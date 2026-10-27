@@ -1,6 +1,6 @@
 {
-    "model": "opus",
-    "effortLevel": "medium",
+    "model": "fable",
+    "effortLevel": "high",
     "permissions": {
       "allow": [
         "Read", "Write", "Edit", "Glob", "Grep", "Agent",

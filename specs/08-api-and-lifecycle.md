@@ -145,4 +145,21 @@ specs/09.
 
 ## Decisions
 
-(Add dated entries when the implementation forces a change.)
+- 2026-10-27 (M1.1): registered names are atoms built from the module and
+  the cache name (`Theine.Maintenance.sessions`, via `Module.concat/2`),
+  not `{Module, name}` tuples. `send/2` on the write path (specs/03) and
+  the "unregistered name raises `ArgumentError`" behaviour it relies on
+  need a local atom name; a tuple would require a Registry and a `via`
+  lookup per write. Cache names are atoms already, so no new atoms are
+  created beyond one per registered process. The tree diagram above keeps
+  the `{Module, name}` notation to mean "the name derived from both".
+- 2026-10-27 (M1.1): a restarted `Theine.Owner` keeps the atomics and
+  counters already in `persistent_term` when the options are unchanged,
+  recreating only the entries table, so the term is written once per
+  cache lifetime even across Owner restarts (no extra global GC, ids stay
+  monotonic, stats survive). If the stored options differ (a brutal kill
+  of the whole tree followed by a start with new options) it allocates and
+  writes afresh.
+- 2026-10-27 (M1.1): `Theine.start_link/1` and `child_spec/1` validate
+  the options in the caller, so `ArgumentError` is raised there rather
+  than surfacing as a supervisor start error.

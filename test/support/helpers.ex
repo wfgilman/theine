@@ -6,6 +6,13 @@ defmodule Theine.Test.Helpers do
   @poll_ms 5
 
   @doc """
+  A cache name no other test uses (specs/10 §Tiers), so caches started with
+  `start_supervised!/1` never collide across async test modules.
+  """
+  @spec unique_cache() :: atom()
+  def unique_cache, do: :"cache_#{System.unique_integer([:positive])}"
+
+  @doc """
   Polls `fun` until it returns a truthy value or stops raising
   `ExUnit.AssertionError`, and returns that value. After `timeout` ms the
   last assertion error is re-raised, or the test is flunked if `fun` only

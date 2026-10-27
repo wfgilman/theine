@@ -20,13 +20,13 @@ Conventions:
 
 ## M0 Scaffold
 
-Done: M0.1, M0.2, M0.3, M0.4, M0.5, M0.6. Open: M0.4b (needs network).
+Done: M0.1, M0.2, M0.3, M0.4, M0.4b, M0.5, M0.6. M0 complete.
 
 - [x] M0.1 Project scaffold and `mix gate` (specs/00 §Milestones M0; specs/10 §Gates): `mix new theine --sup`, exact pins in `.mise.toml` (latest OTP 28 patch, latest Elixir 1.20 patch built for OTP 28), `mix.exs` with runtime dep `telemetry` only, dev/test deps `stream_data`, `dialyxir`, `benchee`, `elixirc_paths` including `test/support` in test, dialyzer PLT path gitignored, `gate` alias running format-check, compile `--warnings-as-errors`, test, dialyzer — outcome: `mix gate` passes on the empty library under `mise exec`.
 - [x] M0.2 Test support helpers (specs/10 §Required helpers): `Theine.Test.Clock` (Agent-backed per cache, `advance(cache, ms)`), `Theine.Test.Trace` (multiset of `{m, f, a}` calls via `:erlang.trace/3` for listed modules), `assert_eventually/2`, `spawn_on_scheduler/2` — test: `test/support` helpers each exercised by one test, e.g. trace_test "returns the multiset of :ets calls made by the function", clock_test "advance/1 moves now/1 forward without sleeping", scheduler_test "spawn_on_scheduler runs on the requested scheduler id".
 - [x] M0.3 `mix bench get` with the raw-ETS baseline (specs/09 §Reference machine, §`mix bench get`, §Acceptance): `mix bench <name>` task compiled only in dev (not shipped in the package), `bench/get.exs` with Zipf(1.0) key generator, shapes `n ∈ {1_000, 100_000, 1_000_000}` × {3-tuple, 1 KB binary} × `parallel ∈ {1, schedulers_online}`, subject `ets` only, warmup 2 s / time 10 s, JSON result to `bench/results/get-<sha>.json`, markdown summary on stdout, non-zero exit on any failed threshold, warning when `ERL_FLAGS` lacks `+sbt db +sbwt very_long`; `bench/README.md` documents the JSON schema — outcome: `mix bench get` exits 0 on the empty library and writes a result file matching the documented schema.
 - [x] M0.4 `mix bench.traces` downloader and synthetic traces (specs/09 §`mix bench hitrate` traces table, §Decisions 2026-10-27 M0.4): manifest `bench/traces.exs`, `:httpc`/`file://` download with `:none | :gzip | :zstd` decompression, SHA-256 check before rename, `loop` and `zipf` generated from a fixed seed with recorded hashes — outcome met for the synthetic traces (generated, verified, re-run is a no-op) and for the download path against `file://` fixtures (plain, gzip, zstd verified; mismatch, missing hash and missing URL each exit non-zero naming the trace). Split: the ARC URLs and hashes are M0.4b.
-- [ ] M0.4b Record the ARC trace URLs and SHA-256s (specs/09 §Decisions 2026-10-27 M0.4; discovered issue 1): find a mirror for `OLTP`, `DS1`, `S3`, `P3` (start from the links in Caffeine's simulator README), set `url` and `compression` in `bench/traces.exs`, run `mix bench.traces --only OLTP,DS1,S3,P3` and record the hashes it prints — outcome: `mix bench.traces` exits 0 with all six traces present, a second run reports every trace `ok`, and `mix bench hitrate` exits 0 with an `lru` row for every ARC trace and size (the part of M0.5's outcome left open). **Needs network access.** The M0.4 build loop could not reach GitHub (curl and `:httpc` need approval in the sandbox); see §Open questions.
+- [x] M0.4b Record the ARC trace URLs and SHA-256s (specs/09 §Decisions 2026-10-27 M0.4; discovered issue 1): done by hand on 2026-10-27 outside the loop. Mirror: `moka-rs/cache-trace` (the ARC source Caffeine's simulator wiki links to), zstd files. The first real download exposed a bug in M0.4's downloader: Mix prunes the `:public_key` code path, so `:httpc.ssl_verify_host_options/1` crashed; fixed with `Mix.ensure_application!/1` for `:inets`, `:ssl`, `:public_key`. Outcome met: `mix bench.traces` exits 0 with all six traces, a second run reports every trace `ok`, decompressed sizes match the independent `djblue/caching` mirror byte for byte, OLTP has the paper's 914,145 lines, and `mix bench hitrate --traces OLTP,P3,S3,DS1` exits 0 with an `lru` row per size. Note for later tasks: the loop's allowlist permits `curl -fsSL`, so downloads from inside the loop work when invoked with exactly those flags.
 - [x] M0.5 `mix bench hitrate` replay harness with the reference LRU (specs/09 §`mix bench hitrate`): trace loader for the ARC `.lis` format and the synthetic format, `lru` policy, per-trace/size hit-rate table, JSON result, non-zero exit when a threshold fails — outcome: `mix bench hitrate` runs the `lru` row for every trace and size listed in specs/09 and exits 0 on the empty library. Met for `loop` and `zipf`. The ARC rows fail loudly (one A3 "trace available" threshold per size) until M0.4b records the traces, so `mix bench hitrate` exits non-zero today and `mix bench hitrate --traces loop,zipf` exits 0. The ARC reader was checked against a fixture only.
 - [x] M0.6 `mix bench maintenance` skeleton (specs/09 §`mix bench maintenance`): Benchee-free script with the three report sections (overshoot, pass duration, write backpressure), JSON result, threshold check with non-zero exit — outcome: `mix bench maintenance` exits 0 on the empty library reporting "no theine subject yet" and the JSON schema is documented in `bench/README.md`. Met. The write and mixed drivers (`Theine.Bench.Load`) are complete and subject-agnostic. They were checked against a fake ETS subject with a trimming process: the sections render, and a failed overshoot exits non-zero. Load parameters are in specs/09 §Decisions M0.6.
 
@@ -98,18 +98,13 @@ Done: nothing yet.
 ## Discovered issues
 
 
-1. **ARC trace hosting.** The original IBM research page for the ARC traces is gone; the files Caffeine's simulator uses are mirrored from links in the Caffeine repository. Recommendation: M0.4 records whichever URLs it actually downloaded with their SHA-256 in `bench/traces.exs`; if a trace is unavailable the hit-rate bench must fail loudly for that row, not skip it.
-2. **`nebulex_local` availability.** Nebulex 3 splits the local adapter into its own package; the exact package name and the Nebulex major it pairs with must be confirmed on Hex in M5.1 before the dep is added.
+1. **`nebulex_local` availability.** Nebulex 3 splits the local adapter into its own package; the exact package name and the Nebulex major it pairs with must be confirmed on Hex in M5.1 before the dep is added.
 
 ## Open questions
 
-1. **M0.4b needs a network the build loop does not have.** Recommendation: a
-   person runs M0.4b once (about five minutes plus the download) or allows
-   network access for `mix bench.traces` in the loop's permissions. Until
-   then the loop should not take M0.4b. M0.5 built the harness. Until M0.4b
-   lands, `mix bench hitrate` fails and names the four ARC traces, so policy
-   tasks (M2.4–M2.6, M2.10) should run it with `--traces loop,zipf` and say
-   so in the commit body.
+None open. M0.4b was done by hand on 2026-10-27, so `mix bench hitrate`
+runs every trace and policy tasks must run it in full, not with
+`--traces loop,zipf`.
 
 Earlier questions: the 15 questions raised when this plan was generated were
 resolved in the specs on 2026-10-27 (summary in specs/00 §Decisions); the
@@ -121,6 +116,29 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M0.4b — `mix bench hitrate`, reference LRU on the ARC traces (2026-10-27)
+
+| trace | size | policy | requests | hit rate % | seconds |
+| --- | --- | --- | --- | --- | --- |
+| OLTP | 1000 | lru | 914145 | 32.83 | 9.27 |
+| OLTP | 2000 | lru | 914145 | 42.47 | 9.27 |
+| OLTP | 5000 | lru | 914145 | 53.65 | 9.27 |
+| DS1 | 1000000 | lru | 43704979 | 3.09 | 249.35 |
+| DS1 | 4000000 | lru | 43704979 | 20.24 | 249.35 |
+| DS1 | 8000000 | lru | 43704979 | 43.03 | 249.35 |
+| S3 | 100000 | lru | 16407702 | 2.33 | 160.03 |
+| S3 | 400000 | lru | 16407702 | 12.04 | 160.03 |
+| P3 | 50000 | lru | 3912296 | 6.86 | 5.60 |
+
+These LRU figures equal the LRU column of Table 2 in the ARC paper
+(Megiddo & Modha, FAST '03) to two decimals, which validates the `.lis`
+parser, the block expansion and the reference LRU against the original
+source. The W-TinyLFU rows added in M2.10 are compared against these. The
+full ARC run takes about 7 minutes on the 4-core reference laptop, almost
+all of it DS1 and S3; policy tasks that want a quick signal can use
+`--traces OLTP,P3,loop,zipf` for iteration and run the full set before
+committing.
 
 M0.5 `lru` baseline (`mix bench hitrate --traces loop,zipf`, parent a06d881):
 

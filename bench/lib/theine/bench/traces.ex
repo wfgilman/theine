@@ -197,6 +197,10 @@ defmodule Theine.Bench.Traces do
   end
 
   defp download(url, dest) do
+    # Mix prunes the code paths of OTP applications the project does not
+    # declare, so :public_key (which :ssl needs for hostname verification)
+    # must be put back on the path before it can be started.
+    for app <- [:inets, :ssl, :public_key], do: Mix.ensure_application!(app)
     {:ok, _} = Application.ensure_all_started([:inets, :ssl])
 
     http = [

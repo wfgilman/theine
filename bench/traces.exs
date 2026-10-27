@@ -6,50 +6,48 @@
 # decompression. Synthetic traces are hashed too, so a generator that stops
 # being deterministic fails here instead of silently shifting hit rates.
 #
-# The ARC traces (Megiddo & Modha) have no URL yet: the original IBM page is
-# gone and this file must record only URLs and hashes that were actually
-# downloaded (specs/09; IMPLEMENTATION_PLAN.md discovered issue 1). Until they
-# are filled in, `mix bench.traces` fails naming each of them. To fill one in,
-# set `url` (and `compression` if the mirror serves .gz or .zst), leave
+# The ARC traces (Megiddo & Modha) come from the moka-rs/cache-trace mirror,
+# which is the ARC source Caffeine's simulator wiki links to. The original IBM
+# page is gone. Recorded on 2026-10-27 from an actual download (specs/09).
+# To add a trace: set `url` (and `compression` for .gz or .zst), leave
 # `sha256: nil`, run `mix bench.traces --only NAME`, and record the hash the
-# failure message prints. Candidate mirrors are the ones Caffeine's simulator
-# README links to.
+# failure message prints.
 [
   %{
     name: "OLTP",
     format: :arc,
     file: "OLTP.lis",
     sizes: [1_000, 2_000, 5_000],
-    url: nil,
-    compression: :none,
-    sha256: nil
+    url: "https://raw.githubusercontent.com/moka-rs/cache-trace/main/arc/OLTP.lis.zst",
+    compression: :zstd,
+    sha256: "01fc36ce7c40a4741e30bd1f999402295fbea829f00f3591ad6732feb078808f"
   },
   %{
     name: "DS1",
     format: :arc,
     file: "DS1.lis",
     sizes: [1_000_000, 4_000_000, 8_000_000],
-    url: nil,
-    compression: :none,
-    sha256: nil
+    url: "https://raw.githubusercontent.com/moka-rs/cache-trace/main/arc/DS1.lis.zst",
+    compression: :zstd,
+    sha256: "368944c669f5aa275d87d14ec1756d7d6e083c94fd458a34a7770b7fd850b025"
   },
   %{
     name: "S3",
     format: :arc,
     file: "S3.lis",
     sizes: [100_000, 400_000],
-    url: nil,
-    compression: :none,
-    sha256: nil
+    url: "https://raw.githubusercontent.com/moka-rs/cache-trace/main/arc/S3.lis.zst",
+    compression: :zstd,
+    sha256: "6d76c453c58274fb9141812b507910f77a61aa675984598f632f7c3ce4985aeb"
   },
   %{
     name: "P3",
     format: :arc,
     file: "P3.lis",
     sizes: [50_000],
-    url: nil,
-    compression: :none,
-    sha256: nil
+    url: "https://raw.githubusercontent.com/moka-rs/cache-trace/main/arc/P3.lis.zst",
+    compression: :zstd,
+    sha256: "bad2e26607cb7c070075a8d17d89081e6c82a3301fc9f6568464e0969898897f"
   },
   # Cycle over 1.5 × 1_000 keys, 100 times (specs/09 §Decisions 2026-10-27, M0.4).
   %{

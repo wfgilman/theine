@@ -24,7 +24,8 @@ removed.
 
 ## Required helpers (`test/support`)
 
-- `Theine.Test.Clock`: an Agent-backed clock with `advance/1`.
+- `Theine.Test.Clock`: an Agent-backed clock per cache name, with
+  `now(cache)` and `advance(cache, ms)`.
 - `Theine.Test.Trace`: run a function under `:erlang.trace/3` for the
   listed modules and return the multiset of `{module, function, arity}`
   calls (specs/01 tracing test).
@@ -72,4 +73,11 @@ correctness is in the branches (claim races, admission ties, stale ids).
 
 ## Decisions
 
-(Add dated entries when the implementation forces a change.)
+- 2026-10-27: `Theine.Test.Clock.advance/1` became `advance(cache, ms)`.
+  specs/06 §Clock keys the test clock by cache name (`now/1` takes the
+  cache), so advancing needs the cache too; one global clock would couple
+  async tests. Caches with no registered clock fall back to real time.
+- 2026-10-27: `Theine.Test.Trace` uses an OTP 27 `:trace` session instead
+  of global `:erlang.trace/3` + `trace_pattern/3`, so concurrent async
+  tracing tests cannot see or reset each other's patterns. The call
+  messages are the same; the result is `%{{m, f, a} => count}`.

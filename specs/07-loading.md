@@ -1,0 +1,191 @@
+# 07 — Loading from an L2
+
+One topic: `Theine.Loader`, how a miss is turned into a value from a slower
+source with exactly one load per key per miss, how callers can await that
+asynchronously, and how stale values are refreshed in the background. This
+is Caffeine's `LoadingCache`, `AsyncLoadingCache` and `refreshAfterWrite`.
+
+## The loader function
+
+```elixir
+@type loader :: (key -> {:commit, value} | {:commit, value, [ttl: ms]} | {:ignore, value})
+```
+
+- `{:commit, value}` stores the value (with the cache's default TTL or the
+  one given) and returns it to every waiter.
+- `{:ignore, value}` returns the value to every waiter and stores nothing.
+  Use it for "not found" results that should not occupy the cache.
+- Raising, throwing or exiting propagates to the claimant as it would from
+  any function call, and every waiter receives `{:error, {:load_failed,
+  reason}}`. Nothing is stored. (Caffeine propagates the exception to every
+  future; this is the same contract.) The shape of `reason`:
+  - raise → the exception struct;
+  - throw → `{:nocatch, value}`;
+  - exit → the exit reason;
+  - claimant died before notifying (waiter saw `:DOWN`) → the monitor's
+    reason, e.g. `:killed`.
+  `fetch/3`'s `@doc` lists these four.
+
+A loader may be given per call (`fetch/3`) or once for the cache
+(`start_link` option `loader:`). A per-call loader wins. `fetch/2` without
+either raises `ArgumentError` at call time.
+
+Loaders run in the calling process for `fetch/3` and in a task under the
+cache's `Task.Supervisor` for `fetch_async/3` and refreshes. Theine never
+calls a loader from the maintenance process.
+
+## Single-flight: `fetch/3`
+
+Two public ETS tables, owned by `Theine.Owner`:
+
+```
+inflight :set            {key, claimant_pid, ref}
+waiters  :duplicate_bag  {{key, ref}, waiter_pid, monitor_ref}
+```
+
+Both with `write_concurrency: :auto`. They are empty whenever no load is in
+progress, so their size is bounded by concurrency, not by cache size.
+
+### Algorithm
+
+```
+fetch(cache, key, loader, opts):
+  case get(cache, key):
+    {:ok, v} -> maybe_refresh(cache, key, entry, loader); {:ok, v}
+    :error   -> claim_or_wait(cache, key, loader, opts, attempts = 0)
+```
+
+**claim_or_wait**:
+
+1. `ref = make_ref()`. If `:ets.insert_new(inflight, {key, self(), ref})`
+   succeeds, this process is the **claimant**; go to *Load*.
+2. Otherwise `[{^key, pid, ref}] = :ets.lookup(inflight, key)` (if the
+   lookup is empty the claimant already finished: go to step 6).
+   `mon = Process.monitor(pid)`. Insert `{{key, ref}, self(), mon}` into
+   `waiters`.
+3. **Double-check**: if `:ets.lookup(inflight, key)` no longer returns that
+   exact `{key, pid, ref}`, the claimant finished between steps 1 and 2 and
+   may have already notified waiters. Deregister (`:ets.delete_object` the
+   waiter row, `Process.demonitor(mon, [:flush])`) and go to step 6.
+4. `receive` one of:
+   - `{:theine_loaded, ^mon, result}` → demonitor with flush, return
+     `result`.
+   - `{:DOWN, ^mon, :process, _, reason}` → the claimant died before
+     notifying. Delete the waiter row. If the key is now cached (the
+     claimant committed and then died), return it. Else if `reason` is
+     `:normal`, go to step 6 (the claimant finished and this waiter was
+     registered too late; the double-check in step 3 makes this rare but
+     not impossible when the claimant is a process that exits right after
+     returning). Else return `{:error, {:load_failed, reason}}`.
+   - after `opts[:timeout]` (default 5000 ms) → delete the waiter row,
+     demonitor with flush, return `{:error, :timeout}`.
+5. (unreachable)
+6. **Retry**: `get` again; on hit return it. On miss, if `attempts < 3`,
+   go to step 1 with `attempts + 1`; else run the loader in this process
+   without claiming (give up on coalescing rather than spin), storing on
+   `:commit`.
+
+**Load** (claimant):
+
+```
+try
+  result = loader.(key)
+  case result:
+    {:commit, v}       -> put(cache, key, v);         reply = {:ok, v}
+    {:commit, v, opts} -> put(cache, key, v, opts);   reply = {:ok, v}
+    {:ignore, v}       ->                             reply = {:ok, v}
+  reply
+after
+  :ets.delete(inflight, key)                        # 1. release the claim
+  for {{^key, ^ref}, pid, mon} <- :ets.lookup(waiters, {key, ref}):  # 2. then read waiters
+    send(pid, {:theine_loaded, mon, reply_or_error})
+  :ets.delete(waiters, {key, ref})
+end
+```
+
+The order inside `after` is load-bearing: the claim is released *before* the
+waiter list is read. A waiter that sees the claim still present at its
+double-check (step 3) therefore registered before the claimant read the
+list, and will be notified. A waiter that registered after the read will see
+the claim gone at step 3 and fall through to the retry. On a raise, the
+`after` block runs with `reply_or_error = {:error, {:load_failed, reason}}`
+built in a `rescue`/`catch` that re-raises after notifying.
+
+### Why not a GenServer per key or a central coalescer
+
+A central process would serialize every miss on the cache through one
+mailbox; a process per key costs a spawn per miss. The ETS claim costs one
+`insert_new` on a miss and nothing on a hit, and waiters pay one monitor and
+one receive. This keeps misses as cheap as the loader allows.
+
+## Asynchronous: `fetch_async/3`
+
+```elixir
+@spec fetch_async(cache, key, loader | nil, opts) :: Task.t()
+```
+
+Returns `Task.Supervisor.async_nolink(sup, fn -> fetch(cache, key, loader, opts) end)`.
+The caller awaits it with `Task.await/2` or `Task.yield/2`. Coalescing is
+inherited from `fetch/3`: ten `fetch_async` calls for one key spawn ten
+tasks but run one loader. The task is unlinked so a loader crash reaches the
+caller as a `Task.await` exit or `Task.yield` `{:exit, reason}`, never as a
+crash of the caller.
+
+An optimization is allowed but not required: if `get/2` hits, return an
+already-completed task (`Task.completed/1`) and spawn nothing.
+
+## Refresh-after-write
+
+`refresh_after_write: ms` on `start_link` (default `:infinity`). On a *hit*
+in `fetch/3` or `get/2` where `now - written_at >= ms` and a loader is
+available (per-call or cache-level), the reader:
+
+1. `:ets.insert_new(refreshing, {key, now})`, a third `Theine.Owner` table.
+   If it fails, a refresh is already running; return the stale value.
+2. On success, `Task.Supervisor.start_child(sup, fn -> ... end)` that runs
+   the loader, stores on `:commit` (which assigns a new id and `written_at`),
+   and in an `after` deletes the `refreshing` row. On `:ignore` or an error
+   the old value stays and the row is deleted; the error is logged at
+   `:warning` with the key omitted (keys may be sensitive) and emitted as
+   `[:theine, :refresh, :exception]` telemetry.
+3. Return the stale value immediately. The reader never waits.
+
+`get/2` performs the refresh check only when `refresh_after_write` is set,
+so the hot-path budget in specs/01 is unchanged for caches without it; with
+it, the cost is one integer comparison on a hit and the `insert_new` only
+once per refresh window per key.
+
+`refresh(cache, key)` forces the same background refresh regardless of age,
+returning `:ok` if started or `{:error, :refreshing}` if one is running.
+
+A refresh for a key that was deleted or evicted during the load still stores
+the loaded value (Caffeine stores it too; the value is fresh by definition).
+
+## Acceptance (A4)
+
+- Exactly-once: 1,000 processes call `fetch/3` on one missing key with a
+  loader that sleeps 50 ms and increments a counter; the counter ends at 1
+  and all 1,000 receive the value. Repeated 100 times in the stress suite
+  across random keys and random claimant delays.
+- `{:ignore, v}`: all waiters receive `v`; `get/2` afterwards misses.
+- Loader raises: the claimant sees the exception; every waiter gets
+  `{:error, {:load_failed, _}}`; nothing is cached; `inflight` and
+  `waiters` are empty afterwards.
+- Claimant killed mid-load (`Process.exit(pid, :kill)`): waiters get
+  `{:error, {:load_failed, :killed}}` within the monitor's delivery, and
+  the next `fetch` for that key claims successfully (no stale claim).
+- Timeout: a waiter with `timeout: 10` and a 100 ms loader returns
+  `{:error, :timeout}` and leaves no waiter row.
+- `fetch_async`: ten concurrent tasks for one key run the loader once; a
+  loader crash surfaces through `Task.yield` as `{:exit, _}`, not as a caller
+  crash.
+- Refresh: with `refresh_after_write: 20`, a value written at t=0 is served
+  as-is at t=25 (no wait, same value), a refresh runs once even under 100
+  concurrent readers, and at t=25+load the new value is served. A refresh
+  loader that raises leaves the old value and the key refreshable again.
+- No leaks: after the stress suite, `inflight`, `waiters` and `refreshing`
+  are empty and the task supervisor has no children.
+
+## Decisions
+
+(Add dated entries when the implementation forces a change.)

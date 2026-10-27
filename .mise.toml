@@ -1,0 +1,6 @@
+[tools]
+# The scaffold task (M0) pins exact versions: the latest OTP 28 patch and the
+# latest Elixir 1.20 patch built against OTP 28.
+erlang = "28"
+elixir = "1.20"
+glow = "latest"

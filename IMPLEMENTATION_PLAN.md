@@ -20,9 +20,9 @@ Conventions:
 
 ## M0 Scaffold
 
-Done: nothing yet.
+Done: M0.1.
 
-- [ ] M0.1 Project scaffold and `mix gate` (specs/00 §Milestones M0; specs/10 §Gates): `mix new theine --sup`, exact pins in `.mise.toml` (latest OTP 28 patch, latest Elixir 1.20 patch built for OTP 28), `mix.exs` with runtime dep `telemetry` only, dev/test deps `stream_data`, `dialyxir`, `benchee`, `elixirc_paths` including `test/support` in test, dialyzer PLT path gitignored, `gate` alias running format-check, compile `--warnings-as-errors`, test, dialyzer — outcome: `mix gate` passes on the empty library under `mise exec`.
+- [x] M0.1 Project scaffold and `mix gate` (specs/00 §Milestones M0; specs/10 §Gates): `mix new theine --sup`, exact pins in `.mise.toml` (latest OTP 28 patch, latest Elixir 1.20 patch built for OTP 28), `mix.exs` with runtime dep `telemetry` only, dev/test deps `stream_data`, `dialyxir`, `benchee`, `elixirc_paths` including `test/support` in test, dialyzer PLT path gitignored, `gate` alias running format-check, compile `--warnings-as-errors`, test, dialyzer — outcome: `mix gate` passes on the empty library under `mise exec`.
 - [ ] M0.2 Test support helpers (specs/10 §Required helpers): `Theine.Test.Clock` (Agent-backed, `advance/1`), `Theine.Test.Trace` (multiset of `{m, f, a}` calls via `:erlang.trace/3` for listed modules), `assert_eventually/2`, `spawn_on_scheduler/2` — test: `test/support` helpers each exercised by one test, e.g. trace_test "returns the multiset of :ets calls made by the function", clock_test "advance/1 moves now/1 forward without sleeping", scheduler_test "spawn_on_scheduler runs on the requested scheduler id".
 - [ ] M0.3 `mix bench get` with the raw-ETS baseline (specs/09 §Reference machine, §`mix bench get`, §Acceptance): `mix bench <name>` task compiled only in dev (not shipped in the package), `bench/get.exs` with Zipf(1.0) key generator, shapes `n ∈ {1_000, 100_000, 1_000_000}` × {3-tuple, 1 KB binary} × `parallel ∈ {1, schedulers_online}`, subject `ets` only, warmup 2 s / time 10 s, JSON result to `bench/results/get-<sha>.json`, markdown summary on stdout, non-zero exit on any failed threshold, warning when `ERL_FLAGS` lacks `+sbt db +sbwt very_long`; `bench/README.md` documents the JSON schema — outcome: `mix bench get` exits 0 on the empty library and writes a result file matching the documented schema.
 - [ ] M0.4 `mix bench.traces` downloader and synthetic traces (specs/09 §`mix bench hitrate` traces table): `bench/traces.exs` records URL and SHA-256 per ARC trace (`OLTP`, `DS1`, `S3`, `P3`); the task downloads into `bench/traces/`, verifies hashes, generates `loop` (cycle over 1.5 × 1_000 keys) and `zipf` (Zipf 0.99, 10M requests over 1M keys) deterministically from a fixed seed — outcome: `mix bench.traces` populates `bench/traces/`, re-running is a no-op, and a hash mismatch exits non-zero naming the trace.
@@ -97,11 +97,9 @@ Done: nothing yet.
 ## Discovered issues
 
 
-1. **No commits and the branch is `master`.** The tooling context names `main` as the main branch and `loop.sh` pushes whatever branch is checked out. Recommendation: rename with `git branch -M main` before the first build iteration; no history exists yet so it is free.
-2. **`.mise.toml` pins majors only** (`erlang = "28"`, `elixir = "1.20"`), while its own comment and specs/00 M0 call for exact patch pins and an Elixir build for OTP 28. Recommendation: M0.1 pins `erlang = "28.x.y"` and `elixir = "1.20.x-otp-28"`. The installed versions could not be verified in the planning session (toolchain commands were not permitted), so M0.1 must start with `mise install` and confirm `elixir --version` reports OTP 28.
-3. **`mix bench <name>` implies a Mix task**, which would ship in the hex package if it lives under `lib/`. Recommendation: compile it from `bench/` (or a dev-only `elixirc_paths` entry) so M5.4's `mix hex.build` check stays clean.
-4. **ARC trace hosting.** The original IBM research page for the ARC traces is gone; the files Caffeine's simulator uses are mirrored from links in the Caffeine repository. Recommendation: M0.4 records whichever URLs it actually downloaded with their SHA-256 in `bench/traces.exs`; if a trace is unavailable the hit-rate bench must fail loudly for that row, not skip it.
-5. **`nebulex_local` availability.** Nebulex 3 splits the local adapter into its own package; the exact package name and the Nebulex major it pairs with must be confirmed on Hex in M5.1 before the dep is added.
+1. **`mix bench <name>` implies a Mix task**, which would ship in the hex package if it lives under `lib/`. Recommendation: compile it from `bench/` (or a dev-only `elixirc_paths` entry) so M5.4's `mix hex.build` check stays clean.
+2. **ARC trace hosting.** The original IBM research page for the ARC traces is gone; the files Caffeine's simulator uses are mirrored from links in the Caffeine repository. Recommendation: M0.4 records whichever URLs it actually downloaded with their SHA-256 in `bench/traces.exs`; if a trace is unavailable the hit-rate bench must fail loudly for that row, not skip it.
+3. **`nebulex_local` availability.** Nebulex 3 splits the local adapter into its own package; the exact package name and the Nebulex major it pairs with must be confirmed on Hex in M5.1 before the dep is added.
 
 ## Open questions
 

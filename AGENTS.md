@@ -68,3 +68,8 @@ test/                         mirrors lib/; test/support for shared helpers
 ## Operational learnings
 
 (A few lines at most. Status goes in IMPLEMENTATION_PLAN.md, not here.)
+
+- Prefix every command with `mise exec --` when the shell has no mise activation.
+- `mix gate` runs in `MIX_ENV=test` (`cli/0` preferred_envs). It runs dialyzer on
+  `lib/` + `test/support`. PLTs are in `priv/plts/` (gitignored). The first
+  build takes about 2.5 min per env.

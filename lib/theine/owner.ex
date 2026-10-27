@@ -3,8 +3,8 @@ defmodule Theine.Owner do
   Holds the entries table, the atomics and the counters of one cache
   (specs/08 §Supervision tree, specs/01 §Tables and handles).
 
-  `init/1` creates the public entries table, allocates the `ids`, `pending`
-  and `flags` atomics and the stats counters, and writes the completed
+  `init/1` creates the public entries table, allocates the `ids`, `pending`,
+  `flags` and `sizes` atomics and the stats counters, and writes the completed
   `%Theine.Config{}` to `:persistent_term`. After that the process does
   nothing but hold the table, so it never crashes on its own; if it is
   killed, the `rest_for_one` supervisor restarts it together with the task
@@ -36,6 +36,10 @@ defmodule Theine.Owner do
   # :counters fields (specs/08 §Stats); Theine.Stats names them in M1.6.
   @counter_fields 7
 
+  # `sizes` atomics: entry count and weighted size, maintained by the
+  # maintenance process (Theine.Policy) and read by size/1 and weighted_size/1.
+  @size_fields 2
+
   @doc "Registered name of the owner process of `cache`."
   @spec name(Config.cache()) :: atom()
   def name(cache) when is_atom(cache), do: Module.concat(__MODULE__, cache)
@@ -63,6 +67,13 @@ defmodule Theine.Owner do
 
         nil ->
           store(allocate(config))
+
+        other ->
+          # The config is keyed by the bare cache name (specs/01 §Decisions),
+          # so another library's term under that atom would be overwritten.
+          raise ArgumentError,
+                "cannot start cache #{inspect(config.name)}: :persistent_term key " <>
+                  "#{inspect(config.name)} already holds #{inspect(other, limit: 5)}"
       end
 
     {:ok, config}
@@ -80,7 +91,8 @@ defmodule Theine.Owner do
       | ids: :atomics.new(1, signed: false),
         pending: :atomics.new(1, signed: true),
         flags: :atomics.new(@drain_flag, signed: false),
-        counters: :counters.new(@counter_fields, [:write_concurrency])
+        counters: :counters.new(@counter_fields, [:write_concurrency]),
+        sizes: :atomics.new(@size_fields, signed: true)
     }
   end
 

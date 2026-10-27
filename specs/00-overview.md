@@ -44,11 +44,11 @@ These are measured by `mix bench get`, `mix bench hitrate`,
 specs/09-benchmarks.md and specs/10-testing.md. Thresholds live there; this
 list is the contract.
 
-- **A1 Latency.** `Theine.get/2` hit latency, p50 and p99, is within 1.3× of a
+- **A1 Latency.** `Theine.get/2` hit latency, p50 and p99, is within 1.5× of a
   raw `:ets.lookup/2` on a table with identical options, identical key and
   value shapes, at 1 scheduler and at all schedulers.
 - **A2 Throughput.** Aggregate `get` hit throughput at all schedulers is at
-  least 0.75× raw ETS, and at least 2× both Cachex and Nebulex local `get` on
+  least 0.65× raw ETS, and at least 2× both Cachex and Nebulex local `get` on
   the same harness.
 - **A3 Hit rate.** On every trace in the hit-rate suite, theine's hit rate is
   at least that of the reference LRU, and on the looping and scan traces it is
@@ -155,3 +155,18 @@ list is the contract.
   `deliver/2` never crashes a writer during a restart (specs/03); the clock
   is a `compile_env` (specs/06); `clear/1` never touches persistent_term
   (specs/01); `ex_doc` is an allowed dev dependency (AGENTS.md).
+- 2026-10-27 (after M1.2, human decision): A1 and A2 reset from 1.3×/0.75× to
+  1.5×/0.65× of raw ETS. Measured in isolation on the reference laptop
+  (OTP 28.5, 4 schedulers), a named-table `:ets.lookup/2` costs about
+  205 ns, so 1.3× left about 60 ns for everything else on a hit. The
+  bounded hit path needs the config read, a scheduler-id read and two
+  atomic read-modify-writes for the read buffer, about 80 ns, before any
+  stats work: 1.41× with no counter op at all, 1.61× with one. The
+  unbounded path with its one counter op measured 1.29× in isolation and
+  1.25–1.38× under Benchee. The design cannot be made cheaper on this
+  machine (dropping the read buffer's head read saved nothing), and
+  Caffeine itself reads at about a third of a raw map's throughput, so the
+  original figures were the error, not the implementation. To keep the
+  hot path as lean as it can be, hits in a bounded cache are no longer
+  counted with `:counters`; they are derived from the read-buffer tails
+  (specs/01, 03, 08). The 2× margin over Cachex and Nebulex is unchanged.

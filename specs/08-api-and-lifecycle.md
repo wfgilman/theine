@@ -100,10 +100,21 @@ docs warn about. Accept it; document it in the module doc.
 `:counters` with `write_concurrency`, one per cache, fields: `hits`,
 `misses`, `loads`, `load_failures`, `evictions`, `expirations`,
 `refreshes`. `stats/1` reads them into `%Theine.Stats{}` with a computed
-`hit_rate` (float, 0.0 when no requests). `stats: false` is a boolean on
-`%Config{}`; `get/2` branches on it once (a single pattern match, no
-function-call indirection) to skip the counter op. The bench reports both
-modes and the tracing test asserts the counters-free multiset.
+`hit_rate` (float, 0.0 when no requests).
+
+`hits` is special. In a bounded cache the `hits` counter is never
+incremented; `stats/1` reports `hits` as the sum of the read-buffer stripe
+tails (specs/03 §Hits from the tails), so a bounded hit does no counters
+op at all. In an unbounded cache there is no read buffer and a hit
+increments the `hits` counter. The miss path, the expired-read branch and
+the loader always use the counters; they are not on the hit budget.
+
+`stats: false` is a boolean on `%Config{}`; `get/2` branches on it once (a
+single pattern match, no function-call indirection) to skip the counter op
+on an unbounded hit and on a miss. It does not change the bounded hit path,
+which has no counter op to skip; the read buffer still claims a sequence
+because the policy needs it. The bench reports both modes and the tracing
+test asserts the counters-free multiset for the unbounded hit.
 
 ## Telemetry
 
@@ -163,3 +174,8 @@ specs/09.
 - 2026-10-27 (M1.1): `Theine.start_link/1` and `child_spec/1` validate
   the options in the caller, so `ArgumentError` is raised there rather
   than surfacing as a supervisor start error.
+- 2026-10-27 (after M1.2, human decision): `hits` for a bounded cache comes from
+  the read-buffer tails and the bounded hit path performs no `:counters`
+  op (specs/01, 03). `stats: false` therefore only affects unbounded hits
+  and the miss path. The A1/A2 thresholds were reset at the same time
+  (specs/00, 09 §Decisions).

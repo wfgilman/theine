@@ -158,4 +158,13 @@ default false, and must not change any non-adaptive test result.
 
 ## Decisions
 
-(Add dated entries when the implementation forces a change.)
+- 2026-10-27 (M1.2): the policy state is a `%Theine.Policy{}` struct (the
+  two or three tables, the `sizes` atomics, `max_size`, the next `seq`) that
+  the maintenance process threads through every call, so the functions
+  above take it first: `on_write(state, key, id, weight, expires_at)`,
+  `on_remove(state, key, id)`, `on_access(state, id)`, `evict(state)`. No
+  process dictionary. In unbounded mode (`max_size: :infinity`, specs/08)
+  only `policy` and `ids` exist and `segment` is `nil`; `seq` is still
+  assigned so the row shape is the same in both modes. `size` and
+  `weighted_size` are published to a two-field `sizes` atomics as each event
+  is applied, which is what `Theine.size/1` and `weighted_size/1` read.

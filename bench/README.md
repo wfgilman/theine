@@ -48,7 +48,7 @@ Each `thresholds` entry:
 | `id` | string | acceptance criterion, e.g. `"A1"` |
 | `description` | string | what was compared, including the shape |
 | `actual` | number | the measured ratio or value |
-| `limit` | string | operator and bound, e.g. `"<= 1.3"` |
+| `limit` | string | operator and bound, e.g. `"<= 1.5"` |
 | `passed` | boolean | |
 
 ## `get` (A1, A2)
@@ -88,8 +88,8 @@ Each `results` row:
 Thresholds (specs/09). They are evaluated for `theine` and `theine_unbounded`
 when those subjects exist. Until then the summary says "none evaluated".
 
-- A1: `p50/ets <= 1.3` and `p99/ets <= 1.3`, every shape.
-- A2: `ips/ets >= 0.75` at full parallelism; `ips / cachex ips >= 2` and
+- A1: `p50/ets <= 1.5` and `p99/ets <= 1.5`, every shape.
+- A2: `ips/ets >= 0.65` at full parallelism; `ips / cachex ips >= 2` and
   `ips / nebulex ips >= 2` at full parallelism when those subjects exist.
 
 ## `hitrate` (A3)

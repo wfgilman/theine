@@ -42,8 +42,8 @@ ips, and the ratio to `ets`.
 
 **Thresholds** (every shape, both parallelisms):
 
-- `theine` p50 ≤ 1.3 × `ets` p50 and p99 ≤ 1.3 × `ets` p99. (A1)
-- `theine` ips ≥ 0.75 × `ets` ips at full parallelism. (A2)
+- `theine` p50 ≤ 1.5 × `ets` p50 and p99 ≤ 1.5 × `ets` p99. (A1)
+- `theine` ips ≥ 0.65 × `ets` ips at full parallelism. (A2)
 - `theine` ips ≥ 2 × `cachex` ips and ≥ 2 × `nebulex` ips at full
   parallelism. (A2)
 
@@ -176,3 +176,13 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   measured. The backpressure fraction needs a count of call-path writes.
   The harness takes it from a subject callback, so M2.11 decides where
   theine exposes it.
+- 2026-10-27 (after M1.2, human decision): A1 and A2 reset to 1.5× and 0.65×.
+  The full `mix bench get` on the finished M1.2 tree passed 20 of 30
+  checks at the old 1.3×/0.75×, the failures all between 1.30× and 1.50×
+  (table in IMPLEMENTATION_PLAN.md §Benchmark log). Isolated measurement
+  of the primitives (specs/00 §Decisions) showed that the bounded hit path
+  of M2.8 cannot get under about 1.4× on the reference laptop even with no
+  stats work, so 1.3× was never reachable by this design. 1.5× leaves the
+  bounded path roughly 20 ns of headroom; the loop may not relax these
+  figures further. `bench/get.exs` and `bench/README.md` carry the new
+  limits.

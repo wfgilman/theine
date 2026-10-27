@@ -55,6 +55,19 @@ every dropped access still claims a sequence. That is intended: the drainer
 reads only the last `slots` sequences, and `tail - head` is a cheap measure
 of how far behind maintenance is (`info/1` reports it).
 
+### Hits from the tails
+
+Because every hit claims a sequence, dropped or not, the sum of the stripe
+tails is the exact number of hits recorded since the buffer was created.
+`Theine.stats/1` reads `hits` for a bounded cache as that sum, and a bounded
+hit performs no `:counters` op (specs/01 §Budget, specs/08 §Stats). The
+tails are never reset: a maintenance restart moves heads up to the tails
+(specs/04 §Restart semantics), `clear/1` leaves the buffer alone, and only
+an Owner restart (which recreates the array) starts the count over, exactly
+as it does for the counters. `record/2` must therefore claim the sequence
+for every hit, including hits that are dropped and hits in a cache started
+with `stats: false`; the one add_get is the whole cost of counting.
+
 Note that a slot may hold a stale id (a reader claimed `t` but has not yet
 `put`), or 0. The drainer tolerates both.
 
@@ -136,3 +149,8 @@ new process registers, and the mutation preceded the send.
 ## Decisions
 
 (Add dated entries when the implementation forces a change.)
+- 2026-10-27 (after M1.2, human decision): the stripe tails double as the hit
+  counter for bounded caches (§Hits from the tails). The tail was already
+  incremented on every hit by step 2 of `record/2`; `stats/1` reading
+  `stripes` atomics once per call costs nothing on the hot path. This
+  removed the `:counters.add` from the bounded hit (specs/01 §Decisions).

@@ -4,9 +4,12 @@ defmodule Theine.Config do
 
   Built once by `new!/1` from the `Theine.start_link/1` options, completed
   with the runtime handles (atomics, counters) by `Theine.Owner`, and stored
-  in `:persistent_term` under `{Theine, name}`. Every public call reads it
-  with one `:persistent_term.get/1`; nothing rewrites it while the cache
-  runs (specs/01 §Tables and handles).
+  in `:persistent_term` under the cache name itself. Every public call reads
+  it with one `:persistent_term.get/1`; nothing rewrites it while the cache
+  runs (specs/01 §Tables and handles). The key is the bare atom because
+  hashing a `{Theine, name}` tuple costs more than the hit-path budget
+  allows (specs/01 §Decisions); `Theine.Owner` refuses to start when that
+  atom already holds a term that is not a cache config.
 
   Registered names are atoms derived from the cache name
   (`Theine.Maintenance.my_cache`), because write events are delivered with
@@ -41,6 +44,7 @@ defmodule Theine.Config do
           pending: :atomics.atomics_ref() | nil,
           flags: :atomics.atomics_ref() | nil,
           counters: :counters.counters_ref() | nil,
+          sizes: :atomics.atomics_ref() | nil,
           read_buffer: :atomics.atomics_ref() | nil,
           sketch: :atomics.atomics_ref() | nil
         }
@@ -70,6 +74,7 @@ defmodule Theine.Config do
             pending: nil,
             flags: nil,
             counters: nil,
+            sizes: nil,
             read_buffer: nil,
             sketch: nil
 
@@ -94,7 +99,7 @@ defmodule Theine.Config do
   ]
 
   # Fields filled in by Theine.Owner, not by options.
-  @runtime_fields [:ids, :pending, :flags, :counters, :read_buffer, :sketch]
+  @runtime_fields [:ids, :pending, :flags, :counters, :sizes, :read_buffer, :sketch]
 
   @doc "The `start_link/1` option names, in the order of the specs/08 table."
   @spec options() :: [atom(), ...]
@@ -155,11 +160,14 @@ defmodule Theine.Config do
       #=> :infinity
   """
   @spec get(cache()) :: t()
-  def get(cache) when is_atom(cache), do: :persistent_term.get({Theine, cache})
+  def get(cache) when is_atom(cache), do: :persistent_term.get(cache)
 
-  @doc "The `:persistent_term` key under which the config of `cache` is stored."
-  @spec key(cache()) :: {Theine, cache()}
-  def key(cache) when is_atom(cache), do: {Theine, cache}
+  @doc """
+  The `:persistent_term` key under which the config of `cache` is stored:
+  the cache name itself.
+  """
+  @spec key(cache()) :: cache()
+  def key(cache) when is_atom(cache), do: cache
 
   @doc """
   True when both configs were built from the same options, ignoring the

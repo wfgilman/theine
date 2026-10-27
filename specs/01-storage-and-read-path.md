@@ -23,7 +23,8 @@ crash loses no data (specs/08 §Supervision).
 
 Resolved configuration (table name, atomics refs, maintenance pid, stripe
 count, TTL defaults, loader) is a `%Theine.Config{}` stored once at startup in
-`:persistent_term` under `{Theine, name}`. It is read on every call and
+`:persistent_term` under the cache name itself (the bare atom; see
+§Decisions 2026-10-27 for why not `{Theine, name}`). It is read on every call and
 never rewritten while the cache runs: `clear/1` changes nothing in it, and a
 maintenance restart is handled by the new process registering under the same
 name, not by storing a pid. `Theine.Owner` writes it once at start and erases
@@ -55,12 +56,15 @@ against ETS with identical value shapes.
 
 A hit performs exactly these operations, in this order, and nothing else:
 
-1. `:persistent_term.get({Theine, name})` → config.
-2. `:ets.lookup(table, key)`.
-3. `[]` → increment the miss counter (one `:counters.add`), return `:error`.
-4. `[{^key, value, id, _w, _written, expires_at}]` →
-   `now = System.monotonic_time(:millisecond)`;
-   if `is_integer(expires_at) and now >= expires_at`, go to *Expired read*.
+1. `:ets.lookup(name, key)`: the entries table is named after the cache, so
+   the lookup needs no config.
+2. `[]` → `:persistent_term.get(name)` → config; increment the miss counter
+   (one `:counters.add`), return `:error`.
+3. `[{^key, value, id, _w, _written, expires_at}]` → if
+   `is_integer(expires_at)`, read `now = System.monotonic_time(:millisecond)`
+   and if `now >= expires_at` go to *Expired read*. Entries with
+   `expires_at == :infinity` read no clock.
+4. `:persistent_term.get(name)` → config.
 5. `Theine.ReadBuffer.record(config, id)` (specs/03): one scheduler-id read,
    at most two atomics ops, and at most one more atomics op plus one message
    send when the stripe crosses its drain threshold.
@@ -70,9 +74,15 @@ The miss path increments one counter and returns. Misses are not recorded in
 the policy; Caffeine does not either.
 
 Budget: steps 1–6 total at most one persistent_term read, one ETS lookup, one
-clock read, one scheduler-id read, three atomics ops and one counters op on
-the hit path. Logger, telemetry, the process dictionary and any message send
-other than the drain trigger are forbidden on this path (AGENTS.md).
+clock read, one scheduler-id read and three atomics ops on the hit path. A
+counters op is allowed on a hit only in an unbounded cache (no read buffer);
+in a bounded cache the hit count comes from the read-buffer tails (specs/03
+§Hits from the tails) and a hit does no counters op. Logger, telemetry, the process dictionary and any message send
+other than the drain trigger are forbidden on this path (AGENTS.md). The
+whole path is written out in `Theine.get/2` itself: no delegation into
+another module, no struct pattern (one map access for the counters, not a
+`__struct__` check plus one), because each of those costs about 10 ns
+against a budget of about 60 ns over a raw named-table lookup (§Decisions).
 
 ### Expired read
 
@@ -132,4 +142,37 @@ are emptied before `clear/1` returns.
 
 ## Decisions
 
-(Add dated entries when the implementation forces a change.)
+- 2026-10-27 (M1.2): the clock read on both paths is
+  `:erlang.monotonic_time(:millisecond)`, the BIF that
+  `System.monotonic_time/1` wraps. The wrapper adds a unit-normalising call
+  per read, which is measurable against the A1 budget; the values are
+  identical. The injected test clock (specs/06 §Clock) replaces this call at
+  compile time in the test build only. On a hit the clock is read only when
+  the entry has an integer `expires_at`: the result is the same and an
+  entry that cannot expire saves the read (about 30 ns).
+- 2026-10-27 (M1.2): the persistent_term key is the bare cache name, not
+  `{Theine, name}`. Measured on the reference laptop (OTP 28.5, 4
+  schedulers): a raw `:ets.lookup/2` on a named table costs about 220 ns,
+  so the A1 budget for everything else on a hit is about 65 ns.
+  `:persistent_term.get/1` costs 39 ns with a two-tuple key and 16 ns with
+  an atom key (the tuple is hashed element by element and allocated per
+  call), `:counters.add/3` with `write_concurrency` 30 ns, a remote call
+  9 ns, a map field access 5–10 ns, the clock 30 ns. With the tuple key the
+  first `mix bench get` run of M1.2 failed 29 of 30 A1/A2 checks at ratios
+  of 1.5–2.1; the atom key, the conditional clock and the inlined read
+  path bring the unbounded subject under 1.3. The cost of the bare atom is
+  a namespace: a cache cannot share its name with a `:persistent_term` key
+  another library uses. `Theine.Owner` checks the key at start and raises
+  `ArgumentError` if it holds a term that is not a `%Theine.Config{}`, so
+  the collision fails loudly rather than overwriting. The same numbers
+  mean the bounded hit path of M2.8 (one scheduler-id read and three
+  atomics ops more, about 65 ns measured in isolation) will need the same
+  care; IMPLEMENTATION_PLAN.md records the risk.
+- 2026-10-27 (after M1.2, human decision): a bounded hit does not touch
+  `:counters`. The read buffer claims a sequence number on every hit, so
+  the sum of the stripe tails is already the exact hit count (specs/03).
+  Measured in isolation the counter op is 24 ns of a ~60–100 ns budget over
+  a 205 ns lookup; removing it takes the bounded hit from 1.61× to 1.41×
+  ETS. The A1/A2 figures themselves were reset at the same time (specs/00
+  §Decisions). Unbounded caches have no read buffer and keep the counter
+  op on a hit; `stats: false` removes it there.

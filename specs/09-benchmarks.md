@@ -134,3 +134,13 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
 ## Decisions
 
 (Add dated entries when the implementation forces a change.)
+
+- 2026-10-27 (M0.3): how `mix bench get` measures, where the text above left
+  it open. Keys are pre-drawn (65 536 per `n`) and picked in Benchee's
+  `before_each` hook, so sampling cost is outside the measured time for every
+  subject. Otherwise a Zipf draw per call would dilute every ratio towards 1.
+  The 1 KB values come from a pool of 1 024 binaries rather than one per key.
+  1M distinct values would need 1 GB, and a single shared binary would make
+  parallel readers contend on its refcount. `ips` is Benchee's per-process
+  figure; ratios are the same as with aggregate throughput. The task and its
+  helpers live in `bench/lib`, compiled in `:dev` only.

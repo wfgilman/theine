@@ -73,3 +73,5 @@ test/                         mirrors lib/; test/support for shared helpers
 - `mix gate` runs in `MIX_ENV=test` (`cli/0` preferred_envs). It runs dialyzer on
   `lib/` + `test/support`. PLTs are in `priv/plts/` (gitignored). The first
   build takes about 2.5 min per env.
+- `mix bench` and its helpers live in `bench/lib`, compiled in `:dev` only. Use
+  `mix bench get --sizes 1000 --warmup 0.2 --time 0.5` for a quick smoke run.

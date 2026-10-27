@@ -29,7 +29,10 @@ defmodule Theine.MixProject do
     [preferred_envs: [gate: :test]]
   end
 
+  # bench/lib holds `mix bench` and its helpers: compiled in :dev only, so
+  # they never reach the hex package (specs/09; M5.4).
   defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(:dev), do: ["lib", "bench/lib"]
   defp elixirc_paths(_), do: ["lib"]
 
   # Runtime: telemetry only (AGENTS.md). Everything else is dev/test/bench.

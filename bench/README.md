@@ -91,3 +91,45 @@ when those subjects exist. Until then the summary says "none evaluated".
 - A1: `p50/ets <= 1.3` and `p99/ets <= 1.3`, every shape.
 - A2: `ips/ets >= 0.75` at full parallelism; `ips / cachex ips >= 2` and
   `ips / nebulex ips >= 2` at full parallelism when those subjects exist.
+
+## Traces (`mix bench.traces`)
+
+```bash
+mix bench.traces                  # every trace in bench/traces.exs
+mix bench.traces --only loop,zipf # a subset, by name
+```
+
+`bench/traces.exs` is the manifest. It holds one map per trace with `name`,
+`file`, `format`, `sizes` (the cache sizes `mix bench hitrate` runs it at) and
+`sha256`, plus either `url` (and `compression`: `:none`, `:gzip` or `:zstd`)
+or `generator`. The task writes each trace to `bench/traces/<file>`
+(gitignored). It writes to a `.part` file first and renames it into place
+only when its SHA-256 matches. `sha256` is the hash of the stored file, after
+decompression, so an existing file can be checked without the archive. A file
+already present with the right hash is left alone, so re-running is a no-op.
+Synthetic traces are hashed too, which catches a generator that stops being
+deterministic.
+
+The task exits non-zero and names every trace that has no URL, fails to
+download, or does not match its hash. With `sha256: nil` the failure message
+prints the hash of the file it produced. To record a new trace: set `url`, run
+`mix bench.traces --only NAME`, copy the printed hash in. `file://` URLs
+install a trace that is already on disk. `--manifest` and `--dir` select
+another manifest and output directory.
+
+Formats on disk:
+
+- `arc`: the ARC `.lis` format, one request per line,
+  `start_block block_count ignored request_id`. A request touches keys
+  `start_block .. start_block + block_count - 1`.
+- `keys`: one non-negative decimal key per line.
+
+Synthetic traces:
+
+- `loop`: keys `0..1499` in order, 100 cycles (150 000 requests). It runs at
+  `max_size` 1 000, so LRU never hits.
+- `zipf`: 10 000 000 draws from Zipf(0.99) over `1..1_000_000`
+  (`Theine.Bench.Zipf`, seed 2026).
+
+The ARC traces (`OLTP`, `DS1`, `S3`, `P3`) have no URL or hash recorded yet.
+See `IMPLEMENTATION_PLAN.md` M0.4b.

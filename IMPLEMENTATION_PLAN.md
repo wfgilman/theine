@@ -20,12 +20,13 @@ Conventions:
 
 ## M0 Scaffold
 
-Done: M0.1, M0.2, M0.3.
+Done: M0.1, M0.2, M0.3, M0.4.
 
 - [x] M0.1 Project scaffold and `mix gate` (specs/00 §Milestones M0; specs/10 §Gates): `mix new theine --sup`, exact pins in `.mise.toml` (latest OTP 28 patch, latest Elixir 1.20 patch built for OTP 28), `mix.exs` with runtime dep `telemetry` only, dev/test deps `stream_data`, `dialyxir`, `benchee`, `elixirc_paths` including `test/support` in test, dialyzer PLT path gitignored, `gate` alias running format-check, compile `--warnings-as-errors`, test, dialyzer — outcome: `mix gate` passes on the empty library under `mise exec`.
 - [x] M0.2 Test support helpers (specs/10 §Required helpers): `Theine.Test.Clock` (Agent-backed per cache, `advance(cache, ms)`), `Theine.Test.Trace` (multiset of `{m, f, a}` calls via `:erlang.trace/3` for listed modules), `assert_eventually/2`, `spawn_on_scheduler/2` — test: `test/support` helpers each exercised by one test, e.g. trace_test "returns the multiset of :ets calls made by the function", clock_test "advance/1 moves now/1 forward without sleeping", scheduler_test "spawn_on_scheduler runs on the requested scheduler id".
 - [x] M0.3 `mix bench get` with the raw-ETS baseline (specs/09 §Reference machine, §`mix bench get`, §Acceptance): `mix bench <name>` task compiled only in dev (not shipped in the package), `bench/get.exs` with Zipf(1.0) key generator, shapes `n ∈ {1_000, 100_000, 1_000_000}` × {3-tuple, 1 KB binary} × `parallel ∈ {1, schedulers_online}`, subject `ets` only, warmup 2 s / time 10 s, JSON result to `bench/results/get-<sha>.json`, markdown summary on stdout, non-zero exit on any failed threshold, warning when `ERL_FLAGS` lacks `+sbt db +sbwt very_long`; `bench/README.md` documents the JSON schema — outcome: `mix bench get` exits 0 on the empty library and writes a result file matching the documented schema.
-- [ ] M0.4 `mix bench.traces` downloader and synthetic traces (specs/09 §`mix bench hitrate` traces table): `bench/traces.exs` records URL and SHA-256 per ARC trace (`OLTP`, `DS1`, `S3`, `P3`); the task downloads into `bench/traces/`, verifies hashes, generates `loop` (cycle over 1.5 × 1_000 keys) and `zipf` (Zipf 0.99, 10M requests over 1M keys) deterministically from a fixed seed — outcome: `mix bench.traces` populates `bench/traces/`, re-running is a no-op, and a hash mismatch exits non-zero naming the trace.
+- [x] M0.4 `mix bench.traces` downloader and synthetic traces (specs/09 §`mix bench hitrate` traces table, §Decisions 2026-10-27 M0.4): manifest `bench/traces.exs`, `:httpc`/`file://` download with `:none | :gzip | :zstd` decompression, SHA-256 check before rename, `loop` and `zipf` generated from a fixed seed with recorded hashes — outcome met for the synthetic traces (generated, verified, re-run is a no-op) and for the download path against `file://` fixtures (plain, gzip, zstd verified; mismatch, missing hash and missing URL each exit non-zero naming the trace). Split: the ARC URLs and hashes are M0.4b.
+- [ ] M0.4b Record the ARC trace URLs and SHA-256s (specs/09 §Decisions 2026-10-27 M0.4; discovered issue 1): find a mirror for `OLTP`, `DS1`, `S3`, `P3` (start from the links in Caffeine's simulator README), set `url` and `compression` in `bench/traces.exs`, run `mix bench.traces --only OLTP,DS1,S3,P3` and record the hashes it prints — outcome: `mix bench.traces` exits 0 with all six traces present, and a second run reports every trace `ok`. **Needs network access.** The M0.4 build loop could not reach GitHub (curl and `:httpc` need approval in the sandbox); see §Open questions.
 - [ ] M0.5 `mix bench hitrate` replay harness with the reference LRU (specs/09 §`mix bench hitrate`): trace loader for the ARC `.lis` format and the synthetic format, `lru` policy, per-trace/size hit-rate table, JSON result, non-zero exit when a threshold fails — outcome: `mix bench hitrate` runs the `lru` row for every trace and size listed in specs/09 and exits 0 on the empty library.
 - [ ] M0.6 `mix bench maintenance` skeleton (specs/09 §`mix bench maintenance`): Benchee-free script with the three report sections (overshoot, pass duration, write backpressure), JSON result, threshold check with non-zero exit — outcome: `mix bench maintenance` exits 0 on the empty library reporting "no theine subject yet" and the JSON schema is documented in `bench/README.md`.
 
@@ -102,7 +103,15 @@ Done: nothing yet.
 
 ## Open questions
 
-None open. The 15 questions raised when this plan was generated were
+1. **M0.4b needs a network the build loop does not have.** Recommendation: a
+   person runs M0.4b once (about five minutes plus the download) or allows
+   network access for `mix bench.traces` in the loop's permissions. Until
+   then the loop should not take M0.4b. M0.5 can still build the harness and
+   run the `lru` rows for `loop` and `zipf`, but its outcome ("every trace")
+   stays unmet while the ARC traces are missing, and the ARC rows must fail
+   loudly rather than be skipped (discovered issue 1).
+
+Earlier questions: the 15 questions raised when this plan was generated were
 resolved in the specs on 2026-10-27 (summary in specs/00 §Decisions); the
 tasks above were edited to match. New questions go here with a recommended
 resolution, and are settled by editing the spec in the build commit that

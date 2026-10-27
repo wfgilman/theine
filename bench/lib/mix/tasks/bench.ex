@@ -16,7 +16,11 @@ defmodule Mix.Tasks.Bench do
 
   use Mix.Task
 
+  # bench/traces.exs is the trace manifest, not a benchmark.
   @impl Mix.Task
+  def run(["traces" | _argv]),
+    do: Mix.raise("mix bench: traces is a manifest; run mix bench.traces")
+
   def run([name | argv]) do
     path = Path.join("bench", name <> ".exs")
 

@@ -144,3 +144,16 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   parallel readers contend on its refcount. `ips` is Benchee's per-process
   figure; ratios are the same as with aggregate throughput. The task and its
   helpers live in `bench/lib`, compiled in `:dev` only.
+- 2026-10-27 (M0.4): trace details the table above left open. `loop` is keys
+  `0..1499` cycled 100 times (150 000 requests); the table fixes only the
+  1.5 × key count. `zipf` uses seed 2026. Synthetic traces are stored as one
+  decimal key per line. Like the ARC traces they carry a SHA-256 in
+  `bench/traces.exs`, so a generator that stops being deterministic fails the
+  task. The recorded hash is of the file as stored in `bench/traces/`, after
+  decompression, so re-runs can verify without the archive.
+  `mix bench.traces` downloads with OTP's `:httpc` (no new dependency) and
+  also accepts `file://` URLs. The ARC URLs and hashes are not recorded yet.
+  The build loop that wrote the task had no network access, and this spec
+  allows only URLs and hashes that were actually downloaded. Until they are
+  recorded, the task fails and names each ARC trace (IMPLEMENTATION_PLAN.md
+  M0.4b).

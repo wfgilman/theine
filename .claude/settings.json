@@ -1,0 +1,20 @@
+{
+    "model": "opus",
+    "effortLevel": "medium",
+    "permissions": {
+      "allow": [
+        "Read", "Write", "Edit", "Glob", "Grep", "Agent",
+        "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)",
+        "Bash(grep:*)", "Bash(rg:*)", "Bash(find:*)", "Bash(sed -n:*)", "Bash(diff:*)",
+        "Bash(sha256sum:*)", "Bash(mkdir:*)", "Bash(chmod:*)", "Bash(rm -f:*)",
+        "Bash(mise:*)", "Bash(mix:*)", "Bash(elixir:*)", "Bash(iex:*)", "Bash(erl:*)",
+        "Bash(curl -fsSL:*)",
+        "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)",
+        "Bash(git add:*)", "Bash(git commit:*)", "Bash(git rev-parse:*)", "Bash(git branch:*)"
+      ],
+      "deny": [
+        "Bash(git push:*)", "Bash(git commit --amend:*)", "Bash(git reset --hard:*)",
+        "Bash(rm -rf:*)", "Bash(sudo:*)", "WebFetch", "WebSearch"
+      ]
+    }
+  }

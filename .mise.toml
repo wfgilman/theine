@@ -1,6 +1,6 @@
 [tools]
-# The scaffold task (M0) pins exact versions: the latest OTP 28 patch and the
-# latest Elixir 1.20 patch built against OTP 28.
-erlang = "28"
-elixir = "1.20"
+# Exact pins: the Elixir build must match the OTP major it runs on. mise's
+# fuzzy "1.20" resolved to an otp-29 build on top of OTP 28, which does not run.
+erlang = "28.5"
+elixir = "1.20.4-otp-28"
 glow = "latest"

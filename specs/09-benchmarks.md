@@ -165,3 +165,14 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   per size ("trace available"), so the bench exits non-zero rather than
   skipping the row. `--traces` selects a subset by name. Hit rates are
   reported in percent, so the A3 margin compares percentage points directly.
+- 2026-10-27 (M0.6): how `mix bench maintenance` drives load, where the text
+  above left it open. Each of the two runs starts a fresh cache with the
+  specs/08 defaults. The mixed run lasts as long as the write run (30 s) and
+  first puts keys `1..max_size`. Its keys are Zipf(1.0) over
+  `2 * max_size`, so writes keep forcing evictions and the pass is measured
+  under eviction load, not just under policy updates. The keys are pre-drawn
+  as in `mix bench get`. Pass durations are nearest-rank percentiles. A run
+  with no pass events fails a threshold rather than passing with nothing
+  measured. The backpressure fraction needs a count of call-path writes.
+  The harness takes it from a subject callback, so M2.11 decides where
+  theine exposes it.

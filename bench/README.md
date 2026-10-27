@@ -135,6 +135,64 @@ Thresholds (specs/09):
   row; also `>= 10.0` on `loop` 1 000 and `OLTP` 1 000 and 2 000. Evaluated
   only where both policies ran; until then the summary says "none evaluated".
 
+## `maintenance` (A5, specs/04 budget)
+
+```bash
+ERL_FLAGS="+sbt db +sbwt very_long" mix bench maintenance
+mix bench maintenance --max-size 10000 --duration 1   # quick smoke run, not a gate
+```
+
+Not Benchee. The drivers are in `Theine.Bench.Load` (`bench/lib`) and know
+nothing about theine. A subject is a map of callbacks (`start`, `put`, `get`,
+`size`, `call_writes`, `stop`; see the moduledoc), and the drivers can be
+checked against a plain ETS table. Each subject is started fresh with
+`max_size` and `write_hwm` 1 024 (the specs/08 default) for each of two runs:
+
+- **write run**: `schedulers_online` writers put distinct keys for
+  `--duration` seconds (default 30). One process samples the entries-table
+  size every 10 ms. 1 s after the writers stop, the size is sampled once more.
+- **mixed run**: keys `1..max_size` are put first. Then `schedulers_online`
+  workers run for `--duration` seconds, each operation a `get` with
+  probability 0.75, otherwise a `put`. Half of the puts carry a 100 ms TTL.
+  Keys are Zipf(1.0) over `2 * max_size` (65 536 pre-drawn, seed 11), so
+  writes keep evicting. Every `[:theine, :maintenance, :pass]` event during
+  the run is collected.
+
+`--max-size` defaults to 1 000 000. M2.11 adds the `theine` subject. Until
+then every section says "no theine subject yet" and the bench exits 0.
+
+Extra `system` fields: `max_size`, `duration_s`, `sample_ms`, `settle_ms`,
+`write_hwm`, `pass_budget_ms`, `read_fraction`, `ttl_ms`, `zipf_s`,
+`key_space`, `subjects` (names), `missing_erl_flags` (list).
+
+Each `results` row is one subject:
+
+| field | type | meaning |
+|---|---|---|
+| `subject` | string | `theine` |
+| `max_size` | integer | cache bound |
+| `overshoot.limit` | integer | `max_size + write_hwm + schedulers_online` |
+| `overshoot.max_sample` | integer | largest sampled table size during the write run |
+| `overshoot.samples` | integer | number of samples taken |
+| `overshoot.writes` | integer | puts completed in the write run |
+| `overshoot.settled_size` | integer | table size 1 s after the writers stopped |
+| `pass.count` | integer | pass events in the mixed run |
+| `pass.p50_us`, `pass.p99_us`, `pass.max_us` | number or null | pass `duration`, µs, nearest rank; null with no passes |
+| `backpressure.reads`, `backpressure.writes` | integer | operations in the mixed run |
+| `backpressure.call_writes` | integer or null | writes that took the call path (specs/03), null when the subject cannot tell |
+| `backpressure.fraction` | number or null | `call_writes / writes` |
+
+Thresholds (specs/09):
+
+- A5 `max sampled size <= max_size + write_hwm + schedulers`: actual
+  `max_sample`, limit `overshoot.limit`.
+- A5 `size 1000 ms after writers stop`: actual `settled_size`, limit
+  `<= max_size`.
+- budget `pass p99 (us)`: `<= 5000`; budget `pass max (us)`: `<= 20000`.
+  A run with no pass events fails `maintenance pass events observed`
+  (actual `0`, limit `>= 1`) rather than passing vacuously.
+- Backpressure is reported only.
+
 ## Traces (`mix bench.traces`)
 
 ```bash

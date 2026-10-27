@@ -92,6 +92,49 @@ when those subjects exist. Until then the summary says "none evaluated".
 - A2: `ips/ets >= 0.75` at full parallelism; `ips / cachex ips >= 2` and
   `ips / nebulex ips >= 2` at full parallelism when those subjects exist.
 
+## `hitrate` (A3)
+
+```bash
+mix bench hitrate                    # every trace in bench/traces.exs
+mix bench hitrate --traces loop,zipf # a subset, by name
+```
+
+A replay harness, not Benchee. Each trace in the manifest is replayed at each
+of its `sizes` through every policy, all instances driven in one pass over
+the file. Every entry has weight 1; a hit is a key present in the policy at
+the time of its access. Traces are not downloaded or generated here: each
+must already be in `bench/traces/` with its recorded SHA-256
+(`mix bench.traces`). A trace that is missing, has no recorded hash, or does
+not match fails one A3 threshold per size instead of being skipped.
+`--manifest` and `--dir` select another manifest and trace directory.
+
+Policies: `lru` (`Theine.Bench.LRU`, two private ETS tables, a baseline and
+not a product). M2.10 adds `theine`.
+
+Extra `system` fields: `traces` (names replayed), `policies` (names).
+
+Each `results` row:
+
+| field | type | meaning |
+|---|---|---|
+| `trace` | string | manifest name |
+| `size` | integer | cache capacity in entries |
+| `policy` | string | `lru`, `theine` |
+| `status` | string | `"ok"`, or `"error"` when the trace could not be replayed |
+| `error` | string or null | why the trace could not be replayed |
+| `requests` | integer or null | keys replayed (an ARC line counts once per block) |
+| `hits` | integer or null | |
+| `hit_rate` | number or null | `100 * hits / requests`, in percent |
+| `seconds` | number or null | wall time of the shared replay pass, so equal across the trace's rows |
+
+Thresholds (specs/09):
+
+- A3 `trace available, <trace> at <size>`: actual `0`, limit `== 1`, for
+  every row whose trace could not be replayed.
+- A3 `theine - lru hit rate (points), <trace> at <size>`: `>= 0.0` on every
+  row; also `>= 10.0` on `loop` 1 000 and `OLTP` 1 000 and 2 000. Evaluated
+  only where both policies ran; until then the summary says "none evaluated".
+
 ## Traces (`mix bench.traces`)
 
 ```bash

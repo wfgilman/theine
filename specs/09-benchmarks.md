@@ -157,3 +157,11 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   allows only URLs and hashes that were actually downloaded. Until they are
   recorded, the task fails and names each ARC trace (IMPLEMENTATION_PLAN.md
   M0.4b).
+- 2026-10-27 (M0.5): how `mix bench hitrate` replays, where the text above
+  left it open. Every access has weight 1, and an ARC line requests each of
+  its blocks as one key, as Caffeine's simulator reads them. The harness
+  only verifies traces and never downloads or generates them. A trace that
+  is missing or does not match its hash counts as one failed A3 threshold
+  per size ("trace available"), so the bench exits non-zero rather than
+  skipping the row. `--traces` selects a subset by name. Hit rates are
+  reported in percent, so the A3 margin compares percentage points directly.

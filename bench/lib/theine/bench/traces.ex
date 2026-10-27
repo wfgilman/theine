@@ -110,6 +110,68 @@ defmodule Theine.Bench.Traces do
     {:error, "SHA-256 mismatch: expected #{expected}, got #{actual}"}
   end
 
+  @doc """
+  Checks that a trace is present in `dir` with its recorded hash, without
+  downloading or generating anything. The hit-rate bench calls this so that a
+  missing or stale trace fails its row loudly instead of being skipped.
+  """
+  @spec verify(entry(), Path.t()) :: :ok | {:error, String.t()}
+  def verify(entry, dir \\ @dir) do
+    file = path(entry, dir)
+
+    cond do
+      is_nil(entry.sha256) ->
+        {:error, "#{entry.name}: no SHA-256 recorded in the manifest (run mix bench.traces)"}
+
+      not File.regular?(file) ->
+        {:error, "#{entry.name}: #{file} is missing (run mix bench.traces)"}
+
+      sha256_file(file) != entry.sha256 ->
+        {:error, "#{entry.name}: #{file} does not match its SHA-256 (run mix bench.traces)"}
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  Folds `fun` over every key a trace requests, in order.
+
+  An `:arc` line `start count _ _` requests the blocks `start .. start +
+  count - 1`, one key each, as Caffeine's simulator reads them. A `:keys`
+  line is one key.
+  """
+  @spec reduce_keys(entry(), Path.t(), acc, (non_neg_integer(), acc -> acc)) :: acc
+        when acc: term()
+  def reduce_keys(%{format: format} = entry, dir \\ @dir, acc, fun) do
+    entry
+    |> path(dir)
+    |> File.stream!(:line, read_ahead: @chunk)
+    |> Enum.reduce(acc, fn line, acc -> reduce_line(format, line, acc, fun) end)
+  end
+
+  defp reduce_line(:keys, line, acc, fun) do
+    case String.trim_trailing(line) do
+      "" -> acc
+      key -> fun.(String.to_integer(key), acc)
+    end
+  end
+
+  defp reduce_line(:arc, line, acc, fun) do
+    case String.split(line) do
+      [start, count | _] ->
+        reduce_blocks(String.to_integer(start), String.to_integer(count), acc, fun)
+
+      [] ->
+        acc
+    end
+  end
+
+  defp reduce_blocks(_block, 0, acc, _fun), do: acc
+
+  defp reduce_blocks(block, count, acc, fun),
+    do: reduce_blocks(block + 1, count - 1, fun.(block, acc), fun)
+
   ## Download
 
   defp fetch(entry, part) do

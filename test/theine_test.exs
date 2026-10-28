@@ -3,7 +3,7 @@ defmodule TheineTest do
 
   import Theine.Test.Helpers
 
-  alias Theine.Config
+  alias Theine.{Config, Entry}
 
   doctest Theine
 
@@ -263,6 +263,168 @@ defmodule TheineTest do
       Theine.run_maintenance(cache)
       assert Theine.size(cache) == 2
       assert Theine.weighted_size(cache) == 3
+    end
+  end
+
+  describe "put_new/4, delete/2 and clear/1" do
+    setup do
+      cache = unique_cache()
+      start_supervised!({Theine, name: cache, max_size: :infinity})
+      %{cache: cache}
+    end
+
+    test "put_new returns {:error, :exists} and sends no event", %{cache: cache} do
+      assert Theine.put_new(cache, :a, 1, weight: 2) == :ok
+      Theine.run_maintenance(cache)
+      {:ok, {:a, id, nil, _, 2, :infinity}} = Theine.Maintenance.policy_row(cache, :a)
+
+      assert Theine.put_new(cache, :a, 2, weight: 5) == {:error, :exists}
+
+      assert Theine.get(cache, :a) == {:ok, 1}
+      assert [{:a, 1, ^id, 2, _, :infinity}] = :ets.lookup(cache, :a)
+      # No event: pending is untouched and the policy row is the original one.
+      assert Theine.Maintenance.policy_row(cache, :a) == {:ok, {:a, id, nil, 1, 2, :infinity}}
+      assert %{pending: 0, size: 1, weighted_size: 2} = Theine.Maintenance.info(cache)
+    end
+
+    test "put_new replaces an expired entry and counts the expiration" do
+      cache = unique_cache()
+      start_supervised!({Theine.Test.Clock, cache: cache, at: 1_000})
+      start_supervised!({Theine, name: cache, max_size: :infinity})
+      counters = Config.get(cache).counters
+
+      assert Theine.put_new(cache, :a, 1, ttl: 10) == :ok
+      [{:a, 1, old_id, 1, 1_000, 1_010}] = :ets.lookup(cache, :a)
+      assert Theine.put_new(cache, :a, 2) == {:error, :exists}
+
+      Theine.Test.Clock.advance(cache, 10)
+      assert Theine.put_new(cache, :a, 2) == :ok
+
+      assert [{:a, 2, new_id, 1, 1_010, :infinity}] = :ets.lookup(cache, :a)
+      assert new_id > old_id
+      assert Theine.get(cache, :a) == {:ok, 2}
+      Theine.run_maintenance(cache)
+      assert {:ok, {:a, ^new_id, nil, _, 1, :infinity}} = Theine.Maintenance.policy_row(cache, :a)
+      assert %{pending: 0, size: 1} = Theine.Maintenance.info(cache)
+      # One expiration, no miss (counter indices from specs/08 §Stats).
+      assert :counters.get(counters, 6) == 1
+      assert :counters.get(counters, 2) == 0
+    end
+
+    test "delete is idempotent and removes the policy row", %{cache: cache} do
+      Theine.put(cache, :a, 1, weight: 3)
+      Theine.put(cache, :b, 1)
+      Theine.run_maintenance(cache)
+      assert %{size: 2, weighted_size: 4} = Theine.Maintenance.info(cache)
+
+      assert Theine.delete(cache, :a) == :ok
+      assert Theine.get(cache, :a) == :error
+      assert :ets.lookup(cache, :a) == []
+      Theine.run_maintenance(cache)
+      assert Theine.Maintenance.policy_row(cache, :a) == :error
+      assert %{pending: 0, size: 1, weighted_size: 1} = Theine.Maintenance.info(cache)
+
+      assert Theine.delete(cache, :a) == :ok
+      assert Theine.delete(cache, :never_there) == :ok
+      assert %{pending: 0, size: 1, weighted_size: 1} = Theine.Maintenance.info(cache)
+      assert Theine.get(cache, :b) == {:ok, 1}
+    end
+
+    test "concurrent puts of one key followed by delete leave no policy row", %{cache: cache} do
+      # Discovered issue 2 (specs/05 §Decisions M1.5): two writers racing on
+      # one key can leave the policy row with an id the table never kept.
+      # The delete's removal event must still clear the row.
+      for round <- 1..200 do
+        key = {:race, round}
+
+        [
+          Task.async(fn -> Theine.put(cache, key, :one) end),
+          Task.async(fn -> Theine.put(cache, key, :two) end)
+        ]
+        |> Task.await_many()
+
+        Theine.delete(cache, key)
+      end
+
+      Theine.run_maintenance(cache)
+      assert %{pending: 0, size: 0, weighted_size: 0} = Theine.Maintenance.info(cache)
+      assert :ets.info(cache, :size) == 0
+    end
+
+    test "clear empties the table and the policy tables before returning", %{cache: cache} do
+      for i <- 1..100, do: Theine.put(cache, i, i, weight: 2)
+      Theine.run_maintenance(cache)
+      assert Theine.size(cache) == 100
+      config = Config.get(cache)
+
+      assert Theine.clear(cache) == :ok
+
+      assert :ets.info(cache, :size) == 0
+      assert Theine.size(cache) == 0
+      assert Theine.weighted_size(cache) == 0
+      assert Theine.get(cache, 1) == :error
+      assert Theine.Maintenance.policy_row(cache, 1) == :error
+      # Config untouched (specs/01 §Tables and handles), cache still usable.
+      assert Config.get(cache) == config
+      Theine.put(cache, :after, 1)
+      Theine.run_maintenance(cache)
+      assert Theine.get(cache, :after) == {:ok, 1}
+      assert Theine.size(cache) == 1
+    end
+
+    test "oversized entry is not stored and produces no write event", %{cache: cache} do
+      # Only max_size: :infinity starts until M2.4; the write path is
+      # exercised with a bounded copy of the running cache's config.
+      config = %{Config.get(cache) | max_size: 10}
+
+      assert Entry.put(config, :big, 1, weight: 11) == :ok
+      assert Entry.put_new(config, :big, 1, weight: 11) == :ok
+      assert :ets.lookup(cache, :big) == []
+      assert :atomics.get(config.ids, 1) == 0
+      assert %{pending: 0, size: 0} = Theine.Maintenance.info(cache)
+
+      assert Entry.put(config, :fits, 1, weight: 10) == :ok
+      assert Theine.get(cache, :fits) == {:ok, 1}
+      Theine.run_maintenance(cache)
+      assert %{pending: 0, size: 1, weighted_size: 10} = Theine.Maintenance.info(cache)
+    end
+
+    test "an oversized weigher result is rejected like weight:", %{cache: cache} do
+      config = %{Config.get(cache) | max_size: 10, weigher: fn _k, v -> byte_size(v) end}
+
+      assert Entry.put(config, :big, String.duplicate("x", 11), []) == :ok
+      assert :ets.lookup(cache, :big) == []
+      assert Entry.put(config, :small, "xxxxx", []) == :ok
+      assert [{:small, "xxxxx", _, 5, _, :infinity}] = :ets.lookup(cache, :small)
+    end
+
+    test "weigher result is stored as the entry weight and weight: overrides it" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, name: cache, max_size: :infinity, weigher: fn _k, v -> byte_size(v) end}
+      )
+
+      Theine.put(cache, :a, "four")
+      assert [{:a, "four", _, 4, _, :infinity}] = :ets.lookup(cache, :a)
+      assert Theine.put_new(cache, :b, "sixsix") == :ok
+      assert [{:b, "sixsix", _, 6, _, :infinity}] = :ets.lookup(cache, :b)
+      Theine.put(cache, :c, "ignored", weight: 1)
+      assert [{:c, "ignored", _, 1, _, :infinity}] = :ets.lookup(cache, :c)
+
+      Theine.run_maintenance(cache)
+      assert Theine.size(cache) == 3
+      assert Theine.weighted_size(cache) == 11
+    end
+
+    test "a weigher that returns a bad weight raises ArgumentError" do
+      cache = unique_cache()
+      start_supervised!({Theine, name: cache, max_size: :infinity, weigher: fn _k, v -> v end})
+
+      assert_raise ArgumentError, ~r/weigher/, fn -> Theine.put(cache, :a, 0) end
+      assert_raise ArgumentError, ~r/weigher/, fn -> Theine.put_new(cache, :a, :atom) end
+      assert Theine.get(cache, :a) == :error
+      assert Theine.put(cache, :a, 2) == :ok
     end
   end
 

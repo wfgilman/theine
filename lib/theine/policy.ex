@@ -26,13 +26,14 @@ defmodule Theine.Policy do
   @type t :: %__MODULE__{
           policy: :ets.table(),
           ids: :ets.table(),
+          table: Config.cache(),
           sizes: :atomics.atomics_ref(),
           max_size: pos_integer() | :infinity,
           next_seq: pos_integer()
         }
 
-  @enforce_keys [:policy, :ids, :sizes, :max_size]
-  defstruct [:policy, :ids, :sizes, :max_size, next_seq: 1]
+  @enforce_keys [:policy, :ids, :table, :sizes, :max_size]
+  defstruct [:policy, :ids, :table, :sizes, :max_size, next_seq: 1]
 
   # Positions in a policy row (1-based, for :ets.update_element/3).
   @row_id 2
@@ -56,10 +57,11 @@ defmodule Theine.Policy do
   `sizes` atomics of `config`.
   """
   @spec new(Config.t()) :: t()
-  def new(%Config{sizes: sizes, max_size: max_size}) do
+  def new(%Config{table: table, sizes: sizes, max_size: max_size}) do
     state = %__MODULE__{
       policy: :ets.new(__MODULE__, [:set, :private]),
       ids: :ets.new(__MODULE__.Ids, [:set, :private]),
+      table: table,
       sizes: sizes,
       max_size: max_size
     }
@@ -115,22 +117,35 @@ defmodule Theine.Policy do
   end
 
   @doc """
-  Applies a `{:removed, key, id}` event (specs/05 §Events `on_remove`). The
-  rows are deleted only when `id` is the key's current id; a stale removal
-  for a version already replaced is ignored.
+  Applies a `{:removed, key, id}` event (specs/05 §Events `on_remove`).
+
+  The rows are deleted when `id` is the key's current id. A removal with
+  another id is stale, and the row is kept while the entries table still
+  holds the key: a newer version's `:put` is in flight or already applied.
+  When the table lacks the key, the row is dropped: two writers racing on
+  one key can apply their `:put` events in the opposite order to their
+  inserts, leaving the row with an id the table never kept, and the removal
+  of the surviving version is the moment to notice (specs/05 §Decisions).
   """
   @spec on_remove(t(), Entry.key(), Entry.id()) :: t()
   def on_remove(%__MODULE__{} = state, key, id) do
     case :ets.lookup(state.policy, key) do
       [{^key, ^id, _segment, _seq, weight, _expires_at}] ->
-        true = :ets.delete(state.policy, key)
-        true = :ets.delete(state.ids, id)
-        add(state, -1, -weight)
-        state
+        drop(state, key, id, weight)
 
-      _ ->
+      [{^key, row_id, _segment, _seq, weight, _expires_at}] ->
+        if :ets.member(state.table, key), do: state, else: drop(state, key, row_id, weight)
+
+      [] ->
         state
     end
+  end
+
+  defp drop(state, key, id, weight) do
+    true = :ets.delete(state.policy, key)
+    true = :ets.delete(state.ids, id)
+    add(state, -1, -weight)
+    state
   end
 
   @doc "Empties the tables and zeroes the published sizes (`Theine.clear/1`)."

@@ -75,6 +75,10 @@ test/                         mirrors lib/; test/support for shared helpers
   build takes about 2.5 min per env.
 - `mix bench` and its helpers live in `bench/lib`, compiled in `:dev` only. Use
   `mix bench get --sizes 1000 --warmup 0.2 --time 0.5` for a quick smoke run.
+- Run the gating `mix bench get` as
+  `mise exec -- env ERL_FLAGS="+sbt db +sbwt very_long" mix bench get`. Without
+  the flags the p99 at n=1000 tuple3 parallel=1 wanders by ±0.1× between
+  runs of the same tree and has crossed the A1 limit once (M1.5).
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

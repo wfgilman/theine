@@ -64,8 +64,11 @@ is the main structural concession to the BEAM.
 ### `on_remove(key, id)`
 
 If `ids` maps `id` to `key` and `policy` holds that id: delete from all three
-tables and subtract the weight. Otherwise ignore (a stale removal for a
-version already replaced).
+tables and subtract the weight. Otherwise the removal is stale (for a
+version already replaced): if the entries table still holds `key`, ignore
+it, since a newer version's `:put` is in flight or already applied; if the
+table lacks `key`, drop the key's rows anyway, because the row's id can be
+one the table never kept (§Decisions 2026-10-27 M1.5).
 
 ### `on_access(id)`
 
@@ -158,6 +161,21 @@ default false, and must not change any non-adaptive test result.
 
 ## Decisions
 
+- 2026-10-27 (M1.5): a stale `on_remove` consults the entries table. `put/4`
+  allocates the id before the insert and sends the event after it, so two
+  writers racing on one key can insert in one order and send in the other:
+  the table keeps the lower id while the policy applies the higher id's
+  `:put` last, or the reverse. The row's id then matches nothing in the
+  table. In a bounded cache the eviction re-lookup (specs/04 §Removing an
+  entry) drops such a row eventually; in an unbounded cache nothing did,
+  so `size/1` drifted by one per race and `delete/2` could never clear the
+  row (its `{:removed, key, id}` carries the table's id, which the policy
+  called stale). The fix is one `:ets.member/2` on the entries table in the
+  stale branch only: key absent means the removal was for the last version
+  the table held, so the row goes; key present means a third version's
+  `:put` is in flight or applied, so the row stays and that event corrects
+  the id. Off the hot path, and `clear/1`'s synchronous `reset/1` heals the
+  same way.
 - 2026-10-27 (M1.2): the policy state is a `%Theine.Policy{}` struct (the
   two or three tables, the `sizes` atomics, `max_size`, the next `seq`) that
   the maintenance process threads through every call, so the functions

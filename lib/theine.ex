@@ -48,6 +48,10 @@ defmodule Theine do
   An unknown option, a missing `name` or `max_size`, or a value of the wrong
   type raises `ArgumentError` naming the option.
 
+  The `weigher` is called on every write without a `weight:` option and
+  must return a positive integer; an entry heavier than `max_size` is never
+  stored (see `put/4`).
+
   `test_hooks: true` enables `Theine.Maintenance.pause/1` and `resume/1`,
   which stop and restart the maintenance process's consumption of write
   events so tests can observe backpressure and lazy expiry. Never set it in
@@ -173,7 +177,11 @@ defmodule Theine do
   - `ttl:` milliseconds or `:infinity`, the time after which the entry
     expires; defaults to the cache's `expire_after_write`.
   - `weight:` a positive integer, the entry's weight toward `max_size`;
-    defaults to 1.
+    defaults to the cache's `weigher` applied to the key and value, or 1
+    without one.
+
+  An entry whose weight exceeds `max_size` is not stored: the call returns
+  `:ok` and the cache is unchanged, as Caffeine does with oversized entries.
 
       iex> {:ok, _} = Theine.start_link(name: :put_doc, max_size: :infinity)
       iex> Theine.put(:put_doc, :a, 1)
@@ -186,6 +194,66 @@ defmodule Theine do
   @spec put(cache(), key(), value(), keyword()) :: :ok
   def put(cache, key, value, opts \\ []) when is_list(opts) do
     Entry.put(:persistent_term.get(cache), key, value, opts)
+  end
+
+  @doc """
+  Stores `value` under `key` only when `key` is absent. Returns `:ok` when
+  stored, `{:error, :exists}` otherwise; an existing entry is left as it is
+  and the maintenance process hears nothing. An expired entry counts as
+  absent and is replaced. Takes the same options as `put/4`, with the same
+  treatment of oversized entries.
+
+      iex> {:ok, _} = Theine.start_link(name: :put_new_doc, max_size: :infinity)
+      iex> Theine.put_new(:put_new_doc, :a, 1)
+      :ok
+      iex> Theine.put_new(:put_new_doc, :a, 2)
+      {:error, :exists}
+      iex> Theine.get(:put_new_doc, :a)
+      {:ok, 1}
+  """
+  @spec put_new(cache(), key(), value(), keyword()) :: :ok | {:error, :exists}
+  def put_new(cache, key, value, opts \\ []) when is_list(opts) do
+    Entry.put_new(:persistent_term.get(cache), key, value, opts)
+  end
+
+  @doc """
+  Removes `key` and returns `:ok`, whether or not it was present. The
+  current version is looked up first and deleted by exact object, so a
+  concurrent `put/4` of the same key is never lost (specs/01 §Write path).
+
+      iex> {:ok, _} = Theine.start_link(name: :delete_doc, max_size: :infinity)
+      iex> Theine.put(:delete_doc, :a, 1)
+      :ok
+      iex> Theine.delete(:delete_doc, :a)
+      :ok
+      iex> Theine.delete(:delete_doc, :a)
+      :ok
+      iex> Theine.get(:delete_doc, :a)
+      :error
+  """
+  @spec delete(cache(), key()) :: :ok
+  def delete(cache, key) do
+    Entry.delete(:persistent_term.get(cache), key)
+  end
+
+  @doc """
+  Removes every entry and returns `:ok` once the maintenance process has
+  forgotten them too, so `size/1` reads 0 afterwards. The cache's
+  configuration and statistics are untouched.
+
+      iex> {:ok, _} = Theine.start_link(name: :clear_doc, max_size: :infinity)
+      iex> Theine.put(:clear_doc, :a, 1)
+      :ok
+      iex> Theine.clear(:clear_doc)
+      :ok
+      iex> {Theine.get(:clear_doc, :a), Theine.size(:clear_doc)}
+      {:error, 0}
+  """
+  @spec clear(cache()) :: :ok
+  def clear(cache) do
+    %{table: table} = :persistent_term.get(cache)
+    true = :ets.delete_all_objects(table)
+    Theine.Maintenance.reset(cache)
   end
 
   @doc """

@@ -80,12 +80,33 @@ defmodule Theine.MaintenanceTest do
     } do
       config = Config.get(cache)
       name = Maintenance.name(cache)
+      :ets.insert(cache, {:a, 1, 7, 1, 0, :infinity})
 
       :atomics.add(config.pending, 1, 3)
       send(name, {:put, :a, 7, 1, :infinity})
       send(name, {:removed, :a, 6})
       assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 7, nil, 1, 1, :infinity}}
 
+      send(name, {:removed, :a, 7})
+      assert Maintenance.policy_row(cache, :a) == :error
+      assert %{pending: 0, size: 0, weighted_size: 0} = Maintenance.info(cache)
+    end
+
+    test "a stale :removed event drops the row once the entries table lacks the key", %{
+      cache: cache
+    } do
+      # specs/05 §Decisions (M1.5): the table kept id 7, the policy applied
+      # id 8 last; the delete of id 7 must still clear the row.
+      config = Config.get(cache)
+      name = Maintenance.name(cache)
+      :ets.insert(cache, {:a, 1, 7, 1, 0, :infinity})
+
+      :atomics.add(config.pending, 1, 3)
+      send(name, {:put, :a, 7, 1, :infinity})
+      send(name, {:put, :a, 8, 2, :infinity})
+      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 8, nil, 1, 2, :infinity}}
+
+      :ets.delete(cache, :a)
       send(name, {:removed, :a, 7})
       assert Maintenance.policy_row(cache, :a) == :error
       assert %{pending: 0, size: 0, weighted_size: 0} = Maintenance.info(cache)
@@ -99,13 +120,15 @@ defmodule Theine.MaintenanceTest do
     test "an {:event, _} call is consumed in mailbox order and replied to", %{cache: cache} do
       config = Config.get(cache)
       name = Maintenance.name(cache)
+      :ets.insert(cache, {:a, 1, 8, 2, 0, :infinity})
 
       :atomics.add(config.pending, 1, 3)
       send(name, {:put, :a, 7, 1, :infinity})
       assert GenServer.call(name, {:event, {:put, :a, 8, 2, :infinity}}) == :ok
       assert GenServer.call(name, {:event, {:removed, :a, 7}}) == :ok
 
-      # The stale removal arrived after the :put of id 8 and was ignored.
+      # The stale removal arrived after the :put of id 8, which is live in
+      # the table, and was ignored.
       assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 8, nil, 1, 2, :infinity}}
       assert %{pending: 0, size: 1, weighted_size: 2} = Maintenance.info(cache)
     end

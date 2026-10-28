@@ -109,7 +109,10 @@ The reader found an entry past its `expires_at`. It:
    carries ids.
 
 `put_new/4` is the same with `:ets.insert_new/2`; on `false` it returns
-`{:error, :exists}` and sends no event.
+`{:error, :exists}` and sends no event, unless the entry in the way is
+expired: then it is removed exactly as the expired-read branch does (delete
+by exact object, `{:removed, key, id}`, `expirations` incremented, no miss
+counted) and the insert is retried (§Decisions 2026-10-27 M1.5).
 
 `delete/2`: `:ets.lookup` to learn the current id (needed so the policy can
 discard the right version), `:ets.delete_object` with that exact tuple, then
@@ -168,6 +171,16 @@ are emptied before `clear/1` returns.
   mean the bounded hit path of M2.8 (one scheduler-id read and three
   atomics ops more, about 65 ns measured in isolation) will need the same
   care; IMPLEMENTATION_PLAN.md records the risk.
+- 2026-10-27 (M1.5): `put_new/4` treats an expired entry as absent. specs/06
+  says an entry past its `expires_at` is never returned by any read and
+  does not depend on the maintenance process being caught up; a `put_new`
+  that reported `{:error, :exists}` for a key `get/2` reports absent would
+  contradict that until the sweep ran. The cost is one lookup on the
+  `false` branch only, so the successful path is unchanged. The weigher
+  result is checked the same way as the `weight:` option (a non-positive
+  or non-integer result raises `ArgumentError` in the writer), and an
+  oversized `put_new` returns `:ok` without looking at the table, like
+  `put/4`.
 - 2026-10-27 (after M1.2, human decision): a bounded hit does not touch
   `:counters`. The read buffer claims a sequence number on every hit, so
   the sum of the stripe tails is already the exact hit count (specs/03).

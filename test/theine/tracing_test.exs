@@ -84,4 +84,54 @@ defmodule Theine.TracingTest do
              {:ets, :insert, 2} => 1
            }
   end
+
+  test "put_new of a new key performs persistent_term.get, atomics.add_get ×2, ets.insert_new",
+       %{cache: cache} do
+    calls = Trace.calls(@modules, fn -> :ok = Theine.put_new(cache, :new, 1) end)
+
+    assert calls == %{
+             {:persistent_term, :get, 1} => 1,
+             {:atomics, :add_get, 3} => 2,
+             {:ets, :insert_new, 2} => 1
+           }
+  end
+
+  test "put_new of a present key adds one ets.lookup and touches pending not at all",
+       %{cache: cache} do
+    calls =
+      Trace.calls(@modules, fn -> {:error, :exists} = Theine.put_new(cache, :present, 2) end)
+
+    # The one add_get is the id; no `pending` increment means no event.
+    assert calls == %{
+             {:persistent_term, :get, 1} => 1,
+             {:atomics, :add_get, 3} => 1,
+             {:ets, :insert_new, 2} => 1,
+             {:ets, :lookup, 2} => 1
+           }
+  end
+
+  test "delete performs persistent_term.get, ets.lookup, ets.delete_object, atomics.add_get",
+       %{cache: cache} do
+    calls = Trace.calls(@modules, fn -> :ok = Theine.delete(cache, :present) end)
+
+    assert calls == %{
+             {:persistent_term, :get, 1} => 1,
+             {:ets, :lookup, 2} => 1,
+             {:ets, :delete_object, 2} => 1,
+             {:atomics, :add_get, 3} => 1
+           }
+  end
+
+  test "delete of an absent key performs persistent_term.get, ets.lookup", %{cache: cache} do
+    calls = Trace.calls(@modules, fn -> :ok = Theine.delete(cache, :absent) end)
+
+    assert calls == %{{:persistent_term, :get, 1} => 1, {:ets, :lookup, 2} => 1}
+  end
+
+  test "an oversized put touches nothing", %{cache: cache} do
+    config = %{Theine.Config.get(cache) | max_size: 1}
+    calls = Trace.calls(@modules, fn -> :ok = Theine.Entry.put(config, :big, 1, weight: 2) end)
+
+    assert calls == %{}
+  end
 end

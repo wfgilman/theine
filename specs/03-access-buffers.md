@@ -154,3 +154,27 @@ new process registers, and the mutation preceded the send.
   incremented on every hit by step 2 of `record/2`; `stats/1` reading
   `stripes` atomics once per call costs nothing on the hot path. This
   removed the `:counters.add` from the bounded hit (specs/01 §Decisions).
+- 2026-10-27 (M2.3): the drain is a fold. The maintenance process threads
+  its `%Theine.Policy{}` through `Policy.on_access/2`, so `drain/2` with a
+  side-effecting `fun.(id)` could not carry the state. `ReadBuffer.drain/3`
+  takes `(config, acc, fun.(id, acc))` and returns `{acc, reads, full?}`:
+  `reads` is the number of ids handed to `fun` (the `reads` measurement of
+  the pass telemetry, specs/04 step 8) and `full?` is true when some stripe
+  had `tail - head >= slots` when it was read, the "drained a full stripe"
+  condition that makes the pass send itself `:drain`. `drain/2` with a
+  one-argument function still exists and returns `{reads, full?}`. The
+  layout helpers live in the module that owns the layout: `hits/1` (the
+  tail sum, which `Theine.Stats.hits/1` now calls), `lag/1` (the sum of
+  `tail - head`, for `info/1`), `reset_heads/1` (for specs/04 §Restart
+  semantics step 2) and `dump/1` for tests.
+- 2026-10-27 (M2.3): `schedule_drain/1` never raises. `send/2` to an
+  unregistered name raises `ArgumentError`, and the maintenance name is
+  unregistered while the process restarts, so without a guard a cache hit
+  could crash a reader. The send is wrapped in a rescue in the rare branch
+  only (the common hit never reaches it), and on failure the flag is left
+  set rather than reset: resetting it would make every reader past the
+  threshold pay a compare-exchange, a failed send and an exception until the
+  restart completes, while leaving it costs them one failed compare-exchange.
+  `Theine.Maintenance.init/1` already clears the flag, and the restart
+  rebuild schedules its own `:drain` when over capacity (specs/04), so no
+  trigger is owed to the reader whose message was lost.

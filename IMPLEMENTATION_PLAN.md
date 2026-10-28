@@ -43,11 +43,11 @@ Done: M1.1, M1.2, M1.3, M1.4, M1.5, M1.6. M1 complete.
 
 ## M2 Policy
 
-Done: M2.1, M2.2.
+Done: M2.1, M2.2, M2.3.
 
 - [x] M2.1 `Theine.Sketch` layout, hashing, `increment/2`, `frequency/2`, `clear/1` (specs/02 §Layout, §Hashing, §Operations minus reset): `words = max(8, next_power_of_two(max_size))` capped at 2^30, `spread/1` mixer, `index/offset` in one private function — tests: sketch_test "layout vectors match the checked-in table", property "frequency equals min(n, 15) after n increments of one key", property "frequency never under-estimates the true count before saturation", "at least 95% of 100_000 single-hit keys report frequency <= 1 at max_size 10_000", "clear/1 zeroes every nibble". Met, with two spec changes (specs/02 §Decisions M2.1): the counter layout is Caffeine's real block layout (`rehash` for the counters, counter `i` in word pair `i` of the block) because the spec's paraphrase reused the block bits for counter 0 and could put two of a key's counters in one nibble; and the collision-quality threshold is now 99% at `frequency <= 3` plus 55% at `<= 1` (measured 99.7% and 61%), since 95% at `<= 1` is impossible at that load (the model and both layouts give about 62%). Notes for later tasks: the sketch is a `%Theine.Sketch{ref, words, block_mask}` struct around an unsigned `:atomics` array (`Config.sketch` typed accordingly; Owner allocates it with `Sketch.new(max_size)` in M2.4); `increment/2` returns `:ok` and does not count, so M2.2's caller keeps `size` and the reset cursor as specs/02 and specs/04 say; `Sketch.dump/1` and `Sketch.positions/2` exist for tests; `clear/1` writes every word (about 1 M atomics ops at `max_size` 1_000_000, fine for `clear/1` and restart, not for a pass).
 - [x] M2.2 `Theine.Sketch.reset/1` with chunked aging (specs/02 §Operations `reset/1`, `sample_size`): reset starts when `size >= sample_size`, advances at most `reset_chunk` words per call with a cursor kept by the caller — tests: sketch_test property "after a complete reset every nibble is old >>> 1 and size follows the odd-count rule", "a 2^20-word sketch resets in passes touching at most reset_chunk words each and frequency stays within [old/2, old] throughout". Met. API (specs/02 §Decisions M2.2): `Sketch.reset/1` halves everything and returns `odd`; `Sketch.reset(sketch, cursor, chunk \\ reset_chunk())` advances one chunk from a `{next_word, odd}` cursor (`Sketch.reset_start/0` to begin) and returns `{:more, cursor} | {:done, odd}`; `Sketch.size_after_reset(size, odd)` is the odd-count rule clamped at 0; `Sketch.sample_size/1` is `10 * max_size`. Notes for M2.7: the maintenance state keeps `sketch_size` (increments since the last completed reset, `+1` per `Sketch.increment/2` in `on_write`) and `sketch_reset :: nil | cursor`; start a reset with `reset_start/0` when `sketch_size >= sample_size` and none is running, call `reset/3` once per pass (step 6), and on `{:done, odd}` set `sketch_size = size_after_reset(sketch_size, odd)`; `Theine.clear/1` and a restart call `Sketch.clear/1` and zero both. The default chunk dropped from 65_536 to 16_384 words after measuring the loop at 92 ns per word on a loaded sketch (1.5 ms per chunk; 65_536 words took 6 ms, over the 5 ms `pass_budget` by itself); M2.11 re-measures in a full pass. The test suite grew by about 1 s: the 2^20-word test checks every pass's range and the whole array once.
-- [ ] M2.3 **(hot path)** `Theine.ReadBuffer` `record/2`, `drain/2`, `schedule_drain/1` (specs/03 §Read buffer): standalone over its own atomics array and flags, not yet wired into `get/2`; `Theine.Stats.hits/1` (M1.6) already sums the stripe tails from the specs/03 layout, so either keep that layout or move the sum into `ReadBuffer.hits/1` and call it from `Stats` — tests: read_buffer_test property "drain yields a sub-multiset of recorded ids, never more than slots per stripe", "drops instead of blocking" (drainer paused, readers at full speed, at most `slots` ids per stripe drained later), "a flood of reads with the drainer paused sends exactly one :drain message", "each stripe receives records with one reader pinned per scheduler".
+- [x] M2.3 **(hot path)** `Theine.ReadBuffer` `record/2`, `drain/2`, `schedule_drain/1` (specs/03 §Read buffer): standalone over its own atomics array and flags, not yet wired into `get/2`; `Theine.Stats.hits/1` (M1.6) already sums the stripe tails from the specs/03 layout, so either keep that layout or move the sum into `ReadBuffer.hits/1` and call it from `Stats` — tests: read_buffer_test property "drain yields a sub-multiset of recorded ids, never more than slots per stripe", "drops instead of blocking" (drainer paused, readers at full speed, at most `slots` ids per stripe drained later), "a flood of reads with the drainer paused sends exactly one :drain message", "each stripe receives records with one reader pinned per scheduler". Met. The tail sum moved into `ReadBuffer.hits/1` and `Stats.hits/1` calls it. Two spec decisions (specs/03 §Decisions M2.3): the drain is a fold, `drain(config, acc, fun.(id, acc))` returning `{acc, reads, full?}`, because the policy state must be threaded through `on_access`, with `drain/2` kept for a one-argument function; and `schedule_drain/1` rescues the `ArgumentError` of a send to the unregistered maintenance name during a restart, leaving the flag set. Also `lag/1` (sum of `tail - head`, for `info/1`), `reset_heads/1` (specs/04 §Restart step 2, for M2.9), `stripe_of/2` and `dump/1`. The tests also pin the ring arithmetic by hand (wrap-around, drops with stale ids in the last `slots` sequences, zero slots of readers that claimed but did not write, the threshold crossing at `t - head == drain_threshold`, a full stripe triggering above the threshold) and a second property drains concurrently with the readers. Notes for later tasks: `record/2` matches the config as a plain map (`read_buffer`, `stripes`, `read_buffer_slots`, `drain_threshold`, `flags`, `maintenance`), so M2.8 can call it or inline its body into `get/2` as specs/01 asks; its common path is exactly `system_info, add_get, get, put`; the drain-flag index stays `Theine.Owner.drain_flag/0`; M2.7's pass is `ReadBuffer.drain(config, policy, &Policy.on_access(&2, &1))` after clearing the flag, with `reads` and `full?` feeding telemetry and the follow-up `:drain`. `mix bench get` is a regression check only (`get/2` is untouched; table under §Benchmark log).
 - [ ] M2.4 **(policy)** `Theine.Policy` bounded mode: regions, `order` table, `on_write/4`, `on_remove/2` (specs/05 §Regions and sizes, §State, §Events `on_write`, `on_remove`): finite `max_size` now accepted by `start_link` (Owner allocates sketch, read buffer and flags only when bounded; `info/1` shows them absent for `:infinity`), new keys placed at window MRU with `Sketch.increment`, updates move to MRU of the current segment, `@max_seq` sentinel asserted — tests: policy_test property "after any sequence of on_write/on_remove every policy key has exactly one order row and one ids row and segment weights equal the sums", "on_remove with a stale id is ignored", "seq never reaches the sentinel" (assertion test), theine_test "max_size: :infinity shows no sketch or read buffer in info/1".
 - [ ] M2.5 **(policy)** `Theine.Policy.on_access/1` (specs/05 §Events `on_access`): window → window MRU; probation → protected MRU with demotion of protected LRU entries while `protected_weight > protected_max`; protected → protected MRU; unknown or stale id skipped — tests: policy_test "on_access promotes a probation entry to protected and demotes when over protected_max", "protected_weight <= protected_max after every on_access" (property), "on_access with an old id after the key was rewritten has no effect".
 - [ ] M2.6 **(policy)** `Theine.Policy.evict/1` with W-TinyLFU admission (specs/05 §Events `evict`, §Acceptance): window overflow into probation counted in `candidates`, a candidate cursor walking from probation MRU toward LRU with `:ets.prev/2`, victim vs candidate with `Sketch.frequency/2`, direct victim eviction once `candidates` reaches 0, `:rand` seeded from the cache name in `init/1`, the ≥ 6 random-admit guard, protected/window fallbacks for tiny caches, `evict_batch` cap returning `:more | :done`, removal by re-lookup and id compare (specs/04 §Removing an entry), `evictions` counter — tests: policy_test "victim freq 3 vs candidate freq 5 evicts the victim", "5 vs 3 evicts the candidate", "2 vs 2 evicts the candidate", "after evict returns :done total weight <= max_size", "scan resistance: 800-key working set retains at least 90% after streaming 100_000 distinct keys at max_size 1000", "removal by stale id leaves a concurrently rewritten entry in place".
@@ -102,7 +102,7 @@ Done: nothing yet.
 2. **Concurrent writes to one key can leave the policy with the wrong id** (found in M1.2, resolved in M1.5). `put/4` allocates the id before the insert, and the write event is sent after it, so two writers racing on one key can produce any interleaving of (insert, send) pairs: the entries table may end with the lower id while the policy applies the higher id's event last, or vice versa. The spec's rules (last `:put` event wins; `on_remove` ignores a stale id) then left a policy row whose id never matched the table; in an unbounded cache `size/1` drifted by one and `delete/2` could not clear the row. Resolved as recommended (specs/05 §Decisions 2026-10-27 M1.5): `on_remove(key, id)` with a non-matching id does one `:ets.member/2` on the entries table and drops the row when the key is absent; when the key is present with a third id, the row stays and that id's `:put` corrects it. Tested in policy_test, maintenance_test and the 200-round race in theine_test.
 3. **A write that straddles `clear/1` can leave a policy row with no entry** (noted in M1.5, not fixed). A writer that inserted before `:ets.delete_all_objects/1` and whose `:put` event is consumed after `Maintenance.reset/1` re-adds a policy row for a key the table no longer holds. No later event for that key arrives on its own (a `delete/2` of an absent key sends nothing), so in an unbounded cache the row lives until a `put` of the same key or a Maintenance restart rebuild (M2.9). In a bounded cache the eviction re-lookup drops it. The window is a few microseconds per `clear/1` and the cost is one phantom entry in `size/1`; the spec accepts it (specs/01 §Write path `clear/1`). If it matters later, `reset/1` could record the `ids` high-water mark and `on_write` ignore `:put` events with a lower id until the table confirms the key.
 
-4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6). Three crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression, each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry.
+4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6, M2.3). Four crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression (M2.3 did not touch `get/2` at all and crossed at 1.51× over a 362 ns floor), each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry.
 
 ## Open questions
 
@@ -120,6 +120,81 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M2.3 — `mix bench get`, theine_unbounded and theine_nostats vs ets, tree of commit after be396e0 (2026-10-27, 29/30 passed in the full run, 10/10 in the `--sizes 1000` confirmation)
+
+Regression check only: this commit adds `Theine.ReadBuffer` and moves the
+tail sum out of `Theine.Stats.hits/1`, which `get/2` does not call. Run
+with `ERL_FLAGS="+sbt db +sbwt very_long"`. p50 1.20–1.38×, p99 1.10–1.33×,
+ips 0.66–0.86× of `ets` for `theine_unbounded`, the band of M1.5 and M1.6.
+The one failed check is the usual one, `theine_unbounded` p99 at n=1000
+tuple3 parallel=1 at 1.51× over an `ets` p99 floor of 362 ns, the lowest
+floor in any log here (384–433 before); `theine_unbounded`'s own p99
+there, 548 ns, is inside the 471–696 band of every earlier run. The
+`--sizes 1000` rerun of the same tree passed 10/10 with the shape at 1.29×
+(floor 403 ns), which clears it per specs/09 §Decisions M1.6. That rerun
+showed `theine_nostats` p99 at 1.58× on n=1000 binary_1kb parallel=1 (670
+vs 485 ns in the full run, p50 unchanged at 300–306 ns): no threshold
+applies to that subject, and it is the same one-off p99 wobble on a
+different shape.
+
+Full run:
+
+| n | value | parallel | subject | p50 ns | p99 ns | ips | p50/ets | p99/ets | ips/ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1000 | tuple3 | 1 | ets | 246.00 | 362.00 | 3931431 | 1.00 | 1.00 | 1.00 |
+| 1000 | tuple3 | 1 | theine_nostats | 283.00 | 440.00 | 3203041 | 1.15 | 1.22 | 0.81 |
+| 1000 | tuple3 | 1 | theine_unbounded | 313.00 | 548.00 | 2822244 | 1.27 | 1.51 | 0.72 |
+| 1000 | tuple3 | 4 | ets | 391.00 | 584.00 | 2465531 | 1.00 | 1.00 | 1.00 |
+| 1000 | tuple3 | 4 | theine_nostats | 468.00 | 668.00 | 1945454 | 1.20 | 1.14 | 0.79 |
+| 1000 | tuple3 | 4 | theine_unbounded | 539.00 | 778.00 | 1623535 | 1.38 | 1.33 | 0.66 |
+| 1000 | binary_1kb | 1 | ets | 271.00 | 415.00 | 3034430 | 1.00 | 1.00 | 1.00 |
+| 1000 | binary_1kb | 1 | theine_nostats | 300.00 | 485.00 | 2776090 | 1.11 | 1.17 | 0.91 |
+| 1000 | binary_1kb | 1 | theine_unbounded | 330.00 | 525.00 | 2548482 | 1.22 | 1.27 | 0.84 |
+| 1000 | binary_1kb | 4 | ets | 436.00 | 695.00 | 1870615 | 1.00 | 1.00 | 1.00 |
+| 1000 | binary_1kb | 4 | theine_nostats | 499.00 | 804.00 | 1679986 | 1.14 | 1.16 | 0.90 |
+| 1000 | binary_1kb | 4 | theine_unbounded | 563.00 | 836.00 | 1504642 | 1.29 | 1.20 | 0.80 |
+| 100000 | tuple3 | 1 | ets | 271.00 | 605.00 | 3140395 | 1.00 | 1.00 | 1.00 |
+| 100000 | tuple3 | 1 | theine_nostats | 341.00 | 636.00 | 2619896 | 1.26 | 1.05 | 0.83 |
+| 100000 | tuple3 | 1 | theine_unbounded | 351.00 | 675.00 | 2340990 | 1.30 | 1.12 | 0.75 |
+| 100000 | tuple3 | 4 | ets | 420.00 | 794.00 | 2127432 | 1.00 | 1.00 | 1.00 |
+| 100000 | tuple3 | 4 | theine_nostats | 504.00 | 898.00 | 1685155 | 1.20 | 1.13 | 0.79 |
+| 100000 | tuple3 | 4 | theine_unbounded | 565.00 | 963.00 | 1469783 | 1.35 | 1.21 | 0.69 |
+| 100000 | binary_1kb | 1 | ets | 293.00 | 603.00 | 2625233 | 1.00 | 1.00 | 1.00 |
+| 100000 | binary_1kb | 1 | theine_nostats | 323.00 | 674.00 | 2398793 | 1.10 | 1.12 | 0.91 |
+| 100000 | binary_1kb | 1 | theine_unbounded | 351.00 | 673.00 | 2241647 | 1.20 | 1.12 | 0.85 |
+| 100000 | binary_1kb | 4 | ets | 468.00 | 909.00 | 1702215 | 1.00 | 1.00 | 1.00 |
+| 100000 | binary_1kb | 4 | theine_nostats | 538.00 | 1043.00 | 1507570 | 1.15 | 1.15 | 0.89 |
+| 100000 | binary_1kb | 4 | theine_unbounded | 598.00 | 1003.00 | 1394043 | 1.28 | 1.10 | 0.82 |
+| 1000000 | tuple3 | 1 | ets | 326.00 | 587.00 | 2940437 | 1.00 | 1.00 | 1.00 |
+| 1000000 | tuple3 | 1 | theine_nostats | 374.00 | 638.00 | 2525528 | 1.15 | 1.09 | 0.86 |
+| 1000000 | tuple3 | 1 | theine_unbounded | 421.00 | 675.00 | 2258496 | 1.29 | 1.15 | 0.77 |
+| 1000000 | tuple3 | 4 | ets | 473.00 | 819.00 | 2012272 | 1.00 | 1.00 | 1.00 |
+| 1000000 | tuple3 | 4 | theine_nostats | 549.00 | 904.00 | 1652402 | 1.16 | 1.10 | 0.82 |
+| 1000000 | tuple3 | 4 | theine_unbounded | 614.00 | 997.00 | 1438988 | 1.30 | 1.22 | 0.72 |
+| 1000000 | binary_1kb | 1 | ets | 347.00 | 628.00 | 2422452 | 1.00 | 1.00 | 1.00 |
+| 1000000 | binary_1kb | 1 | theine_nostats | 373.00 | 686.00 | 2255090 | 1.07 | 1.09 | 0.93 |
+| 1000000 | binary_1kb | 1 | theine_unbounded | 416.00 | 700.00 | 2086033 | 1.20 | 1.11 | 0.86 |
+| 1000000 | binary_1kb | 4 | ets | 521.00 | 919.00 | 1619673 | 1.00 | 1.00 | 1.00 |
+| 1000000 | binary_1kb | 4 | theine_nostats | 575.00 | 1009.00 | 1464031 | 1.10 | 1.10 | 0.90 |
+| 1000000 | binary_1kb | 4 | theine_unbounded | 653.00 | 1052.00 | 1328209 | 1.25 | 1.14 | 0.82 |
+
+`--sizes 1000` confirmation run of the same tree (10/10 passed):
+
+| n | value | parallel | subject | p50 ns | p99 ns | ips | p50/ets | p99/ets | ips/ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1000 | tuple3 | 1 | ets | 247.00 | 403.00 | 3890382 | 1.00 | 1.00 | 1.00 |
+| 1000 | tuple3 | 1 | theine_nostats | 287.00 | 444.00 | 3175708 | 1.16 | 1.10 | 0.82 |
+| 1000 | tuple3 | 1 | theine_unbounded | 315.00 | 521.00 | 2781676 | 1.28 | 1.29 | 0.72 |
+| 1000 | tuple3 | 4 | ets | 399.00 | 588.00 | 2395810 | 1.00 | 1.00 | 1.00 |
+| 1000 | tuple3 | 4 | theine_nostats | 483.00 | 692.00 | 1891245 | 1.21 | 1.18 | 0.79 |
+| 1000 | tuple3 | 4 | theine_unbounded | 540.00 | 775.00 | 1622336 | 1.35 | 1.32 | 0.68 |
+| 1000 | binary_1kb | 1 | ets | 271.00 | 424.00 | 3023469 | 1.00 | 1.00 | 1.00 |
+| 1000 | binary_1kb | 1 | theine_nostats | 306.00 | 670.00 | 2661610 | 1.13 | 1.58 | 0.88 |
+| 1000 | binary_1kb | 1 | theine_unbounded | 334.00 | 504.00 | 2515852 | 1.23 | 1.19 | 0.83 |
+| 1000 | binary_1kb | 4 | ets | 432.00 | 704.00 | 1887747 | 1.00 | 1.00 | 1.00 |
+| 1000 | binary_1kb | 4 | theine_nostats | 511.00 | 871.00 | 1628484 | 1.18 | 1.24 | 0.86 |
+| 1000 | binary_1kb | 4 | theine_unbounded | 582.00 | 881.00 | 1464679 | 1.35 | 1.25 | 0.78 |
 
 ### M1.6 — `mix bench get`, theine_unbounded and theine_nostats vs ets, tree of commit after f18387b (2026-10-27, 29/30 passed in the full run, 10/10 in the `--sizes 1000` confirmation)
 

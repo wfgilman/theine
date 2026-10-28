@@ -144,16 +144,7 @@ defmodule Theine.Stats do
   @spec hits(Config.t()) :: non_neg_integer()
   def hits(%Config{read_buffer: nil, counters: counters}), do: :counters.get(counters, hits())
 
-  def hits(%Config{read_buffer: buffer, stripes: stripes, read_buffer_slots: slots}) do
-    # Stripe `s` starts at `s * (2 + slots) + 1` and its tail is the first
-    # word (specs/03 §Layout). Theine.ReadBuffer owns this layout; the sum
-    # is computed here so that stats/1 needs nothing from the policy.
-    width = 2 + slots
-
-    Enum.reduce(0..(stripes - 1)//1, 0, fn s, sum ->
-      sum + :atomics.get(buffer, s * width + 1)
-    end)
-  end
+  def hits(%Config{} = config), do: Theine.ReadBuffer.hits(config)
 
   @doc """
   Hit rate as a float: `hits / (hits + misses)`, or `0.0` with no requests.

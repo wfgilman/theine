@@ -48,7 +48,7 @@ defmodule Theine.Config do
           request_counters: :counters.counters_ref() | nil,
           sizes: :atomics.atomics_ref() | nil,
           read_buffer: :atomics.atomics_ref() | nil,
-          sketch: :atomics.atomics_ref() | nil
+          sketch: Theine.Sketch.t() | nil
         }
 
   @enforce_keys [:name, :max_size, :table, :maintenance, :task_supervisor]

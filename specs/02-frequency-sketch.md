@@ -32,15 +32,19 @@ million-entry cache (8 MB) costs the maintenance process no GC.
 `h = spread(:erlang.phash2(key, 4_294_967_296))`, where `spread/1` is a
 32-bit integer mixer (Caffeine uses `h ^= h >>> 17; h *= 0xed5ad4bb;
 h ^= h >>> 11; h *= 0xac4c1b51; h ^= h >>> 15`, masked to 32 bits; use that).
-Then `block = (h &&& (blocks - 1)) * 8` where `blocks = words / 8`, and for
-`i in 0..3`:
+`h` picks the block: `block = (h &&& (blocks - 1)) * 8` where
+`blocks = words / 8`. A second mixer picks the counters, so that the bits
+that chose the block do not also choose a counter:
+`c = rehash(h)` with `c = h * 0x31848bab; c ^= c >>> 14`, masked to 32 bits
+(Caffeine's `rehash`). Then for `i in 0..3`:
 
 ```
-hi      = (h >>> (i * 8)) &&& 0xFF
-index   = block + (hi &&& 7)          # which word in the block
-offset  = ((hi >>> 3) &&& 15) * 4     # which nibble
+ci      = c >>> (i * 8)
+index   = block + 2 * i + (ci &&& 1)  # one of the block's i-th word pair
+offset  = ((ci >>> 1) &&& 15) * 4     # which nibble
 ```
 
+A key's four counters are therefore in four distinct words of one block.
 Both `index` and `offset` are deterministic functions of `(key, i)`. Write
 them once in a private function and test it with fixed vectors so that the
 layout never silently changes between commits.
@@ -79,8 +83,9 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
 - Layout vectors: for a fixed set of keys, `index/offset` pairs match the
   checked-in table in `test/theine/sketch_test.exs`.
 - Collision quality: with `max_size = 10_000` and 100_000 distinct keys each
-  seen once, at least 95% of keys report `frequency <= 1` (a crude check that
-  the hash spread is doing its job).
+  seen once and no reset, at least 99% of keys report `frequency <= 3` and
+  at least 55% report `frequency <= 1` (a crude check that the hash spread
+  is doing its job; see §Decisions for where the figures come from).
 - Chunked reset: a sketch of 2^20 words resets in passes that each touch at
   most `reset_chunk` words, and `frequency/2` stays within `[old/2, old]` of
   the true halved value for any key throughout.
@@ -88,3 +93,29 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
 ## Decisions
 
 (Add dated entries when the implementation forces a change.)
+
+- 2026-10-27 (M2.1): the counter layout is Caffeine's actual block layout
+  (`rehash`, word pairs), not the earlier paraphrase
+  `index = block + (hi &&& 7)`, `offset = ((hi >>> 3) &&& 15) * 4` with
+  `hi` taken from the same `h` that chose the block. That paraphrase reused
+  the block's bits for counter 0: with `max_size` 10_000 (2_048 blocks, 11
+  block bits) counter 0's byte was fully determined by the block, so every
+  key in a block shared one nibble, and counter 1's word was fixed per
+  block as well. The sketch was effectively two or three hashes, and it
+  could place two of a key's counters in the same nibble, which breaks the
+  `frequency == min(n, 15)` property. Measured with 100_000 single-hit keys
+  at `max_size` 10_000: `frequency <= 3` for 99.7% of keys under the block
+  layout against 98.4% under the paraphrase, and `<= 4` for 99.99% against
+  99.5%.
+- 2026-10-27 (M2.1): the collision-quality threshold was "95% report
+  `frequency <= 1`" for 100_000 single-hit keys at `max_size` 10_000. That
+  cannot hold for any hash: the sketch has 16_384 words, 262_144 nibbles,
+  and takes 400_000 increments, a mean load of 1.53 per nibble, so a key's
+  counter is free of other keys with probability e^-1.53 ≈ 0.22 and
+  `min(4 counters) <= 1` with probability 1 - 0.78^4 ≈ 0.62. Measured:
+  61–65% under both layouts. The acceptance now asks for 99% at `<= 3`
+  (model 99.85%, measured 99.7%; the paraphrase layout measured 98.4%, so
+  the check discriminates) and 55% at `<= 1` (model and measurement 62%).
+  The sketch is only used at and below `sample_size = 10 * max_size`
+  increments, which is exactly this load; the 4-bit counters are meant to
+  be read as "roughly how popular", not as counts.

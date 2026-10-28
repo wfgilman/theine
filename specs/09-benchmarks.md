@@ -186,3 +186,14 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   bounded path roughly 20 ns of headroom; the loop may not relax these
   figures further. `bench/get.exs` and `bench/README.md` carry the new
   limits.
+- 2026-10-27 (M1.6): how a hot-path task reads a single failed check in
+  the full `mix bench get`. The p99 of the `ets` floor at n=1000 tuple3
+  parallel=1 wanders by about ±0.1× between full runs of one tree (338 to
+  433 ns on the same day; the earlier logs show 384 to 677 ns) and has
+  crossed the A1 limit for `theine_unbounded` three times with no change to
+  the hit path (M1.5 once, M1.6 twice). The thresholds stand. A task whose
+  full run fails only that check re-runs `mix bench get --sizes 1000` on
+  the same tree, with the `ERL_FLAGS` above; if every n=1000 check passes
+  there, the task records both tables in IMPLEMENTATION_PLAN.md and is not
+  failed by the noisy run. A second failure in the targeted run, or a
+  failure at any other shape, is a regression.

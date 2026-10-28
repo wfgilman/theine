@@ -19,6 +19,7 @@ defmodule Theine.Bench.Get do
 
   # Theine subjects the A1/A2 thresholds apply to; `ets` is the floor and
   # `cachex`/`nebulex` the A2 comparison (specs/09 §mix bench get).
+  # `theine_nostats` is reported for information only.
   @theine_subjects ["theine", "theine_unbounded"]
   @rivals ["cachex", "nebulex"]
 
@@ -152,6 +153,20 @@ defmodule Theine.Bench.Get do
         setup: fn n, value_fun ->
           name = :theine_bench_unbounded
           {:ok, sup} = Theine.start_link(name: name, max_size: :infinity)
+          populate(n, fn chunk -> Enum.each(chunk, &Theine.put(name, &1, value_fun.(&1))) end)
+          wait_for_maintenance(name)
+          {name, sup}
+        end,
+        get: fn {name, _sup} -> fn key -> Theine.get(name, key) end end,
+        teardown: fn {_name, sup} -> Supervisor.stop(sup) end
+      },
+      %{
+        # `stats: false` (specs/08 §Stats): the hit skips its counter op.
+        # Unbounded until M2.8 makes it the bounded `stats: false` subject.
+        name: "theine_nostats",
+        setup: fn n, value_fun ->
+          name = :theine_bench_nostats
+          {:ok, sup} = Theine.start_link(name: name, max_size: :infinity, stats: false)
           populate(n, fn chunk -> Enum.each(chunk, &Theine.put(name, &1, value_fun.(&1))) end)
           wait_for_maintenance(name)
           {name, sup}

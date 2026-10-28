@@ -33,8 +33,8 @@ defmodule Theine.Owner do
   # Index of the drain flag inside the `flags` atomics (specs/03).
   @drain_flag 1
 
-  # :counters fields (specs/08 §Stats); Theine.Stats names them in M1.6.
-  @counter_fields 7
+  # :counters fields (specs/08 §Stats), named by Theine.Stats.
+  @counter_fields Theine.Stats.field_count()
 
   # `sizes` atomics: entry count and weighted size, maintained by the
   # maintenance process (Theine.Policy) and read by size/1 and weighted_size/1.
@@ -85,13 +85,18 @@ defmodule Theine.Owner do
     :ok
   end
 
-  defp allocate(%Config{} = config) do
+  defp allocate(%Config{stats: stats} = config) do
+    counters = :counters.new(@counter_fields, [:write_concurrency])
+
     %{
       config
       | ids: :atomics.new(1, signed: false),
         pending: :atomics.new(1, signed: true),
         flags: :atomics.new(@drain_flag, signed: false),
-        counters: :counters.new(@counter_fields, [:write_concurrency]),
+        counters: counters,
+        # The hit and miss paths count through this field only, so
+        # `stats: false` is one nil match there (specs/08 §Stats).
+        request_counters: if(stats, do: counters, else: nil),
         sizes: :atomics.new(@size_fields, signed: true)
     }
   end

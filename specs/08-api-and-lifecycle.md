@@ -180,3 +180,20 @@ specs/09.
   op (specs/01, 03). `stats: false` therefore only affects unbounded hits
   and the miss path. The A1/A2 thresholds were reset at the same time
   (specs/00, 09 §Decisions).
+- 2026-10-27 (M1.6): `stats: false` turns off the *request* counters only.
+  `hits` and `misses` are never incremented by `get/2`, including the miss
+  an expired read would count, so `stats/1` reports both as 0 and
+  `hit_rate` as 0.0. The *event* counters (`expirations`, `evictions`,
+  `loads`, `load_failures`, `refreshes`) are maintained regardless of the
+  option: every site that increments them is off the hot path, so the
+  option saves nothing there, and operators still get to see what the
+  cache did. §Stats above was silent on the expired-read branch and the
+  other sites; the rule "request counters off, event counters on" is the
+  one `Theine.Stats` documents. `Theine.Stats` fixes the counter indices
+  (`hits/0` … `refreshes/0`); the hot path reads them as compile-time
+  constants. The "single pattern match" in §Stats is on one map key, not
+  two: `Theine.Owner` stores the counters ref a second time as the runtime
+  field `request_counters`, nil under `stats: false`, and `get/2` matches
+  `%{request_counters: nil}` or `%{request_counters: c}`. Matching
+  `%{stats: true, counters: c}` instead costs a second map fetch on every
+  hit, visible as a few ns in the first M1.6 `mix bench get` run.

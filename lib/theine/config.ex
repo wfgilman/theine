@@ -45,6 +45,7 @@ defmodule Theine.Config do
           pending: :atomics.atomics_ref() | nil,
           flags: :atomics.atomics_ref() | nil,
           counters: :counters.counters_ref() | nil,
+          request_counters: :counters.counters_ref() | nil,
           sizes: :atomics.atomics_ref() | nil,
           read_buffer: :atomics.atomics_ref() | nil,
           sketch: :atomics.atomics_ref() | nil
@@ -76,6 +77,7 @@ defmodule Theine.Config do
             pending: nil,
             flags: nil,
             counters: nil,
+            request_counters: nil,
             sizes: nil,
             read_buffer: nil,
             sketch: nil
@@ -101,8 +103,19 @@ defmodule Theine.Config do
     :test_hooks
   ]
 
-  # Fields filled in by Theine.Owner, not by options.
-  @runtime_fields [:ids, :pending, :flags, :counters, :sizes, :read_buffer, :sketch]
+  # Fields filled in by Theine.Owner, not by options. `request_counters` is
+  # the same ref as `counters`, or nil with `stats: false`, so that the hit
+  # path decides with one map key (specs/08 §Stats, §Decisions M1.6).
+  @runtime_fields [
+    :ids,
+    :pending,
+    :flags,
+    :counters,
+    :request_counters,
+    :sizes,
+    :read_buffer,
+    :sketch
+  ]
 
   @doc "The `start_link/1` option names, in the order of the specs/08 table."
   @spec options() :: [atom(), ...]

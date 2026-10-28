@@ -58,7 +58,7 @@ defmodule Theine do
   production: a paused cache blocks writers once `write_hwm` events queue.
   """
 
-  alias Theine.{Config, Entry, Policy}
+  alias Theine.{Config, Entry, Policy, Stats}
 
   require Theine.Clock
 
@@ -66,10 +66,10 @@ defmodule Theine do
   @type key :: Entry.key()
   @type value :: Entry.value()
 
-  # :counters fields (specs/08 §Stats order); Theine.Stats names them in
-  # M1.6. Kept in step with Theine.Entry.
-  @hits 1
-  @misses 2
+  # :counters indices, resolved at compile time so the hot path makes no
+  # call into Theine.Stats.
+  @hits Stats.hits()
+  @misses Stats.misses()
 
   @doc """
   Starts a cache and its supervision tree, linked to the caller.
@@ -110,9 +110,9 @@ defmodule Theine do
   `:error`. Mirrors `Map.fetch/2`.
 
   A hit costs one ETS lookup, one `:persistent_term` read, one counter
-  increment, and a clock read only when the entry carries an expiry; it
-  never writes to the table. An expired entry is deleted by the reader and
-  reported as a miss (specs/01 §Read path).
+  increment (none with `stats: false`), and a clock read only when the
+  entry carries an expiry; it never writes to the table. An expired entry
+  is deleted by the reader and reported as a miss (specs/01 §Read path).
 
       iex> {:ok, _} = Theine.start_link(name: :get_doc, max_size: :infinity)
       iex> Theine.put(:get_doc, :a, 1)
@@ -136,14 +136,23 @@ defmodule Theine do
         if is_integer(expires_at) and Theine.Clock.now(cache) >= expires_at do
           Entry.expired(:persistent_term.get(cache), entry)
         else
-          %{counters: counters} = :persistent_term.get(cache)
-          :counters.add(counters, @hits, 1)
+          # `request_counters` is the counters ref, or nil with
+          # `stats: false` (specs/08 §Stats): one map key decides, with no
+          # further call.
+          case :persistent_term.get(cache) do
+            %{request_counters: nil} -> :ok
+            %{request_counters: counters} -> :counters.add(counters, @hits, 1)
+          end
+
           {:ok, value}
         end
 
       [] ->
-        %{counters: counters} = :persistent_term.get(cache)
-        :counters.add(counters, @misses, 1)
+        case :persistent_term.get(cache) do
+          %{request_counters: nil} -> :ok
+          %{request_counters: counters} -> :counters.add(counters, @misses, 1)
+        end
+
         :error
     end
   end
@@ -285,6 +294,30 @@ defmodule Theine do
   @spec weighted_size(cache()) :: non_neg_integer()
   def weighted_size(cache) do
     Policy.weighted_size(:persistent_term.get(cache).sizes)
+  end
+
+  @doc """
+  Returns the cache's statistics as a `%Theine.Stats{}`: `hits`, `misses`,
+  `loads`, `load_failures`, `evictions`, `expirations`, `refreshes` and the
+  computed `hit_rate` (`0.0` with no requests).
+
+  With `stats: false` the request counters stay at zero: `get/2` counts
+  neither hits nor misses, so `hit_rate` is `0.0`. The event counters are
+  maintained either way (see `Theine.Stats`). `clear/1` leaves the
+  statistics untouched.
+
+      iex> {:ok, _} = Theine.start_link(name: :stats_doc, max_size: :infinity)
+      iex> Theine.put(:stats_doc, :a, 1)
+      iex> Theine.get(:stats_doc, :a)
+      iex> Theine.get(:stats_doc, :a)
+      iex> Theine.get(:stats_doc, :missing)
+      iex> %Theine.Stats{hits: 2, misses: 1, hit_rate: rate} = Theine.stats(:stats_doc)
+      iex> Float.round(rate, 3)
+      0.667
+  """
+  @spec stats(cache()) :: Stats.t()
+  def stats(cache) do
+    Stats.read(:persistent_term.get(cache))
   end
 
   @doc """

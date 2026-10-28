@@ -20,7 +20,7 @@ defmodule Theine.Entry do
   hot paths (AGENTS.md).
   """
 
-  alias Theine.{Config, WriteEvents}
+  alias Theine.{Config, Stats, WriteEvents}
 
   require Theine.Clock
 
@@ -39,11 +39,9 @@ defmodule Theine.Entry do
   @written_at 5
   @expires_at 6
 
-  # :counters fields in the specs/08 §Stats order (hits, misses, loads,
-  # load_failures, evictions, expirations, refreshes). Theine.Stats names
-  # them in M1.6; the indices here and in Theine must stay in step with it.
-  @misses 2
-  @expirations 6
+  # :counters indices (specs/08 §Stats), resolved at compile time.
+  @misses Stats.misses()
+  @expirations Stats.expirations()
 
   @doc "Position of the key in an entry tuple."
   @spec key_pos() :: 1
@@ -74,13 +72,21 @@ defmodule Theine.Entry do
   reader found `entry` past its `expires_at`. Deletes exactly the tuple it
   saw (the only write a read may perform; a concurrent put has a different
   id and survives), reports `{:removed, key, id}` to the maintenance
-  process, counts a miss and an expiration, and returns `:error`.
+  process, counts a miss (unless `stats: false`) and an expiration, and
+  returns `:error`.
   """
   @spec expired(Config.t(), t()) :: :error
   def expired(%Config{table: table, counters: counters} = config, entry) do
     true = :ets.delete_object(table, entry)
     WriteEvents.deliver(config, {:removed, elem(entry, @key - 1), elem(entry, @id - 1)})
-    :counters.add(counters, @misses, 1)
+
+    # The miss is a request counter, off with `stats: false`; the
+    # expiration is an event counter, always kept (specs/08 §Decisions).
+    case config.request_counters do
+      nil -> :ok
+      request_counters -> :counters.add(request_counters, @misses, 1)
+    end
+
     :counters.add(counters, @expirations, 1)
     :error
   end

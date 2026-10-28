@@ -128,6 +128,43 @@ defmodule Theine.TracingTest do
     assert calls == %{{:persistent_term, :get, 1} => 1, {:ets, :lookup, 2} => 1}
   end
 
+  describe "stats: false" do
+    setup do
+      cache = unique_cache()
+      start_supervised!({Theine, name: cache, max_size: :infinity, stats: false})
+      Theine.put(cache, :present, 1)
+      %{nostats: cache}
+    end
+
+    test "hit performs no :counters call", %{nostats: cache} do
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+
+      assert calls == %{{:persistent_term, :get, 1} => 1, {:ets, :lookup, 2} => 1}
+    end
+
+    test "miss performs no :counters call", %{nostats: cache} do
+      calls = Trace.calls(@modules, fn -> :error = Theine.get(cache, :absent) end)
+
+      assert calls == %{{:persistent_term, :get, 1} => 1, {:ets, :lookup, 2} => 1}
+    end
+
+    test "expired read drops the misses op and keeps the expirations op", %{nostats: cache} do
+      start_supervised!({Theine.Test.Clock, cache: cache})
+      Theine.put(cache, :expiring, 1, ttl: 10)
+      Theine.Test.Clock.advance(cache, 10)
+
+      calls = Trace.calls(@modules, fn -> :error = Theine.get(cache, :expiring) end)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:ets, :delete_object, 2} => 1,
+               {:atomics, :add_get, 3} => 1,
+               {:counters, :add, 3} => 1
+             }
+    end
+  end
+
   test "an oversized put touches nothing", %{cache: cache} do
     config = %{Theine.Config.get(cache) | max_size: 1}
     calls = Trace.calls(@modules, fn -> :ok = Theine.Entry.put(config, :big, 1, weight: 2) end)

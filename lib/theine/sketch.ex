@@ -15,6 +15,14 @@ defmodule Theine.Sketch do
   The struct is immutable metadata around the array; the number of
   increments since the last reset and the reset cursor live in the
   maintenance state (specs/04 §Responsibilities), not here.
+
+  Aging (specs/02 §Operations `reset/1`): once the caller has counted
+  `sample_size/1` increments it starts a reset with `reset_start/0` and
+  advances it one chunk per maintenance pass with `reset/3`, which halves
+  every counter in at most `chunk` words and returns the new cursor, or
+  `{:done, odd}` when the last word has been halved. `odd` is the number of
+  nibbles that were odd before halving; the caller's new increment count is
+  `size_after_reset/2`. `reset/1` runs the whole reset in one call.
   """
 
   import Bitwise
@@ -30,10 +38,22 @@ defmodule Theine.Sketch do
 
   @type frequency :: 0..15
 
+  @typedoc """
+  A reset in progress: the 1-based index of the next word to halve and the
+  odd nibbles counted so far. Kept by the maintenance process between passes.
+  """
+  @type reset_cursor :: {next_word :: pos_integer(), odd :: non_neg_integer()}
+
   @min_words 8
   @max_words 1 <<< 30
   @mask32 0xFFFFFFFF
   @nibble 0xF
+  @reset_chunk 16_384
+  # Clears the top bit of every nibble of a 32-bit half after the shift, so
+  # no counter's low bit leaks into its neighbour.
+  @reset_mask32 0x77777777
+  # The low bit of every nibble of a 32-bit half.
+  @one_mask32 0x11111111
 
   @doc """
   The number of 64-bit words a sketch for `max_size` uses:
@@ -99,6 +119,77 @@ defmodule Theine.Sketch do
     clear_words(ref, words)
   end
 
+  @doc """
+  The number of increments after which the caller starts a reset:
+  `10 * max_size` (specs/02 §Layout).
+
+      iex> Theine.Sketch.sample_size(1_000)
+      10000
+  """
+  @spec sample_size(pos_integer()) :: pos_integer()
+  def sample_size(max_size) when is_integer(max_size) and max_size > 0, do: 10 * max_size
+
+  @doc """
+  The default number of words `reset/3` halves per call (specs/02
+  §Operations and §Decisions M2.2, specs/04 §Budget). About 1.5 ms on the
+  reference machine for a chunk whose words are mostly in use.
+
+      iex> Theine.Sketch.reset_chunk()
+      16384
+  """
+  @spec reset_chunk() :: 16_384
+  def reset_chunk, do: @reset_chunk
+
+  @doc "The cursor of a reset that has not halved any word yet."
+  @spec reset_start() :: {1, 0}
+  def reset_start, do: {1, 0}
+
+  @doc """
+  Halves every counter in one call and returns the number of nibbles that
+  were odd, for `size_after_reset/2`. Equivalent to calling `reset/3` from
+  `reset_start/0` until it returns `{:done, odd}`.
+  """
+  @spec reset(t()) :: non_neg_integer()
+  def reset(%__MODULE__{} = sketch), do: reset_to_end(sketch, reset_start())
+
+  @doc """
+  Advances a reset by at most `chunk` words: each word `w` in the chunk
+  becomes `(w >>> 1) &&& 0x7777777777777777`, halving its 16 counters, and
+  its odd nibbles are added to the cursor's count. Returns `{:more, cursor}`
+  while words remain and `{:done, odd}` once the last word has been halved
+  (specs/02 §Operations).
+
+  Counters past the cursor keep their old value until a later chunk reaches
+  them, so between calls `frequency/2` is somewhere in `[old >>> 1, old]`.
+  """
+  @spec reset(t(), reset_cursor(), pos_integer()) ::
+          {:more, reset_cursor()} | {:done, non_neg_integer()}
+  def reset(%__MODULE__{ref: ref, words: words}, {next, odd}, chunk \\ @reset_chunk)
+      when is_integer(next) and next >= 1 and next <= words and is_integer(chunk) and chunk > 0 do
+    last = min(next + chunk - 1, words)
+    odd = halve_words(ref, next, last, odd)
+
+    if last == words, do: {:done, odd}, else: {:more, {last + 1, odd}}
+  end
+
+  @doc """
+  The caller's increment count once a reset has completed with `odd` odd
+  nibbles: `(size - (odd >>> 2)) >>> 1`, Caffeine's rule (specs/02
+  §Operations). Each increment touches four counters, so `odd >>> 2`
+  estimates the increments whose halving truncated. Clamped at 0, which only
+  matters for a sketch of a few words whose residue from an earlier reset
+  can leave more odd nibbles than `4 * size`.
+
+      iex> Theine.Sketch.size_after_reset(10_000, 4_000)
+      4500
+      iex> Theine.Sketch.size_after_reset(10, 128)
+      0
+  """
+  @spec size_after_reset(non_neg_integer(), non_neg_integer()) :: non_neg_integer()
+  def size_after_reset(size, odd) when is_integer(size) and is_integer(odd) do
+    max(size - (odd >>> 2), 0) >>> 1
+  end
+
   @doc "The raw words, for tests."
   @spec dump(t()) :: [non_neg_integer()]
   def dump(%__MODULE__{ref: ref, words: words}) do
@@ -153,6 +244,44 @@ defmodule Theine.Sketch do
     :atomics.put(ref, i, 0)
     clear_words(ref, i - 1)
   end
+
+  defp reset_to_end(sketch, cursor) do
+    case reset(sketch, cursor, @reset_chunk) do
+      {:done, odd} -> odd
+      {:more, cursor} -> reset_to_end(sketch, cursor)
+    end
+  end
+
+  # Halves words `i..last` (1-based, inclusive). A zero word has no odd
+  # nibble and halves to itself, so it is read but not written; most words
+  # of a sketch below sample_size are zero.
+  #
+  # The word is split into 32-bit halves before any arithmetic: a word with
+  # its top nibble in use is above 2^59 and so a bignum on the BEAM, and
+  # bignum shifts and masks ran the loop at about twice the cost of the
+  # atomics themselves (specs/02 §Decisions M2.2). Halving the halves
+  # separately gives the same result as `(word >>> 1) &&& 0x7777777777777777`:
+  # the bit that crosses from the high half is the top bit of nibble 7,
+  # which the mask clears anyway.
+  defp halve_words(_ref, i, last, odd) when i > last, do: odd
+
+  defp halve_words(ref, i, last, odd) do
+    case :atomics.get(ref, i) do
+      0 ->
+        halve_words(ref, i + 1, last, odd)
+
+      word ->
+        lo = word &&& @mask32
+        hi = word >>> 32
+        :atomics.put(ref, i, (hi >>> 1 &&& @reset_mask32) <<< 32 ||| (lo >>> 1 &&& @reset_mask32))
+        halve_words(ref, i + 1, last, odd + odd_nibbles(lo) + odd_nibbles(hi))
+    end
+  end
+
+  # The number of nibbles of a 32-bit half with their low bit set. Those bits
+  # sit at powers of 16, and 16 is 1 modulo 15, so the remainder of their sum
+  # by 15 is their count; a half has 8 nibbles, so the count never wraps.
+  defp odd_nibbles(half), do: rem(half &&& @one_mask32, 15)
 
   # Caffeine's 32-bit mixers, with the multiplications masked to 32 bits.
   defp spread(h) do

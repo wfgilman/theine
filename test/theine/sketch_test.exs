@@ -179,6 +179,163 @@ defmodule Theine.SketchTest do
     end
   end
 
+  describe "reset" do
+    @reset_mask 0x7777777777777777
+
+    test "sample_size/1 is 10 * max_size" do
+      assert Sketch.sample_size(1) == 10
+      assert Sketch.sample_size(1_000_000) == 10_000_000
+    end
+
+    property "after a complete reset every nibble is old >>> 1 and size follows the odd-count rule" do
+      check all keys <- list_of(key_gen(), max_length: 300),
+                max_size <- integer(1..2_000),
+                chunk <- integer(1..100),
+                rounds <- integer(1..2) do
+        sketch = Sketch.new(max_size)
+        # A second round leaves residue from an earlier halving in the
+        # counters, so odd nibbles are not only the ones increments set.
+        for _ <- 2..rounds//1, do: Sketch.reset(sketch)
+        Enum.each(keys, &Sketch.increment(sketch, &1))
+
+        old = Sketch.dump(sketch)
+        old_frequencies = Map.new(keys, &{&1, Sketch.frequency(sketch, &1)})
+
+        {steps, odd} = walk_reset(sketch, Sketch.reset_start(), chunk, [])
+
+        assert length(steps) == div(sketch.words + chunk - 1, chunk)
+        assert Enum.all?(steps, fn {from, to} -> to - from <= chunk end)
+        assert Sketch.dump(sketch) == Enum.map(old, &(&1 >>> 1 &&& @reset_mask))
+        assert odd == odd_nibbles(old)
+
+        for {key, old_frequency} <- old_frequencies do
+          assert Sketch.frequency(sketch, key) == old_frequency >>> 1
+        end
+
+        size = length(keys)
+        expected = if size >= odd >>> 2, do: (size - (odd >>> 2)) >>> 1, else: 0
+        assert Sketch.size_after_reset(size, odd) == expected
+      end
+    end
+
+    test "reset/1 halves everything in one call and returns the odd count" do
+      sketch = Sketch.new(100)
+      for i <- 1..500, _ <- 1..rem(i, 16)//1, do: Sketch.increment(sketch, {:k, i})
+      old = Sketch.dump(sketch)
+
+      assert Sketch.reset(sketch) == odd_nibbles(old)
+      assert Sketch.dump(sketch) == Enum.map(old, &(&1 >>> 1 &&& @reset_mask))
+    end
+
+    test "a reset of an empty sketch is a no-op that reports no odd nibbles" do
+      sketch = Sketch.new(100)
+
+      assert Sketch.reset(sketch) == 0
+      assert Sketch.reset(sketch, Sketch.reset_start(), 8) == {:more, {9, 0}}
+      assert Sketch.dump(sketch) == List.duplicate(0, sketch.words)
+    end
+
+    test "reset/3 rejects a cursor past the end and a non-positive chunk" do
+      sketch = Sketch.new(1)
+
+      assert_raise FunctionClauseError, fn -> Sketch.reset(sketch, {9, 0}, 8) end
+      assert_raise FunctionClauseError, fn -> Sketch.reset(sketch, {0, 0}, 8) end
+      assert_raise FunctionClauseError, fn -> Sketch.reset(sketch, {1, 0}, 0) end
+    end
+
+    test "size_after_reset/2 is (size - odd >>> 2) >>> 1, clamped at 0" do
+      assert Sketch.size_after_reset(10_000, 0) == 5_000
+      assert Sketch.size_after_reset(10_000, 4_000) == 4_500
+      assert Sketch.size_after_reset(10_001, 3) == 5_000
+      assert Sketch.size_after_reset(0, 0) == 0
+      assert Sketch.size_after_reset(10, 128) == 0
+    end
+
+    test "a 2^20-word sketch resets in passes touching at most reset_chunk words each and frequency stays within [old/2, old] throughout" do
+      # specs/02 §Acceptance, chunked reset, with the sketch of a
+      # max_size 1_000_000 cache (8 MB). After each pass the words of its
+      # range are halved and the words of the next range are untouched; the
+      # final dump equals the old words halved exactly once. Together these
+      # show each pass changed exactly its range: a pass that reached ahead
+      # or behind would leave some word halved twice or not at all.
+      sketch = Sketch.new(1_000_000)
+      assert sketch.words == 1 <<< 20
+      chunk = Sketch.reset_chunk()
+      words = sketch.words
+
+      keys = for i <- 1..20_000, do: {:k, i}
+      for {:k, i} = key <- keys, _ <- 1..(rem(i, 15) + 1)//1, do: Sketch.increment(sketch, key)
+
+      old_frequencies = Map.new(keys, &{&1, Sketch.frequency(sketch, &1)})
+      assert Enum.any?(old_frequencies, fn {_, f} -> f == 15 end)
+      old = Sketch.dump(sketch)
+      old_words = List.to_tuple(old)
+
+      {steps, odd} =
+        walk_reset(sketch, Sketch.reset_start(), chunk, [], fn {from, to} ->
+          assert to - from <= chunk
+
+          assert Enum.all?(from..(to - 1)//1, fn i ->
+                   :atomics.get(sketch.ref, i) == (elem(old_words, i - 1) >>> 1 &&& @reset_mask)
+                 end),
+                 "pass #{from}..#{to - 1} left a word of its range unhalved"
+
+          assert Enum.all?(to..min(to + chunk - 1, words)//1, fn i ->
+                   :atomics.get(sketch.ref, i) == elem(old_words, i - 1)
+                 end),
+                 "pass #{from}..#{to - 1} touched a word of the next range"
+
+          # `{key, old, now}` for every key whose frequency left [old/2, old].
+          out_of_band =
+            for {key, old_frequency} <- old_frequencies,
+                frequency = Sketch.frequency(sketch, key),
+                frequency < old_frequency >>> 1 or frequency > old_frequency,
+                do: {key, old_frequency, frequency}
+
+          assert out_of_band == [], "frequencies left [old/2, old] after pass #{from}..#{to - 1}"
+        end)
+
+      assert length(steps) == div(words, chunk)
+
+      assert Enum.map(steps, fn {from, to} -> to - from end) ==
+               List.duplicate(chunk, div(words, chunk))
+
+      assert odd == odd_nibbles(old)
+      assert Sketch.dump(sketch) == Enum.map(old, &(&1 >>> 1 &&& @reset_mask))
+
+      for {key, old_frequency} <- old_frequencies do
+        assert Sketch.frequency(sketch, key) == old_frequency >>> 1
+      end
+    end
+
+    # Runs a chunked reset to completion, returning the `{from, to}` word
+    # range (1-based, `to` exclusive) of every pass and the final odd count.
+    # `after_step` sees each range as soon as the pass is done.
+    defp walk_reset(sketch, cursor, chunk, steps, after_step \\ fn _ -> :ok end) do
+      {from, _} = cursor
+
+      case Sketch.reset(sketch, cursor, chunk) do
+        {:done, odd} ->
+          step = {from, sketch.words + 1}
+          after_step.(step)
+          {Enum.reverse([step | steps]), odd}
+
+        {:more, {next, _} = cursor} ->
+          step = {from, next}
+          after_step.(step)
+          walk_reset(sketch, cursor, chunk, [step | steps], after_step)
+      end
+    end
+
+    # The oracle for the odd count: one nibble at a time, nothing shared with
+    # the implementation's arithmetic. Zero words have no odd nibble.
+    defp odd_nibbles(words) do
+      for word <- words, word != 0, shift <- 0..60//4, reduce: 0 do
+        odd -> odd + (word >>> shift &&& 1)
+      end
+    end
+  end
+
   describe "clear/1" do
     test "zeroes every nibble" do
       sketch = Sketch.new(500)

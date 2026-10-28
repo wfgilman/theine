@@ -60,9 +60,9 @@ layout never silently changes between commits.
   becomes `(size - (odd >>> 2)) >>> 1`. Each increment touches four
   counters, so `odd >>> 2` estimates the increments whose halving truncated;
   this is Caffeine's exact rule. Reset is chunked: process
-  at most `reset_chunk` words (default 65_536) per maintenance pass and keep a
-  cursor in the maintenance state; increments on words past the cursor are
-  halved when the cursor reaches them. The sketch is lossy by design, so the
+  at most `reset_chunk` words (default 16_384, see §Decisions M2.2) per
+  maintenance pass and keep a cursor in the maintenance state; increments on
+  words past the cursor are halved when the cursor reaches them. The sketch is lossy by design, so the
   temporary inconsistency is acceptable; the maintenance pass budget in
   specs/04 is not negotiable.
 - `clear/1`: zero every word, `size = 0`. Used by `Theine.clear/1`.
@@ -119,3 +119,33 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
   The sketch is only used at and below `sample_size = 10 * max_size`
   increments, which is exactly this load; the 4-bit counters are meant to
   be read as "roughly how popular", not as counts.
+- 2026-10-27 (M2.2): the reset API. `reset/1` halves every word in one
+  call and returns `odd`. The chunked form is `reset(sketch, cursor,
+  chunk)` with the cursor `{next_word, odd}` kept by the caller, starting
+  from `reset_start/0` (`{1, 0}`); it returns `{:more, cursor}` or
+  `{:done, odd}`. `size_after_reset(size, odd)` is the odd-count rule
+  `(size - (odd >>> 2)) >>> 1`, clamped at 0: a sketch of a few words can
+  carry more odd nibbles than `4 * size` from an earlier halving (8 words
+  hold 128 nibbles against a `sample_size` of 10 at `max_size` 1), and a
+  negative count would be nonsense. `sample_size/1` and `reset_chunk/0` are
+  functions of the module; `reset_chunk` is not a `start_link` option, since
+  specs/08 lists none and the maintenance process (M2.7) can pass the
+  module default.
+- 2026-10-27 (M2.2): `reset_chunk` defaults to 16_384 words, not 65_536.
+  Measured on the reference machine with a 2^20-word sketch 80% of whose
+  words were non-zero: the first loop (64-bit shift, mask and a SWAR nibble
+  count on the whole word) ran at 150 ns per word, so one 65_536-word
+  chunk took 10 ms against the 5 ms `pass_budget` of specs/04 with nothing
+  else in the pass. Words with their top nibble in use are above 2^59 and
+  so bignums on the BEAM; every shift and mask on them allocates. Splitting
+  each word into 32-bit halves before any arithmetic (the halving is the
+  same, since the bit crossing from the high half is the top bit of
+  nibble 7, which the mask clears; the odd count is `rem(half &&&
+  0x11111111, 15)` because 16 is 1 modulo 15 and a half has only 8
+  nibbles) brought the loop to 92 ns per word, close to the 55–65 ns the
+  two atomics ops cost alone. At 65_536 words that is still 6 ms, so the
+  default chunk is 16_384 (about 1.5 ms loaded, 0.5 ms on a zero sketch,
+  which is skipped without a write). A 2^20-word sketch now resets over 64
+  passes instead of 16; the sketch is lossy and specs/04 says to size caps
+  from measurements. M2.11 measures the whole pass and may change the
+  figure again.

@@ -25,6 +25,7 @@ defmodule Theine.ConfigTest do
     assert config.evict_batch == 1024
     assert config.maintenance_interval == 1000
     assert config.stats == true
+    assert config.test_hooks == false
   end
 
   test "names the table, the maintenance process and the task supervisor after the cache" do
@@ -58,7 +59,8 @@ defmodule Theine.ConfigTest do
         expire_batch: 5,
         evict_batch: 6,
         maintenance_interval: 50,
-        stats: false
+        stats: false,
+        test_hooks: true
       )
 
     assert config.weigher == weigher
@@ -76,6 +78,7 @@ defmodule Theine.ConfigTest do
     assert config.evict_batch == 6
     assert config.maintenance_interval == 50
     refute config.stats
+    assert config.test_hooks
   end
 
   test "missing name or max_size raises naming the option" do
@@ -109,7 +112,8 @@ defmodule Theine.ConfigTest do
       expire_batch: :many,
       evict_batch: 0,
       maintenance_interval: 0,
-      stats: :yes
+      stats: :yes,
+      test_hooks: 1
     ]
 
     for {key, value} <- bad do

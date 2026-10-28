@@ -43,9 +43,15 @@ defmodule Theine do
   | `evict_batch` | pos_integer | 1024 |
   | `maintenance_interval` | ms | 1000 |
   | `stats` | boolean | `true` |
+  | `test_hooks` | boolean | `false` |
 
   An unknown option, a missing `name` or `max_size`, or a value of the wrong
   type raises `ArgumentError` naming the option.
+
+  `test_hooks: true` enables `Theine.Maintenance.pause/1` and `resume/1`,
+  which stop and restart the maintenance process's consumption of write
+  events so tests can observe backpressure and lazy expiry. Never set it in
+  production: a paused cache blocks writers once `write_hwm` events queue.
   """
 
   alias Theine.{Config, Entry, Policy}

@@ -37,6 +37,7 @@ defmodule Theine.Config do
           evict_batch: pos_integer(),
           maintenance_interval: pos_integer(),
           stats: boolean(),
+          test_hooks: boolean(),
           table: cache(),
           maintenance: atom(),
           task_supervisor: atom(),
@@ -67,6 +68,7 @@ defmodule Theine.Config do
             evict_batch: 1024,
             maintenance_interval: 1000,
             stats: true,
+            test_hooks: false,
             table: nil,
             maintenance: nil,
             task_supervisor: nil,
@@ -95,7 +97,8 @@ defmodule Theine.Config do
     :expire_batch,
     :evict_batch,
     :maintenance_interval,
-    :stats
+    :stats,
+    :test_hooks
   ]
 
   # Fields filled in by Theine.Owner, not by options.
@@ -213,7 +216,8 @@ defmodule Theine.Config do
 
   defp validate!(:window_percent, n) when is_integer(n) and n in 1..80, do: n
 
-  defp validate!(key, bool) when key in [:adaptive, :stats] and is_boolean(bool), do: bool
+  defp validate!(key, bool) when key in [:adaptive, :stats, :test_hooks] and is_boolean(bool),
+    do: bool
 
   defp validate!(key, n)
        when key in [
@@ -238,7 +242,7 @@ defmodule Theine.Config do
   defp expected(:weigher), do: "expected a function of arity 2 or nil"
   defp expected(:loader), do: "expected a function of arity 1 or nil"
   defp expected(:window_percent), do: "expected an integer in 1..80"
-  defp expected(key) when key in [:adaptive, :stats], do: "expected a boolean"
+  defp expected(key) when key in [:adaptive, :stats, :test_hooks], do: "expected a boolean"
 
   defp expected(key) when key in [:expire_after_write, :refresh_after_write],
     do: "expected a positive number of milliseconds or :infinity"

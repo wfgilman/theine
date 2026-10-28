@@ -33,6 +33,7 @@ children = [
 | `evict_batch` | pos_integer | 1024 | 04, 05 |
 | `maintenance_interval` | ms | 1000 | 04 |
 | `stats` | boolean | true | this file |
+| `test_hooks` | boolean | false | 04 (`pause/1`, `resume/1`; tests only) |
 
 Unknown options raise `ArgumentError` with the option name. `max_size:
 :infinity` disables the policy entirely: no sketch, no read buffer, no

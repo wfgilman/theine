@@ -10,9 +10,19 @@ defmodule Theine.Maintenance do
   and the drain flag, and creates the `Theine.Policy` tables. Write events
   (`{:put, key, id, weight, expires_at}` and `{:removed, key, id}`,
   specs/03) are applied to the policy as they arrive and decrement `pending`
-  per event; nothing waits for a pass (specs/04 §The pass). The pass itself
-  only records its duration so far: the read-buffer drain, expiry sweep and
-  eviction arrive with the tasks that own them.
+  per event; nothing waits for a pass (specs/04 §The pass). A writer above
+  `write_hwm` delivers its event as the call `{:event, event}` instead of a
+  plain message (specs/03 §Delivery with backpressure); calls and messages
+  are consumed in mailbox order and the call is replied to as its event is
+  consumed. The pass itself only records its duration so far: the
+  read-buffer drain, expiry sweep and eviction arrive with the tasks that
+  own them.
+
+  `pause/1` and `resume/1` exist for tests (specs/04 §Responsibilities) and
+  only in a cache started with `test_hooks: true`. A paused process blocks
+  in a selective receive that accepts nothing but `resume/1`, so every
+  write event, `:drain` and call queues in its mailbox exactly as it would
+  behind a slow pass, and writers above `write_hwm` block.
   """
 
   use GenServer
@@ -73,6 +83,42 @@ defmodule Theine.Maintenance do
   def run(cache) when is_atom(cache), do: GenServer.call(name(cache), :run)
 
   @doc """
+  Stops the process consuming anything until `resume/1`: write events,
+  `:drain` messages and calls all queue in its mailbox, and writers above
+  `write_hwm` block (specs/03 §Delivery with backpressure). Returns `:ok`
+  once the process is paused. Tests only: raises `ArgumentError` unless the
+  cache was started with `test_hooks: true`.
+
+      Theine.Maintenance.pause(:sessions)
+      #=> :ok
+  """
+  @spec pause(Config.cache()) :: :ok
+  def pause(cache) when is_atom(cache), do: hook!(cache, :pause)
+
+  @doc """
+  Lets a process paused by `pause/1` consume its mailbox again and returns
+  `:ok` once it has. A no-op on a process that is not paused. Tests only:
+  raises `ArgumentError` unless the cache was started with `test_hooks:
+  true`.
+
+      Theine.Maintenance.resume(:sessions)
+      #=> :ok
+  """
+  @spec resume(Config.cache()) :: :ok
+  def resume(cache) when is_atom(cache), do: hook!(cache, :resume)
+
+  defp hook!(cache, hook) do
+    case GenServer.call(name(cache), hook, :infinity) do
+      :ok ->
+        :ok
+
+      {:error, :test_hooks_disabled} ->
+        raise ArgumentError,
+              "Theine.Maintenance.#{hook}/1 needs the cache #{inspect(cache)} started with test_hooks: true"
+    end
+  end
+
+  @doc """
   Returns the process's view of the cache: pass count, last pass duration in
   native time units, the `pending` write-event count, and the entry count
   and weighted size as last seen by the policy.
@@ -123,14 +169,46 @@ defmodule Theine.Maintenance do
     {:reply, Policy.lookup(state.policy, key), state}
   end
 
-  # Write events are applied on arrival (specs/04 §The pass, first paragraph).
-  @impl true
-  def handle_info({:put, key, id, weight, expires_at}, state) do
-    {:noreply, consumed(state, Policy.on_write(state.policy, key, id, weight, expires_at))}
+  # The backpressure path (specs/03): the writer waits for its event to be
+  # consumed, so the reply is the consumption.
+  def handle_call({:event, event}, _from, state) do
+    {:reply, :ok, apply_event(state, event)}
   end
 
-  def handle_info({:removed, key, id}, state) do
-    {:noreply, consumed(state, Policy.on_remove(state.policy, key, id))}
+  def handle_call(:pause, from, %{config: %Config{test_hooks: true}} = state) do
+    GenServer.reply(from, :ok)
+
+    # Paused means consuming nothing: block here, where only `resume/1` can
+    # get through, so write events, calls and :drain pile up in the mailbox
+    # exactly as they would behind a slow pass. The call tuple shape is the
+    # one GenServer documents; the `from` goes straight back to reply/2.
+    receive do
+      {:"$gen_call", resume_from, :resume} -> GenServer.reply(resume_from, :ok)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_call(:resume, _from, %{config: %Config{test_hooks: true}} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call(hook, _from, state) when hook in [:pause, :resume] do
+    {:reply, {:error, :test_hooks_disabled}, state}
+  end
+
+  # Write events are applied on arrival (specs/04 §The pass, first paragraph).
+  @impl true
+  def handle_info({:put, _, _, _, _} = event, state), do: {:noreply, apply_event(state, event)}
+  def handle_info({:removed, _, _} = event, state), do: {:noreply, apply_event(state, event)}
+
+  @spec apply_event(state(), Theine.WriteEvents.event()) :: state()
+  defp apply_event(state, {:put, key, id, weight, expires_at}) do
+    consumed(state, Policy.on_write(state.policy, key, id, weight, expires_at))
+  end
+
+  defp apply_event(state, {:removed, key, id}) do
+    consumed(state, Policy.on_remove(state.policy, key, id))
   end
 
   defp consumed(state, policy) do

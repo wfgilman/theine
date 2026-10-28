@@ -120,3 +120,15 @@ rebuild are applied after it completes (they are queued in the mailbox).
 ## Decisions
 
 (Add dated entries when the implementation forces a change.)
+
+- 2026-10-27 (M1.3): `pause/1` and `resume/1` are gated by the
+  `start_link` option `test_hooks: true` (specs/08 table), not a
+  compile-time flag, so the test suite can pause one cache while others in
+  the same VM run normally; without it both calls raise `ArgumentError`.
+  Paused means the process blocks in a selective receive that matches only
+  the `resume/1` call: write events, backpressure calls, `:drain` and the
+  interval timer all stay in the mailbox, which is exactly the state a slow
+  pass would leave and what the specs/03 backpressure and specs/06 lazy
+  expiry tests need to observe. `info/1` and `run/1` therefore also wait
+  until `resume/1`; tests inspect `pending` and the mailbox from outside
+  (`Process.info/2`) while paused.

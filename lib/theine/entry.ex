@@ -10,7 +10,7 @@ defmodule Theine.Entry do
   - `id`: integer ≥ 1 from the cache's id counter, a fresh one per write.
     0 is reserved to mean "empty slot" in the read buffer.
   - `weight`: integer ≥ 1 (the `weight:` option; the weigher arrives in M1.5).
-  - `written_at`: monotonic milliseconds at write.
+  - `written_at`: monotonic milliseconds at write, from `Theine.Clock.now/1`.
   - `expires_at`: monotonic milliseconds, or `:infinity`.
 
   The read path lives in `Theine.get/2` itself, so that a hit pays no call
@@ -19,6 +19,8 @@ defmodule Theine.Entry do
   """
 
   alias Theine.{Config, WriteEvents}
+
+  require Theine.Clock
 
   @type key :: term()
   @type value :: term()
@@ -92,7 +94,7 @@ defmodule Theine.Entry do
   @spec put(Config.t(), key(), value(), keyword()) :: :ok
   def put(%Config{} = config, key, value, opts) when is_list(opts) do
     weight = weight(Keyword.get(opts, :weight, 1))
-    now = :erlang.monotonic_time(:millisecond)
+    now = Theine.Clock.now(config.name)
     expires_at = expires_at(Keyword.get(opts, :ttl, config.expire_after_write), now)
     id = :atomics.add_get(config.ids, 1, 1)
     true = :ets.insert(config.table, {key, value, id, weight, now, expires_at})

@@ -56,6 +56,8 @@ defmodule Theine do
 
   alias Theine.{Config, Entry, Policy}
 
+  require Theine.Clock
+
   @type cache :: Config.cache()
   @type key :: Entry.key()
   @type value :: Entry.value()
@@ -124,9 +126,10 @@ defmodule Theine do
     # delegated: every call and map access costs against the A1 budget.
     case :ets.lookup(cache, key) do
       [{_, value, _, _, _, expires_at} = entry] ->
-        # The clock is the BIF behind System.monotonic_time/1 (specs/01
-        # §Decisions); it is read only for entries that can expire.
-        if is_integer(expires_at) and :erlang.monotonic_time(:millisecond) >= expires_at do
+        # The clock expands to the BIF behind System.monotonic_time/1
+        # (specs/01 §Decisions; the test build injects Theine.Test.Clock,
+        # specs/06 §Clock); it is read only for entries that can expire.
+        if is_integer(expires_at) and Theine.Clock.now(cache) >= expires_at do
           Entry.expired(:persistent_term.get(cache), entry)
         else
           %{counters: counters} = :persistent_term.get(cache)

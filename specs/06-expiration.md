@@ -81,4 +81,14 @@ test build, and the tracing test in specs/01 traces only `:ets`,
 
 ## Decisions
 
-(Add dated entries when the implementation forces a change.)
+- 2026-10-27 (M1.4): the `compile_env` clock is exposed as the macro
+  `Theine.Clock.now/1`, required by `Theine` and `Theine.Entry`, rather than
+  as a function. specs/01 forbids delegating into another module on the read
+  path and the budget has no room for a call, so the call sites expand
+  inline: to `:erlang.monotonic_time(:millisecond)` when `:clock` is unset
+  (every build but test; verified in the dev build's abstract code, which
+  never references the test clock) and to `Theine.Test.Clock.now(cache)` in
+  the test build. `put/4` stamps `written_at` through the same macro, keyed
+  by `config.name`, so a test clock moves both the write and the read side
+  of one cache together. `config/config.exs` imports `config/test.exs` only
+  for `config_env() == :test`; a consumer's build never reads either file.

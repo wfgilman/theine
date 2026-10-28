@@ -51,6 +51,29 @@ defmodule Theine.TracingTest do
            }
   end
 
+  test "expired read performs exactly persistent_term.get, ets.lookup, ets.delete_object, atomics.add_get, counters.add ×2",
+       %{cache: cache} do
+    # The injected clock (specs/06 §Clock) is an Agent call, outside the
+    # traced modules, so the multiset is the production one.
+    start_supervised!({Theine.Test.Clock, cache: cache})
+    Theine.put(cache, :expiring, 1, ttl: 10)
+    Theine.Test.Clock.advance(cache, 10)
+
+    calls = Trace.calls(@modules, fn -> :error = Theine.get(cache, :expiring) end)
+
+    # delete_object of the exact tuple, add_get on `pending` for the
+    # {:removed, key, id} event, misses and expirations (specs/01 §Expired read).
+    assert calls == %{
+             {:persistent_term, :get, 1} => 1,
+             {:ets, :lookup, 2} => 1,
+             {:ets, :delete_object, 2} => 1,
+             {:atomics, :add_get, 3} => 1,
+             {:counters, :add, 3} => 2
+           }
+
+    assert :ets.lookup(cache, :expiring) == []
+  end
+
   test "put performs persistent_term.get, atomics.add_get ×2, ets.insert", %{cache: cache} do
     calls = Trace.calls(@modules, fn -> :ok = Theine.put(cache, :new, 1) end)
 

@@ -408,6 +408,9 @@ defmodule TheineTest do
 
                 :error ->
                   Theine.put(cache, key, i)
+                  # The put's eviction lands before the next get, not when
+                  # the scheduler runs the maintenance process (M2.11e).
+                  _ = Theine.Maintenance.info(cache)
                   hits
               end
 

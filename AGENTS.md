@@ -109,8 +109,10 @@ test/                         mirrors lib/; test/support for shared helpers
   `--traces loop` takes seconds. `--accesses-per-pass 1` replays like
   Caffeine's simulator, `--window-percent 1,5,20` sweeps the window. The
   full run replays DS1 at 8 M entries (about 3 GB of ETS) and takes about
-  46 min (LRU-only was 8); run it in the background. Two runs must agree
-  to the hit (the harness raises if a pass it did not request ran).
+  85 min (46 before M2.11e's round trip after each miss; LRU-only was 8);
+  run it in the background. Two runs must agree to the hit: compare the
+  `hits` fields in the JSON, not the percentages (the harness raises if a
+  pass it did not request ran).
 - `mix bench maintenance` takes about 2 min at the default 1 M entries
   (two 30 s runs plus 1 M puts); `--max-size 10000 --duration 1` smokes it
   in seconds and shows the same overshoot structure. To attribute an

@@ -282,10 +282,12 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   OLTP runs of M2.10, with the default stripes, differed by 59, 351 and
   577 hits at the three sizes). The writes of a batch are applied as they
   arrive, each followed by the eviction it forces (specs/04 §The pass,
-  M2.11c), and sit ahead of the `run/1` call in the mailbox; the reads sit
-  in the one stripe until that pass drains them, so each pass sees the
-  batch's writes with their evictions, then its reads in access order,
-  then its own step 5, which has nothing left to do. `close/1`
+  M2.11c), and the harness waits for each one: a miss's put is followed
+  by a `Theine.Maintenance.info/1` round trip, so the put and its eviction
+  are done before the next access (M2.11e, below). The reads sit in the
+  one stripe until the pass drains them, so each pass sees the batch's
+  writes with their evictions, then its reads in access order, then its
+  own step 5, which has nothing left to do. `close/1`
   raises when the maintenance process's pass count differs from the
   harness's call count, when the cache's own hit count (specs/03 §Hits from
   the tails) differs from the replay's, when events are still pending, or
@@ -327,3 +329,27 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   `theine_static` subject and its check arrive with the adaptive window
   (IMPLEMENTATION_PLAN.md M2.13). Until then the bench still fails
   `theine ≥ lru` on OLTP, as it should.
+- 2026-10-29 (M2.11e): the replay waits for each miss's put to be applied.
+  Since M2.11c a `:put` evicts when the maintenance process receives it,
+  so whether that eviction lands before or after the replaying process's
+  next gets depended on when the scheduler ran the maintenance process: a
+  key it removed hit in one run and missed in the next. theine_test's
+  replay test failed about once in 120 full-suite runs that way. Measured
+  on that test's key sequence: 15_298 hits with every eviction before the
+  next get, 15_279 with every eviction after the batch's gets (maintenance
+  paused), and 15_279 in 60 unsynchronised runs, quiet and under a
+  spinner per scheduler. The unsynchronised replay mostly sat at the
+  "after" end only because the replayer rarely yields within a 32-access
+  batch. `Theine.Bench.Cache` and the test now follow a miss's put with a
+  `Theine.Maintenance.info/1` round trip (the mailbox is FIFO per sender,
+  so the reply comes after the put and its eviction). `write_hwm` cannot
+  force the call path, since it must be at least 1. The "before" order is
+  the one taken: it is Caffeine's simulator order (the eviction runs
+  inside the access that missed), and it is what a cache whose
+  maintenance keeps up serves. The "after" order counted as hits reads of
+  entries the policy had already evicted. The OLTP rows move to within
+  0.06 points of the one-access-per-pass figures of M2.10 (35.50, 41.89,
+  52.40 against 35.44, 41.95, 52.41). Two OLTP runs agree to the hit, both
+  under a concurrent `mix test --repeat-until-failure` load, and the
+  replay test passed 300 full-suite repeats. The full run's rows and cost
+  are in IMPLEMENTATION_PLAN.md §Benchmark log M2.11e.

@@ -14,10 +14,17 @@ defmodule Theine.Bench.Cache do
   day away, and the pass count is checked in `close/1`. The write-count and
   follow-up triggers cannot fire with at most 64 accesses per pass
   (`write_batch` 256, `read_buffer_slots` 64, `evict_batch` 1024).
-  The writes of a batch are applied by the maintenance process as they
-  arrive and sit ahead of the `run/1` call in its mailbox, the reads sit in
-  the ring until that pass drains them, so every pass sees the batch's
-  writes, then its reads, then evicts. The ring has a single stripe
+  The maintenance process applies each write as it arrives, with the
+  eviction it forces (specs/04 §The pass, M2.11c), and a miss's put is
+  followed by a `Theine.Maintenance.info/1` round trip, so that the put and
+  its eviction are done before the next access: left to the scheduler, an
+  eviction lands before or after the batch's next gets depending on when
+  the maintenance process runs, and a key it removes hits in one run and
+  misses in the next (measured in M2.11e: 15_298 hits with every eviction
+  before the next get, 15_279 with every eviction after the batch, on the
+  key sequence of theine_test's replay test). The reads sit in the ring
+  until the pass drains them, so every pass sees the batch's writes with
+  their evictions, then its reads. The ring has a single stripe
   (`stripes: 1`): with one per scheduler, the reads of a batch would be
   spread over the stripes as the replaying process migrates and the pass,
   which drains stripe by stripe, would apply them in an order that differs
@@ -122,6 +129,7 @@ defmodule Theine.Bench.Cache do
 
         :error ->
           :ok = Theine.put(name, key, :v)
+          _ = Theine.Maintenance.info(name)
           {:miss, cache.hits}
       end
 

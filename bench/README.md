@@ -85,8 +85,13 @@ Each `results` row:
 | `sample_size` | integer | samples behind the statistics (Benchee caps at 1M per process) |
 | `ratio_to_ets` | object | `p50`, `p99`, `ips` divided by the `ets` row of the same shape |
 
-Thresholds (specs/09). They are evaluated for `theine` and `theine_unbounded`
-when those subjects exist. Until then the summary says "none evaluated".
+Subjects: `ets` is the floor; `theine` is bounded at `max_size: n` with
+the policy on (every hit records into the read buffer, which the
+maintenance process drains while the readers run); `theine_unbounded` is
+`max_size: :infinity`; `theine_nostats` is bounded with `stats: false` and
+is reported for information only. `cachex` and `nebulex` arrive in M5.1.
+
+Thresholds (specs/09). They are evaluated for `theine` and `theine_unbounded`.
 
 - A1: `p50/ets <= 1.5` and `p99/ets <= 1.5`, every shape.
 - A2: `ips/ets >= 0.65` at full parallelism; `ips / cachex ips >= 2` and

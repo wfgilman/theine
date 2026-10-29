@@ -124,8 +124,7 @@ defmodule Theine.Bench.Get do
   end
 
   # Each subject: setup(n, value_fun) -> state, get(state) -> (key -> _),
-  # teardown(state). Later milestones add the bounded theine subjects, cachex
-  # and nebulex here.
+  # teardown(state). M5.1 adds cachex and nebulex here.
   defp subjects do
     [
       %{
@@ -148,33 +147,34 @@ defmodule Theine.Bench.Get do
         get: fn table -> fn key -> :ets.lookup(table, key) end end,
         teardown: &:ets.delete/1
       },
-      %{
-        name: "theine_unbounded",
-        setup: fn n, value_fun ->
-          name = :theine_bench_unbounded
-          {:ok, sup} = Theine.start_link(name: name, max_size: :infinity)
-          populate(n, fn chunk -> Enum.each(chunk, &Theine.put(name, &1, value_fun.(&1))) end)
-          wait_for_maintenance(name)
-          {name, sup}
-        end,
-        get: fn {name, _sup} -> fn key -> Theine.get(name, key) end end,
-        teardown: fn {_name, sup} -> Supervisor.stop(sup) end
-      },
-      %{
-        # `stats: false` (specs/08 §Stats): the hit skips its counter op.
-        # Unbounded until M2.8 makes it the bounded `stats: false` subject.
-        name: "theine_nostats",
-        setup: fn n, value_fun ->
-          name = :theine_bench_nostats
-          {:ok, sup} = Theine.start_link(name: name, max_size: :infinity, stats: false)
-          populate(n, fn chunk -> Enum.each(chunk, &Theine.put(name, &1, value_fun.(&1))) end)
-          wait_for_maintenance(name)
-          {name, sup}
-        end,
-        get: fn {name, _sup} -> fn key -> Theine.get(name, key) end end,
-        teardown: fn {_name, sup} -> Supervisor.stop(sup) end
-      }
+      # Bounded at exactly `n` (specs/09): the policy is on, every hit
+      # records into the read buffer and the maintenance process drains
+      # it concurrently with the readers.
+      theine_subject("theine", :theine_bench_bounded, fn n -> [max_size: n] end),
+      theine_subject("theine_unbounded", :theine_bench_unbounded, fn _n ->
+        [max_size: :infinity]
+      end),
+      # Bounded with `stats: false` (specs/08 §Stats): reported for
+      # information, no threshold. A bounded hit has no counter op to skip,
+      # so this measures the option's cost on the miss path alone.
+      theine_subject("theine_nostats", :theine_bench_nostats, fn n ->
+        [max_size: n, stats: false]
+      end)
     ]
+  end
+
+  defp theine_subject(subject, name, opts) do
+    %{
+      name: subject,
+      setup: fn n, value_fun ->
+        {:ok, sup} = Theine.start_link([name: name] ++ opts.(n))
+        populate(n, fn chunk -> Enum.each(chunk, &Theine.put(name, &1, value_fun.(&1))) end)
+        wait_for_maintenance(name)
+        {name, sup}
+      end,
+      get: fn {name, _sup} -> fn key -> Theine.get(name, key) end end,
+      teardown: fn {_name, sup} -> Supervisor.stop(sup) end
+    }
   end
 
   defp populate(n, insert_chunk) do

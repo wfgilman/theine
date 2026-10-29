@@ -91,6 +91,12 @@ defmodule Theine.Owner do
   defp allocate(%Config{stats: stats} = config) do
     counters = :counters.new(@counter_fields, [:write_concurrency])
     bounded? = is_integer(config.max_size)
+    # The miss path counts through this field only, so `stats: false` is
+    # one nil match there (specs/08 §Stats).
+    request_counters = if(stats, do: counters, else: nil)
+
+    read_buffer =
+      if(bounded?, do: ReadBuffer.new(config.stripes, config.read_buffer_slots), else: nil)
 
     %{
       config
@@ -98,12 +104,16 @@ defmodule Theine.Owner do
         pending: :atomics.new(1, signed: true),
         flags: :atomics.new(@drain_flag, signed: false),
         counters: counters,
-        # The hit and miss paths count through this field only, so
-        # `stats: false` is one nil match there (specs/08 §Stats).
-        request_counters: if(stats, do: counters, else: nil),
+        request_counters: request_counters,
+        # The hit path fetches this one key: the read-buffer tuple when
+        # bounded, else the request counters (specs/08 §Decisions M2.8).
+        hit:
+          if(bounded?,
+            do: {read_buffer, config.stripes, config.read_buffer_slots, config.drain_threshold},
+            else: request_counters
+          ),
         sizes: :atomics.new(@size_fields, signed: true),
-        read_buffer:
-          if(bounded?, do: ReadBuffer.new(config.stripes, config.read_buffer_slots), else: nil),
+        read_buffer: read_buffer,
         sketch: if(bounded?, do: Sketch.new(config.max_size), else: nil)
     }
   end

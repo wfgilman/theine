@@ -82,6 +82,14 @@ test/                         mirrors lib/; test/support for shared helpers
   If that is the only failed check, re-run `--sizes 1000` on the same tree;
   a pass there clears it (specs/09 §Decisions M1.6). The full run takes
   about 12 minutes, the `--sizes 1000` run about 3.
+- To cost a hit-path change before the 12-minute bench, time `Theine.get/2`
+  in a compiled module (a `defmodule` in an `.exs` run with
+  `mise exec -- env ERL_FLAGS=... mix run script.exs`; anonymous funs in
+  `mix run -e` are interpreted). Measured there (M2.8): `:erlang.system_info(:scheduler_id)`
+  7 ns, each `:atomics` op 18–25 ns, `:counters.add` 22 ns, `:persistent_term.get`
+  13 ns plus ~8 ns per extra map key matched; ets lookup 220 ns. Summing
+  `[:theine, :maintenance, :pass]` durations in a telemetry handler shows
+  whether the maintenance process is saturated.
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

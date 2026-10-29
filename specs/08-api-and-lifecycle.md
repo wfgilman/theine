@@ -206,3 +206,20 @@ specs/09.
   keeps the table above honest about what production may set. The
   maintenance process dispatches its policy calls through the field
   (specs/04 §Decisions M2.7); nothing on the read or write path reads it.
+- 2026-10-28 (M2.8): a bounded cache started with `stats: false` reports
+  `hits` as 0, not as the tail sum. §Stats says the option does not change
+  the bounded hit path, and it does not: every hit still claims its
+  sequence because the policy needs the read, and `Theine.ReadBuffer.hits/1`
+  still returns the true count. But `misses` are not counted under the
+  option, so reporting the tails would give a `hit_rate` of 1.0 for a
+  cache that was asked not to keep request statistics. `Theine.Stats.hits/1`
+  therefore returns 0 when `request_counters` is nil, bounded or not, and
+  the documented contract ("`hits` and `misses` read 0, `hit_rate` 0.0",
+  M1.6 above) holds in both modes. The hit path reads one config key,
+  the runtime field `hit`: `{buffer, stripes, slots, drain_threshold}`
+  in a bounded cache, else the `request_counters` value. A first version
+  matched five keys in one pattern; measured in a compiled loop, that
+  five-key `get_map_elements` cost about 8 ns more than a one-key match
+  on the 31-key config flatmap and the full `mix bench get` showed the
+  unbounded hit about 30 ns slower than in M2.3. Tuple element access is
+  a few ns, so the bounded branch destructures the tuple instead.

@@ -19,6 +19,18 @@ defmodule Theine.Config do
   @type cache :: atom()
   @type ms_or_infinity :: pos_integer() | :infinity
 
+  @typedoc """
+  What `Theine.get/2` does on a hit, as one field so the hot path fetches a
+  single key from the config (specs/08 §Decisions M2.8): in a bounded cache
+  the read-buffer tuple `{buffer, stripes, slots, drain_threshold}` that
+  `record/2` needs; in an unbounded cache the request counters, or nil with
+  `stats: false`.
+  """
+  @type hit ::
+          {:atomics.atomics_ref(), pos_integer(), pos_integer(), pos_integer()}
+          | :counters.counters_ref()
+          | nil
+
   @type t :: %__MODULE__{
           name: cache(),
           max_size: pos_integer() | :infinity,
@@ -47,6 +59,7 @@ defmodule Theine.Config do
           flags: :atomics.atomics_ref() | nil,
           counters: :counters.counters_ref() | nil,
           request_counters: :counters.counters_ref() | nil,
+          hit: hit(),
           sizes: :atomics.atomics_ref() | nil,
           read_buffer: :atomics.atomics_ref() | nil,
           sketch: Theine.Sketch.t() | nil
@@ -80,6 +93,7 @@ defmodule Theine.Config do
             flags: nil,
             counters: nil,
             request_counters: nil,
+            hit: nil,
             sizes: nil,
             read_buffer: nil,
             sketch: nil
@@ -107,14 +121,16 @@ defmodule Theine.Config do
   ]
 
   # Fields filled in by Theine.Owner, not by options. `request_counters` is
-  # the same ref as `counters`, or nil with `stats: false`, so that the hit
-  # path decides with one map key (specs/08 §Stats, §Decisions M1.6).
+  # the same ref as `counters`, or nil with `stats: false`, so that the miss
+  # path decides with one map key (specs/08 §Stats, §Decisions M1.6); `hit`
+  # does the same for the hit path (§Decisions M2.8).
   @runtime_fields [
     :ids,
     :pending,
     :flags,
     :counters,
     :request_counters,
+    :hit,
     :sizes,
     :read_buffer,
     :sketch

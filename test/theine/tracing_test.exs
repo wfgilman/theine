@@ -165,6 +165,120 @@ defmodule Theine.TracingTest do
     end
   end
 
+  describe "bounded cache" do
+    # One stripe so every scheduler records into the same ring; a long
+    # interval so only `:drain` messages move the head while the test counts.
+    @bounded [
+      max_size: 1_000,
+      stripes: 1,
+      read_buffer_slots: 8,
+      drain_threshold: 4,
+      maintenance_interval: 60_000,
+      test_hooks: true
+    ]
+
+    setup do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache] ++ @bounded})
+      Theine.put(cache, :present, 1)
+      Theine.run_maintenance(cache)
+      %{bounded: cache}
+    end
+
+    test "bounded hit performs exactly persistent_term.get, ets.lookup, atomics.add_get, atomics.get, atomics.put",
+         %{bounded: cache} do
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+
+      # The read buffer claims a sequence (add_get on the tail), reads the
+      # head and writes the id (specs/03 §record/2); the hit count comes
+      # from the tails, so no :counters call (specs/08 §Stats).
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:atomics, :add_get, 3} => 1,
+               {:atomics, :get, 2} => 1,
+               {:atomics, :put, 3} => 1
+             }
+    end
+
+    test "bounded hit with stats: false performs the same multiset" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, stats: false] ++ @bounded})
+      Theine.put(cache, :present, 1)
+      Theine.run_maintenance(cache)
+
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:atomics, :add_get, 3} => 1,
+               {:atomics, :get, 2} => 1,
+               {:atomics, :put, 3} => 1
+             }
+    end
+
+    test "bounded miss performs exactly persistent_term.get, ets.lookup, counters.add",
+         %{bounded: cache} do
+      calls = Trace.calls(@modules, fn -> :error = Theine.get(cache, :absent) end)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:counters, :add, 3} => 1
+             }
+    end
+
+    test "bounded hit at the drain threshold adds exactly one compare_exchange",
+         %{bounded: cache} do
+      # Sequences 0..3 sit below the threshold of 4; the fifth hit claims
+      # sequence 4 with the head still at 0, so `t - head == threshold`
+      # and the reader flips the drain flag and sends `:drain`.
+      for _ <- 1..4, do: {:ok, 1} = Theine.get(cache, :present)
+      assert %{read_buffer: %{lag: 4}} = Theine.Maintenance.info(cache)
+
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:atomics, :add_get, 3} => 1,
+               {:atomics, :get, 2} => 1,
+               {:atomics, :put, 3} => 1,
+               {:atomics, :compare_exchange, 4} => 1
+             }
+
+      # The `:drain` it sent runs a pass that empties the stripe.
+      assert_eventually(fn ->
+        assert %{read_buffer: %{lag: 0}} = Theine.Maintenance.info(cache)
+      end)
+    end
+
+    test "bounded hit on a full stripe drops the id: add_get, get, compare_exchange, no put",
+         %{bounded: cache} do
+      # Paused, the maintenance process consumes neither the `:drain` sent
+      # at sequence 4 nor anything else, so the head stays at 0 and the
+      # ring of 8 is full at sequence 8. The flag is already set, so the
+      # compare_exchange fails and nothing is sent.
+      Theine.Maintenance.pause(cache)
+      for _ <- 1..8, do: {:ok, 1} = Theine.get(cache, :present)
+
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:atomics, :add_get, 3} => 1,
+               {:atomics, :get, 2} => 1,
+               {:atomics, :compare_exchange, 4} => 1
+             }
+
+      Theine.Maintenance.resume(cache)
+      # Every hit claimed a sequence, dropped or not (specs/03 §Hits from the tails).
+      assert %Theine.Stats{hits: 9} = Theine.stats(cache)
+    end
+  end
+
   test "an oversized put touches nothing", %{cache: cache} do
     config = %{Theine.Config.get(cache) | max_size: 1}
     calls = Trace.calls(@modules, fn -> :ok = Theine.Entry.put(config, :big, 1, weight: 2) end)

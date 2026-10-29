@@ -123,6 +123,111 @@ defmodule Theine.StatsTest do
     end
   end
 
+  describe "stats/1 on a bounded cache" do
+    # One stripe of four slots: the buffer drops after four unread hits,
+    # and the tails still count every hit (specs/03 §Hits from the tails).
+    @bounded [
+      max_size: 100,
+      stripes: 1,
+      read_buffer_slots: 4,
+      maintenance_interval: 60_000,
+      test_hooks: true
+    ]
+
+    setup do
+      cache = unique_cache()
+      start_supervised!({Clock, cache: cache, at: 1_000})
+      start_supervised!({Theine, [name: cache] ++ @bounded})
+      %{cache: cache}
+    end
+
+    test "counts match a scripted sequence of hits, misses and expirations exactly",
+         %{cache: cache} do
+      Theine.put(cache, :a, 1)
+      Theine.put(cache, :b, 2, ttl: 10)
+
+      assert {:ok, 1} = Theine.get(cache, :a)
+      assert 1 = Theine.get(cache, :a, nil)
+      assert {:ok, 2} = Theine.get(cache, :b)
+      assert :error = Theine.get(cache, :c)
+      assert :default = Theine.get(cache, :d, :default)
+
+      Clock.advance(cache, 10)
+      assert :error = Theine.get(cache, :b)
+
+      Theine.put(cache, :e, 1, ttl: 5)
+      Clock.advance(cache, 5)
+      assert :ok = Theine.put_new(cache, :e, 2)
+
+      assert %Stats{hits: 3, misses: 3, expirations: 2, evictions: 0, hit_rate: 0.5} =
+               Theine.stats(cache)
+
+      # The hits counter is never touched by a bounded hit (specs/08 §Stats).
+      assert :counters.get(Config.get(cache).counters, Stats.hits()) == 0
+    end
+
+    test "bounded hits equal the number of successful gets even when the read buffer drops (maintenance paused)",
+         %{cache: cache} do
+      Theine.put(cache, :a, 1)
+      Theine.run_maintenance(cache)
+      Theine.Maintenance.pause(cache)
+
+      for _ <- 1..100, do: {:ok, 1} = Theine.get(cache, :a)
+      for _ <- 1..3, do: :error = Theine.get(cache, :missing)
+
+      assert %Stats{hits: 100, misses: 3} = Theine.stats(cache)
+
+      Theine.Maintenance.resume(cache)
+      # At most `slots` reads survived in the ring; the count did not care.
+      assert %{read_buffer: %{lag: 0}} = Theine.Maintenance.info(cache)
+      assert %Stats{hits: 100, misses: 3} = Theine.stats(cache)
+    end
+
+    test "a Maintenance restart does not reset bounded hits", %{cache: cache} do
+      Theine.put(cache, :a, 1)
+      for _ <- 1..5, do: {:ok, 1} = Theine.get(cache, :a)
+      assert %Stats{hits: 5} = Theine.stats(cache)
+
+      pid = Process.whereis(Theine.Maintenance.name(cache))
+      Process.exit(pid, :kill)
+
+      assert_eventually(fn ->
+        Process.whereis(Theine.Maintenance.name(cache)) not in [nil, pid]
+      end)
+
+      assert %Stats{hits: 5} = Theine.stats(cache)
+      for _ <- 1..2, do: {:ok, 1} = Theine.get(cache, :a)
+      assert %Stats{hits: 7} = Theine.stats(cache)
+    end
+
+    test "counts from several processes add up", %{cache: cache} do
+      Theine.put(cache, :a, 1)
+
+      1..8
+      |> Enum.map(fn i ->
+        Task.async(fn ->
+          for _ <- 1..100, do: {:ok, 1} = Theine.get(cache, :a)
+          for _ <- 1..i, do: :error = Theine.get(cache, {:missing, i})
+        end)
+      end)
+      |> Task.await_many()
+
+      assert %Stats{hits: 800, misses: 36} = Theine.stats(cache)
+    end
+
+    test "with stats: false hits and misses read 0 though the tails advance" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, stats: false] ++ @bounded})
+      Theine.put(cache, :a, 1)
+
+      for _ <- 1..3, do: {:ok, 1} = Theine.get(cache, :a)
+      :error = Theine.get(cache, :b)
+
+      assert Theine.stats(cache) == %Stats{hit_rate: 0.0}
+      assert Theine.ReadBuffer.hits(Config.get(cache)) == 3
+    end
+  end
+
   describe "Stats.read/1 with a read buffer" do
     test "hits is the sum of the stripe tails and the hits counter is ignored" do
       cache = unique_cache()
@@ -193,13 +298,20 @@ defmodule Theine.StatsTest do
     test "request_counters is the counters ref, or nil with stats: false" do
       with_stats = unique_cache()
       start_supervised!({Theine, name: with_stats, max_size: :infinity})
-      assert %Config{counters: counters, request_counters: counters} = Config.get(with_stats)
+
+      assert %Config{counters: counters, request_counters: counters, hit: counters} =
+               Config.get(with_stats)
+
       assert %{size: 7} = :counters.info(counters)
 
       without = unique_cache()
       start_supervised!({Theine, name: without, max_size: :infinity, stats: false})
-      assert %Config{counters: other, request_counters: nil} = Config.get(without)
+      assert %Config{counters: other, request_counters: nil, hit: nil} = Config.get(without)
       assert %{size: 7} = :counters.info(other)
+
+      bounded = unique_cache()
+      start_supervised!({Theine, name: bounded, max_size: 10, stats: false})
+      assert %Config{request_counters: nil, hit: {_, _, _, _}} = Config.get(bounded)
     end
   end
 end

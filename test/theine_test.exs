@@ -93,6 +93,8 @@ defmodule TheineTest do
       assert :atomics.info(config.sizes).size == 2
       assert config.read_buffer == nil
       assert config.sketch == nil
+      # The hit path's one key: the request counters when unbounded.
+      assert config.hit == config.counters
     end
 
     test "max_size: :infinity shows no sketch or read buffer in info/1" do
@@ -113,6 +115,8 @@ defmodule TheineTest do
       assert :atomics.info(config.sketch.ref).size == 8192
       assert :atomics.info(config.read_buffer).size == 3 * (2 + 16)
       assert Theine.ReadBuffer.hits(config) == 0
+      # The hit path's one key: the read-buffer tuple when bounded.
+      assert config.hit == {config.read_buffer, 3, 16, config.drain_threshold}
 
       assert %{
                sketch: %{words: 8192, increments: 0},
@@ -326,6 +330,37 @@ defmodule TheineTest do
       Theine.run_maintenance(cache)
       assert Theine.size(cache) == 2
       assert Theine.weighted_size(cache) == 3
+    end
+  end
+
+  describe "get/2 under a bound" do
+    test "reads of one key under a bound keep it resident while 10× distinct keys stream past" do
+      cache = unique_cache()
+      start_supervised!({Theine, name: cache, max_size: 100, maintenance_interval: 60_000})
+      Theine.put(cache, :hot, :v)
+      Theine.run_maintenance(cache)
+
+      # Every iteration writes a fresh key and reads :hot once; a pass every
+      # 16 iterations applies the writes, drains the reads (so :hot moves
+      # to its segment's MRU before eviction) and evicts the overflow.
+      for i <- 1..1_000 do
+        Theine.put(cache, {:cold, i}, i)
+        assert {:ok, :v} = Theine.get(cache, :hot)
+        if rem(i, 16) == 0, do: Theine.run_maintenance(cache)
+      end
+
+      Theine.run_maintenance(cache)
+      assert_eventually(fn -> assert %{pending: 0} = Theine.Maintenance.info(cache) end)
+
+      assert Theine.get(cache, :hot) == {:ok, :v}
+
+      assert {:ok, {:hot, _, segment, _, 1, :infinity}} =
+               Theine.Maintenance.policy_row(cache, :hot)
+
+      assert segment in [:window, :probation, :protected]
+      assert Theine.size(cache) <= 100
+      assert %Theine.Stats{evictions: evictions, hits: 1_001} = Theine.stats(cache)
+      assert evictions >= 900
     end
   end
 

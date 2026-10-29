@@ -25,7 +25,10 @@ defmodule Theine.Stats do
 
   `stats: false` (specs/08 §Stats) turns off the request counters: `hits`
   and `misses` are not counted on `get/2`, which saves the counter op on an
-  unbounded hit and on a miss. The event counters (`expirations`,
+  unbounded hit and on a miss. A bounded hit still claims its sequence
+  (the policy needs the read), but `read/1` reports `hits` as 0 rather
+  than the tail sum, so `hits`, `misses` and `hit_rate` read 0 in both
+  modes (specs/08 §Decisions M2.8). The event counters (`expirations`,
   `evictions`, `loads`, `load_failures`, `refreshes`) are maintained
   regardless; they are incremented off the hot path, where the cost is
   nothing, and stay useful for operators (specs/08 §Decisions).
@@ -139,11 +142,11 @@ defmodule Theine.Stats do
   @doc """
   The hit count of a cache: the `hits` counter in an unbounded cache, the
   sum of the read-buffer stripe tails in a bounded one (specs/03 §Hits from
-  the tails).
+  the tails), and 0 under `stats: false` either way.
   """
   @spec hits(Config.t()) :: non_neg_integer()
   def hits(%Config{read_buffer: nil, counters: counters}), do: :counters.get(counters, hits())
-
+  def hits(%Config{request_counters: nil}), do: 0
   def hits(%Config{} = config), do: Theine.ReadBuffer.hits(config)
 
   @doc """

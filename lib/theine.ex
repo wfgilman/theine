@@ -51,9 +51,9 @@ defmodule Theine do
 
   `max_size: :infinity` disables the policy entirely: no frequency sketch,
   no read buffer, no eviction; expiration and loading still work. A finite
-  `max_size` bounds the total entry weight and allocates both. Eviction
-  itself arrives with the policy's `evict/1` (M2.6); until then a bounded
-  cache tracks its segments without trimming them.
+  `max_size` bounds the total entry weight and allocates both: every hit
+  then records the entry's id in the read buffer, and the maintenance
+  process evicts by W-TinyLFU (specs/05) once the weight exceeds the bound.
 
   The `weigher` is called on every write without a `weight:` option and
   must return a positive integer; an entry heavier than `max_size` is never
@@ -68,7 +68,7 @@ defmodule Theine do
   blocks writers once `write_hwm` events queue.
   """
 
-  alias Theine.{Config, Entry, Policy, Stats}
+  alias Theine.{Config, Entry, Policy, ReadBuffer, Stats}
 
   require Theine.Clock
 
@@ -119,10 +119,14 @@ defmodule Theine do
   Returns `{:ok, value}` when `key` is present and not expired, else
   `:error`. Mirrors `Map.fetch/2`.
 
-  A hit costs one ETS lookup, one `:persistent_term` read, one counter
-  increment (none with `stats: false`), and a clock read only when the
-  entry carries an expiry; it never writes to the table. An expired entry
-  is deleted by the reader and reported as a miss (specs/01 §Read path).
+  A hit costs one ETS lookup, one `:persistent_term` read, a clock read
+  only when the entry carries an expiry, and then either one counter
+  increment (unbounded cache; none with `stats: false`) or, in a bounded
+  cache, one scheduler-id read and three `:atomics` ops that record the
+  read in the read buffer (specs/03), plus one more op and a message to
+  the maintenance process once per `drain_threshold` reads. It never
+  writes to the table. An expired entry is deleted by the reader and
+  reported as a miss (specs/01 §Read path).
 
       iex> {:ok, _} = Theine.start_link(name: :get_doc, max_size: :infinity)
       iex> Theine.put(:get_doc, :a, 1)
@@ -136,22 +140,32 @@ defmodule Theine do
   def get(cache, key) do
     # The hot path (specs/01 §Read path, AGENTS.md). The entries table is
     # named after the cache, so the lookup needs no config; the config is
-    # read only for the counters. Written out in full here rather than
-    # delegated: every call and map access costs against the A1 budget.
+    # read only after a hit or a miss is known. Written out in full here
+    # rather than delegated: every call and map access costs against the
+    # A1 budget.
     case :ets.lookup(cache, key) do
-      [{_, value, _, _, _, expires_at} = entry] ->
+      [{_, value, id, _, _, expires_at} = entry] ->
         # The clock expands to the BIF behind System.monotonic_time/1
         # (specs/01 §Decisions; the test build injects Theine.Test.Clock,
         # specs/06 §Clock); it is read only for entries that can expire.
         if is_integer(expires_at) and Theine.Clock.now(cache) >= expires_at do
           Entry.expired(:persistent_term.get(cache), entry)
         else
-          # `request_counters` is the counters ref, or nil with
-          # `stats: false` (specs/08 §Stats): one map key decides, with no
-          # further call.
+          # `hit` is the one config key the hit path reads (specs/08
+          # §Decisions M2.8): the read-buffer tuple when bounded, else the
+          # request counters, or nil with `stats: false`. The bounded
+          # branch is a local function so that this one stays as small as
+          # the unbounded-only version measured in M2.3 (a bigger body
+          # cost the unbounded hit about 10 ns in the bench).
           case :persistent_term.get(cache) do
-            %{request_counters: nil} -> :ok
-            %{request_counters: counters} -> :counters.add(counters, @hits, 1)
+            %{hit: {buffer, stripes, slots, threshold}} = config ->
+              record(config, buffer, stripes, slots, threshold, id)
+
+            %{hit: nil} ->
+              :ok
+
+            %{hit: counters} ->
+              :counters.add(counters, @hits, 1)
           end
 
           {:ok, value}
@@ -165,6 +179,28 @@ defmodule Theine do
 
         :error
     end
+  end
+
+  # The bounded hit: `Theine.ReadBuffer.record/2` with the sizes taken from
+  # the `hit` tuple (specs/01 §Read path step 5, specs/03 §`record/2`),
+  # local so that no call leaves the module. Claim a sequence in the
+  # scheduler's stripe, write the id unless the ring is full, and ask for a
+  # pass when the ring is full or the lag reached the drain threshold. The
+  # sum of the tails is the hit count, so no counter op (specs/03 §Hits
+  # from the tails). Not inlined: the point is to keep `get/2` small.
+  defp record(config, buffer, stripes, slots, threshold, id) do
+    base = rem(:erlang.system_info(:scheduler_id) - 1, stripes) * (2 + slots) + 1
+    t = :atomics.add_get(buffer, base, 1) - 1
+    lag = t - :atomics.get(buffer, base + 1)
+
+    if lag < slots do
+      :atomics.put(buffer, base + 2 + rem(t, slots), id)
+      if lag >= threshold, do: ReadBuffer.schedule_drain(config)
+    else
+      ReadBuffer.schedule_drain(config)
+    end
+
+    :ok
   end
 
   @doc """
@@ -311,10 +347,12 @@ defmodule Theine do
   `loads`, `load_failures`, `evictions`, `expirations`, `refreshes` and the
   computed `hit_rate` (`0.0` with no requests).
 
-  With `stats: false` the request counters stay at zero: `get/2` counts
-  neither hits nor misses, so `hit_rate` is `0.0`. The event counters are
-  maintained either way (see `Theine.Stats`). `clear/1` leaves the
-  statistics untouched.
+  In a bounded cache `hits` is the number of reads recorded in the read
+  buffer, which every hit does, so it survives a maintenance restart and
+  counts reads the buffer dropped. With `stats: false` the request
+  counters stay at zero: `get/2` counts neither hits nor misses, so
+  `hit_rate` is `0.0`. The event counters are maintained either way (see
+  `Theine.Stats`). `clear/1` leaves the statistics untouched.
 
       iex> {:ok, _} = Theine.start_link(name: :stats_doc, max_size: :infinity)
       iex> Theine.put(:stats_doc, :a, 1)

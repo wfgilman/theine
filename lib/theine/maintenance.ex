@@ -29,6 +29,15 @@ defmodule Theine.Maintenance do
   pass schedules the next one at once through
   `Theine.ReadBuffer.schedule_drain/1`.
 
+  Drain-triggered passes are rate limited (specs/04 §The pass, §Decisions
+  M2.8c): after a pass of duration `d`, a `:drain` that arrives within
+  `drain_backoff * d` is deferred with a timer to the end of that gap,
+  rounded up to the millisecond, and the drain flag stays set meanwhile so
+  readers send nothing more; a second `:drain` in that window is dropped.
+  `run/1`, the interval timer and the `write_batch` trigger are never
+  deferred. Reads during the gap are dropped by the ring, which specs/03
+  allows. `drain_backoff: 0` turns the limit off.
+
   `pause/1` and `resume/1` exist for tests (specs/04 §Responsibilities) and
   only in a cache started with `test_hooks: true`. A paused process blocks
   in a selective receive that accepts nothing but `resume/1`, so every
@@ -87,9 +96,14 @@ defmodule Theine.Maintenance do
     passes: 0,
     last_pass_duration: nil,
     writes: 0,
-    sketch_reset: nil
+    sketch_reset: nil,
+    drain_after: nil,
+    deferred: nil
   ]
 
+  # `drain_after` is the monotonic time (native units) before which no
+  # drain-triggered pass may start, set at the end of every pass; `deferred`
+  # is the timer of the one `:drain` waiting for it, or nil.
   @typep state :: %__MODULE__{
            cache: Config.cache(),
            config: Config.t(),
@@ -98,7 +112,9 @@ defmodule Theine.Maintenance do
            passes: non_neg_integer(),
            last_pass_duration: non_neg_integer() | nil,
            writes: non_neg_integer(),
-           sketch_reset: Sketch.reset_cursor() | nil
+           sketch_reset: Sketch.reset_cursor() | nil,
+           drain_after: integer() | nil,
+           deferred: reference() | nil
          }
 
   @doc "Registered name of the maintenance process of `cache`."
@@ -325,7 +341,27 @@ defmodule Theine.Maintenance do
   def handle_info({:removed, _, _} = event, state),
     do: {:noreply, state |> apply_event(event) |> batch()}
 
-  def handle_info(:drain, state), do: {:noreply, pass(state)}
+  # A reader's or a follow-up's `:drain` (specs/03 §`schedule_drain/1`).
+  # While one is deferred, another is dropped: the flag has stayed set, so
+  # this can only be a message that was already in flight when the last pass
+  # cleared it, and the deferred pass serves both.
+  def handle_info(:drain, %__MODULE__{deferred: ref} = state) when is_reference(ref),
+    do: {:noreply, state}
+
+  def handle_info(:drain, %__MODULE__{drain_after: nil} = state), do: {:noreply, pass(state)}
+
+  def handle_info(:drain, %__MODULE__{drain_after: drain_after} = state) do
+    remaining = drain_after - System.monotonic_time()
+
+    if remaining > 0 do
+      ref = Process.send_after(self(), :deferred_drain, ceil_ms(remaining))
+      {:noreply, %{state | deferred: ref}}
+    else
+      {:noreply, pass(state)}
+    end
+  end
+
+  def handle_info(:deferred_drain, state), do: {:noreply, pass(%{state | deferred: nil})}
 
   def handle_info(:interval, state) do
     schedule_interval(state.config)
@@ -366,8 +402,10 @@ defmodule Theine.Maintenance do
     state = flush(state, config.write_batch * 4)
 
     # 2. Clear the drain flag before reading the buffer: a reader that
-    #    crosses the threshold from here on schedules the next pass.
-    :atomics.put(config.flags, @drain_flag, 0)
+    #    crosses the threshold from here on schedules the next pass. Not
+    #    while a deferred `:drain` is pending: that one is the next pass, and
+    #    the set flag is what keeps readers from sending another.
+    if is_nil(state.deferred), do: :atomics.put(config.flags, @drain_flag, 0)
 
     # 3. Drain the read buffer into the policy.
     {policy, reads, full?} = drain(config, module, state.policy)
@@ -384,7 +422,8 @@ defmodule Theine.Maintenance do
     if full? or status == :more, do: ReadBuffer.schedule_drain(config)
 
     # 8. Record and emit.
-    duration = System.monotonic_time() - started
+    finished = System.monotonic_time()
+    duration = finished - started
 
     :telemetry.execute(
       [:theine, :maintenance, :pass],
@@ -398,8 +437,16 @@ defmodule Theine.Maintenance do
         sketch_reset: sketch_reset,
         passes: state.passes + 1,
         last_pass_duration: duration,
-        writes: 0
+        writes: 0,
+        drain_after: finished + config.drain_backoff * duration
     }
+  end
+
+  # Native units to whole milliseconds, rounded up, so a deferred pass never
+  # starts before `drain_after`.
+  defp ceil_ms(native) when native > 0 do
+    per_ms = max(System.convert_time_unit(1, :millisecond, :native), 1)
+    div(native + per_ms - 1, per_ms)
   end
 
   # Step 1: write events and backpressure calls still in the mailbox, in

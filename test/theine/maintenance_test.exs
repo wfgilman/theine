@@ -27,8 +27,9 @@ defmodule Theine.MaintenanceTest do
   end
 
   # Forwards every pass event of `cache` to the test process as
-  # `{:pass, measurements, metadata}`, with the maintenance process's own
-  # mailbox length and the drain flag as seen at emission time.
+  # `{:pass, measurements, metadata, extra}`, with the emission time, the
+  # maintenance process's own mailbox length and the drain flag as seen at
+  # emission time.
   defp attach_pass_handler(cache) do
     handler = {__MODULE__, cache}
     config = %{test: self(), flags: Config.get(cache).flags}
@@ -45,9 +46,28 @@ defmodule Theine.MaintenanceTest do
   end
 
   def handle_pass(_event, measurements, metadata, %{test: test, flags: flags}) do
+    at = System.monotonic_time()
     {:message_queue_len, len} = Process.info(self(), :message_queue_len)
     flag = :atomics.get(flags, @drain_flag)
-    send(test, {:pass, measurements, metadata, %{queue: len, flag: flag}})
+    send(test, {:pass, measurements, metadata, %{at: at, queue: len, flag: flag}})
+  end
+
+  defp ms(n), do: System.convert_time_unit(n, :millisecond, :native)
+
+  # Reads `key` from `cache` as fast as it can until `deadline` (monotonic ms).
+  defp flood(cache, key, deadline) do
+    {:ok, _} = Theine.get(cache, key)
+    if System.monotonic_time(:millisecond) < deadline, do: flood(cache, key, deadline), else: :ok
+  end
+
+  # Every pass message of `cache` already in the test mailbox.
+  defp passes_received(cache, acc \\ []) do
+    receive do
+      {:pass, measurements, %{cache: ^cache}, extra} ->
+        passes_received(cache, [{measurements, extra} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   test "info/1 reports the cache, pass count, last pass duration, pending and sizes", %{
@@ -317,7 +337,12 @@ defmodule Theine.MaintenanceTest do
       :atomics.put(config.flags, @drain_flag, 1)
       send(Maintenance.name(cache), :drain)
 
-      assert %{passes: 2, read_buffer: %{lag: 0}} = Maintenance.info(cache)
+      # The :drain follows the run/1 pass within drain_backoff × its
+      # duration, so it is deferred by about a millisecond (§The pass).
+      assert_eventually(fn ->
+        assert %{passes: 2, read_buffer: %{lag: 0}} = Maintenance.info(cache)
+      end)
+
       assert flag(cache) == 0
       assert seq_of(cache, :a) > seq_of(cache, :b)
 
@@ -458,7 +483,8 @@ defmodule Theine.MaintenanceTest do
 
       # The reader's :drain ran a pass that found the stripe full (ten
       # sequences claimed against four slots) and scheduled one more; that
-      # one found it empty and stopped.
+      # one, deferred by drain_backoff × the first pass's duration, found it
+      # empty and stopped.
       assert_eventually(fn -> Maintenance.info(cache).passes == 2 end)
       Process.sleep(20)
       assert %{passes: 2, read_buffer: %{lag: 0}} = Maintenance.info(cache)
@@ -517,6 +543,118 @@ defmodule Theine.MaintenanceTest do
       assert %{sketch: %{reset: {^next, _}}} = Maintenance.info(cache)
       Theine.clear(cache)
       assert %{sketch: %{increments: 0, reset: nil}} = Maintenance.info(cache)
+    end
+  end
+
+  describe "drain backoff (specs/04 §The pass, §Decisions M2.8c)" do
+    # One stripe of eight with a threshold of four: the fourth read of the
+    # test process sends the one :drain, and the ring holds every read.
+    @small [stripes: 1, read_buffer_slots: 8, drain_threshold: 4, test_hooks: true]
+
+    test "drain-triggered passes under a flooding reader keep the pass time under a quarter of wall time" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, max_size: 1_000] ++ @quiet})
+      for i <- 1..64, do: Theine.put(cache, i, i)
+      Maintenance.run(cache)
+      attach_pass_handler(cache)
+
+      # One reader saturating its stripe for 300 ms; without the limit the
+      # maintenance process was busy 98% of the time behind such a reader
+      # (IMPLEMENTATION_PLAN.md, discovered issue 6).
+      started = System.monotonic_time()
+      deadline = System.monotonic_time(:millisecond) + 300
+      reader = spawn_link(fn -> flood(cache, 1, deadline) end)
+      ref = Process.monitor(reader)
+      assert_receive {:DOWN, ^ref, :process, ^reader, :normal}, 5_000
+      # The deferred follow-up of the last trigger, if any, runs inside this.
+      Process.sleep(50)
+      wall = System.monotonic_time() - started
+
+      durations = for {%{duration: d}, _} <- passes_received(cache), do: d
+      assert length(durations) >= 10
+      # Every pass but the first follows a gap of at least drain_backoff (3)
+      # times the previous pass, so 4 × busy ≤ wall + 3 × the last pass.
+      assert Enum.sum(durations) <= div(wall, 4) + Enum.max(durations)
+      assert Theine.stats(cache).hits > length(durations) * 64
+    end
+
+    test "a deferred drain runs no earlier than drain_backoff × the last pass duration and within a millisecond of it" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache, max_size: 100, drain_backoff: 1_000] ++ @small ++ @quiet}
+      )
+
+      config = Config.get(cache)
+      attach_pass_handler(cache)
+
+      # Nothing precedes the first pass, so the reader's :drain runs at once.
+      for i <- 1..4, do: :ok = ReadBuffer.record(config, i)
+      assert_receive {:pass, %{duration: d1}, %{cache: ^cache}, %{at: end1}}, 1_000
+      assert flag(cache) == 0
+
+      # The next :drain arrives within 1_000 × d1 of that pass and waits for
+      # the rest of the gap, rounded up to the millisecond.
+      for i <- 1..4, do: :ok = ReadBuffer.record(config, i)
+      assert_receive {:pass, %{duration: d2, reads: 4}, %{cache: ^cache}, %{at: end2}}, 10_000
+      gap = end2 - d2 - end1
+      assert gap >= 1_000 * d1
+      assert gap <= 1_000 * d1 + ms(1) + ms(200)
+      assert flag(cache) == 0
+    end
+
+    test "a :drain during the deferral is dropped, the flag stays set, and run/1 is not deferred" do
+      cache = unique_cache()
+
+      # A gap of 10_000_000 × the pass duration: seconds at least, so every
+      # step below lands inside it.
+      start_supervised!(
+        {Theine, [name: cache, max_size: 100, drain_backoff: 10_000_000] ++ @small ++ @quiet}
+      )
+
+      config = Config.get(cache)
+      pid = Process.whereis(Maintenance.name(cache))
+
+      for i <- 1..4, do: :ok = ReadBuffer.record(config, i)
+      assert %{passes: 1, read_buffer: %{lag: 0}} = Maintenance.info(cache)
+      assert flag(cache) == 0
+
+      # The reader's next :drain is parked; the info call queued behind it
+      # finds no second pass and the flag still set.
+      for i <- 1..4, do: :ok = ReadBuffer.record(config, i)
+      assert %{passes: 1, read_buffer: %{lag: 4}} = Maintenance.info(cache)
+      assert flag(cache) == 1
+
+      # A :drain already in flight is dropped rather than parked twice.
+      send(Maintenance.name(cache), :drain)
+      assert %{passes: 1} = Maintenance.info(cache)
+
+      # Readers past the threshold find the flag set and send nothing.
+      for i <- 1..8, do: :ok = ReadBuffer.record(config, i)
+      assert Process.info(pid, :message_queue_len) == {:message_queue_len, 0}
+      assert %{passes: 1, read_buffer: %{lag: 12}} = Maintenance.info(cache)
+
+      # run/1 passes at once, drains the ring and leaves the flag to the
+      # deferred pass.
+      assert Maintenance.run(cache) == :ok
+      assert %{passes: 2, read_buffer: %{lag: 0}} = Maintenance.info(cache)
+      assert flag(cache) == 1
+    end
+
+    test "drain_backoff: 0 runs every :drain as it arrives" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache, max_size: 100, drain_backoff: 0] ++ @small ++ @quiet}
+      )
+
+      config = Config.get(cache)
+
+      for i <- 1..4, do: :ok = ReadBuffer.record(config, i)
+      assert %{passes: 1} = Maintenance.info(cache)
+      for i <- 1..4, do: :ok = ReadBuffer.record(config, i)
+      assert %{passes: 2, read_buffer: %{lag: 0}} = Maintenance.info(cache)
+      assert flag(cache) == 0
     end
   end
 end

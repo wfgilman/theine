@@ -32,6 +32,7 @@ children = [
 | `expire_batch` | pos_integer | 1024 | 04, 06 |
 | `evict_batch` | pos_integer | 1024 | 04, 05 |
 | `maintenance_interval` | ms | 1000 | 04 |
+| `drain_backoff` | non_neg_integer | 3 | 04 (a drain-triggered pass waits this multiple of the last pass's duration; 0 disables) |
 | `stats` | boolean | true | this file |
 | `test_hooks` | boolean | false | 04 (`pause/1`, `resume/1`; tests only) |
 | `policy_module` | module | `Theine.Policy` | 04, 10 (needs `test_hooks: true`; tests only) |

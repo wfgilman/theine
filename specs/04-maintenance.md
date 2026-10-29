@@ -27,6 +27,19 @@ every `maintenance_interval` ms (default 1000) so expiry runs even on an
 idle cache, by `run/1`, or by the count above reaching `write_batch`
 (default 256) since the last pass.
 
+Drain-triggered passes are rate limited so that readers cannot keep the
+process busy full time: after a pass of duration `d` (whatever triggered
+it), a `:drain` that arrives before `drain_backoff × d` (default 3, a
+`start_link` option; 0 disables) has elapsed since the pass ended is
+deferred with a timer to that moment, rounded up to a whole millisecond,
+and the drain flag stays set until the deferred pass starts, so readers
+send nothing more in between and a second `:drain` already in flight is
+dropped. `run/1`, the interval timer and the `write_batch` trigger are never
+deferred. Reads that arrive during the gap beyond the ring's capacity are
+dropped, which specs/03 allows: the policy needs a sample, not every read.
+A deferred pass runs every step, including the follow-up rule below, so a
+cache over capacity still converges.
+
 Order, matching Caffeine:
 
 1. **Flush write events.** Before touching the buffers, receive whatever
@@ -180,3 +193,32 @@ rebuild are applied after it completes (they are queued in the mailbox).
     sketch.
   - The periodic trigger is one `Process.send_after/3` timer, re-armed when
     it fires, so the interval is the gap between pass starts.
+- 2026-10-28 (M2.8c): drain-triggered passes are rate limited (§The pass).
+  Measured with the M2.8b tree under one saturating reader, the process ran
+  7_100 passes in 816 ms of wall time (800 ms busy, about 110 µs per pass
+  for 64 reads, 1.7 µs per `on_access`): every pass that drained a full
+  stripe followed up at once and every reader trigger that found the flag
+  clear woke the process, so at full parallelism on the four-scheduler
+  reference machine one core went to maintenance and `theine` ips sat at
+  0.39–0.52× `ets` (IMPLEMENTATION_PLAN.md, discovered issue 6); at
+  parallel 1 the same pass frequency put the bounded p99 at 1.56–2.32×
+  `ets` through the `send` on each trigger and the drainer's traffic on the
+  reader's stripe. The rule: the pass records `drain_after = finished +
+  drain_backoff × duration` after every pass, and a `:drain` arriving
+  before it is parked with one `Process.send_after/3` timer for the
+  remaining time rounded up to the millisecond (`:deferred_drain`), with
+  the flag left set; step 2 skips clearing the flag while such a timer is
+  pending, so a `run/1`, timer or `write_batch` pass in the gap leaves the
+  deferred pass as the one in flight and the specs/03 "at most one
+  `:drain`" rule holds. `drain_after` is set by every pass, not only
+  drain-triggered ones, because the cost being limited is the pass itself;
+  only the deferral is specific to the drain trigger. With `drain_backoff`
+  3 the drain-triggered duty cycle is at most 25% by construction, and in
+  practice lower, because BEAM timers are millisecond-grained: a 100 µs
+  pass is followed by at least 1 ms of reader-only time, so under a
+  saturating reader the process samples the newest `slots` reads of each
+  stripe about once per millisecond. The knob is an option rather than a
+  constant so that `mix bench get` can try `k` = 7 if 25% is not enough for
+  A2 and tests can make the gap wide enough to observe. `drain_backoff: 0`
+  restores back-to-back passes. `reset/1` leaves a pending deferral alone;
+  it runs a pass on the emptied policy, which is harmless.

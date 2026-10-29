@@ -51,6 +51,7 @@ defmodule Theine.Config do
           expire_batch: pos_integer(),
           evict_batch: pos_integer(),
           maintenance_interval: pos_integer(),
+          drain_backoff: non_neg_integer(),
           stats: boolean(),
           test_hooks: boolean(),
           policy_module: module(),
@@ -85,6 +86,7 @@ defmodule Theine.Config do
             expire_batch: 1024,
             evict_batch: 1024,
             maintenance_interval: 1000,
+            drain_backoff: 3,
             stats: true,
             test_hooks: false,
             policy_module: Theine.Policy,
@@ -118,6 +120,7 @@ defmodule Theine.Config do
     :expire_batch,
     :evict_batch,
     :maintenance_interval,
+    :drain_backoff,
     :stats,
     :test_hooks,
     :policy_module
@@ -310,6 +313,9 @@ defmodule Theine.Config do
             ] and is_integer(n) and n > 0,
        do: n
 
+  # The drain-pass rate limit (specs/04 §The pass): 0 turns it off.
+  defp validate!(:drain_backoff, n) when is_integer(n) and n >= 0, do: n
+
   defp validate!(key, value) do
     raise ArgumentError,
           "invalid value for option #{inspect(key)}: #{inspect(value)} (#{expected(key)})"
@@ -329,5 +335,6 @@ defmodule Theine.Config do
   defp expected(key) when key in [:stripes, :read_buffer_slots, :drain_threshold],
     do: "expected a power of two"
 
+  defp expected(:drain_backoff), do: "expected a non-negative integer"
   defp expected(_), do: "expected a positive integer"
 end

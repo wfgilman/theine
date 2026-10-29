@@ -27,6 +27,7 @@ defmodule Theine.ConfigTest do
     assert config.expire_batch == 1024
     assert config.evict_batch == 1024
     assert config.maintenance_interval == 1000
+    assert config.drain_backoff == 3
     assert config.stats == true
     assert config.test_hooks == false
     assert config.policy_module == Theine.Policy
@@ -71,6 +72,7 @@ defmodule Theine.ConfigTest do
         expire_batch: 5,
         evict_batch: 6,
         maintenance_interval: 50,
+        drain_backoff: 0,
         stats: false,
         test_hooks: true,
         policy_module: Theine.Test.Policy
@@ -90,6 +92,7 @@ defmodule Theine.ConfigTest do
     assert config.expire_batch == 5
     assert config.evict_batch == 6
     assert config.maintenance_interval == 50
+    assert config.drain_backoff == 0
     refute config.stats
     assert config.test_hooks
     assert config.policy_module == Theine.Test.Policy
@@ -131,6 +134,8 @@ defmodule Theine.ConfigTest do
       expire_batch: :many,
       evict_batch: 0,
       maintenance_interval: 0,
+      drain_backoff: -1,
+      drain_backoff: 1.5,
       stats: :yes,
       test_hooks: 1,
       policy_module: "Theine.Policy",

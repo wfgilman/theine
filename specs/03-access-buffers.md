@@ -52,7 +52,11 @@ flight per cache; the maintenance process resets the flag to 0 when it
 trigger that finds the flag set is simply lost; the next test is
 `drain_threshold` reads later on that stripe, and the ring keeps the last
 `slots` reads whatever happens in between, so `slots` should stay at or
-above `2 * drain_threshold` (the defaults are 64 and 32).
+above `2 * drain_threshold` (the defaults are 64 and 32). The maintenance
+process may hold the flag set for longer than a pass: a `:drain` that
+arrives too soon after the last pass is deferred with the flag still set
+(specs/04 §The pass, `drain_backoff`), and readers in that gap pay one
+failed compare_exchange per `drain_threshold` reads and nothing else.
 
 Budget on a hit: one scheduler-id read, one add_get, one put, and once per
 `drain_threshold` reads one compare_exchange plus one send. That is inside

@@ -91,7 +91,11 @@ test/                         mirrors lib/; test/support for shared helpers
   small integers about 11 ns each (a division), `Bitwise.band/2` about 1 ns,
   so size options on a hot path should be powers of two (M2.8b). Summing
   `[:theine, :maintenance, :pass]` durations in a telemetry handler shows
-  whether the maintenance process is saturated.
+  whether the maintenance process is saturated. Under readers on every
+  scheduler a pass's `duration` is wall time on a shared scheduler and runs
+  about 4× longer per read than with one reader (M2.8c), so compare the
+  duty cycle (sum of durations / wall), not pass lengths, across loads; the
+  `drain_backoff` option sets the drain-pass gap (0 = back to back).
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

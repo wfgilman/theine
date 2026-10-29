@@ -74,7 +74,8 @@ Order, matching Caffeine:
    eviction that stopped at `evict_batch`; it stays as the safety net that
    makes "over capacity converges" true whatever the path.
 6. **Sketch aging**: if a reset is in progress, advance it by one chunk.
-7. **Adaptive step** (M6 only): `Policy.climb/1` if enabled.
+7. **Adaptive step**: `Policy.climb/1` when `adaptive` is true, the default
+   (specs/05 §Adaptive window).
 8. Record pass duration and queue depths in the maintenance state and emit
    `[:theine, :maintenance, :pass]` telemetry with measurements
    `%{duration: native, reads: n, writes: n, expired: n, evicted: n}`;

@@ -108,19 +108,21 @@ defmodule TheineTest do
     test "a finite max_size allocates the sketch and the read buffer once" do
       cache = unique_cache()
 
-      start_supervised!({Theine, name: cache, max_size: 5_000, stripes: 3, read_buffer_slots: 16})
+      start_supervised!({Theine, name: cache, max_size: 5_000, stripes: 4, read_buffer_slots: 16})
 
       config = Config.get(cache)
       assert %Theine.Sketch{words: 8192} = config.sketch
       assert :atomics.info(config.sketch.ref).size == 8192
-      assert :atomics.info(config.read_buffer).size == 3 * (2 + 16)
+      assert :atomics.info(config.read_buffer).size == 4 * (2 + 16)
       assert Theine.ReadBuffer.hits(config) == 0
-      # The hit path's one key: the read-buffer tuple when bounded.
-      assert config.hit == {config.read_buffer, 3, 16, config.drain_threshold}
+      # The hit path's one key: the read-buffer tuple when bounded, with
+      # the stripe mask, stripe width, slot mask and trigger mask (specs/03
+      # §Decisions M2.8b).
+      assert config.hit == {config.read_buffer, 3, 18, 15, config.drain_threshold - 1}
 
       assert %{
                sketch: %{words: 8192, increments: 0},
-               read_buffer: %{stripes: 3, slots: 16, lag: 0},
+               read_buffer: %{stripes: 4, slots: 16, lag: 0},
                segments: %{window: 0, probation: 0, protected: 0}
              } = Theine.Maintenance.info(cache)
 

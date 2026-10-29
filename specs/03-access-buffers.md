@@ -23,37 +23,48 @@ base + 1  -> head   (next sequence number the drainer will read)
 base + 2 .. base + 1 + slots -> ring slots holding ids (0 = empty)
 ```
 
-Defaults: `stripes = System.schedulers_online()`, `slots = 64`,
-`drain_threshold = 32`. All three are `start_link` options.
+Defaults: `stripes = System.schedulers_online()` rounded up to a power of
+two, `slots = 64`, `drain_threshold = 32`. All three are `start_link`
+options and must be powers of two (`ArgumentError` otherwise), so that
+every modulo below is a bit mask; the masks and the stripe width
+`2 + slots` are precomputed in the config's `hit` tuple (specs/08).
 
 ### `record(config, id)` — the hot-path side
 
 1. `s = :erlang.system_info(:scheduler_id) - 1` modulo `stripes`
    (scheduler ids are 1-based). This is a cheap BIF and gives near-perfect
-   striping under normal scheduling.
+   striping under normal scheduling. Schedulers beyond the online count
+   leave their stripes empty.
 2. `t = :atomics.add_get(buf, base, 1) - 1` claims sequence `t`.
-3. `head = :atomics.get(buf, base + 1)`. If `t - head >= slots`, the ring
-   is full: **drop** the access (the claimed sequence is simply never
-   written) and go to step 5 with `full = true`.
-4. `:atomics.put(buf, base + 2 + rem(t, slots), id)`.
-5. If `full` or `t - head >= drain_threshold`, call `schedule_drain(config)`.
+3. `:atomics.put(buf, base + 2 + rem(t, slots), id)`, whatever the head
+   says. The ring holds the most recent `slots` reads of the stripe; when
+   the drainer is more than `slots` behind, the write lands on a slot whose
+   read was never drained, and that overwritten read is the **drop**. The
+   reader never reads the head.
+4. If `rem(t + 1, drain_threshold) == 0`, call `schedule_drain(config)`:
+   the flag is tested on every `drain_threshold`-th sequence of the stripe,
+   not on every read past a lag.
 
 `schedule_drain/1`: `:atomics.compare_exchange(flags, drain_flag, 0, 1)`;
 on `:ok`, `send(config.maintenance, :drain)`. At most one drain message is in
 flight per cache; the maintenance process resets the flag to 0 when it
-*starts* a drain, so a trigger during the drain schedules the next one.
+*starts* a drain, so a trigger during the drain schedules the next one. A
+trigger that finds the flag set is simply lost; the next test is
+`drain_threshold` reads later on that stripe, and the ring keeps the last
+`slots` reads whatever happens in between, so `slots` should stay at or
+above `2 * drain_threshold` (the defaults are 64 and 32).
 
-Budget on a hit: one scheduler-id read, one add_get, one get, one put, and
-rarely one compare_exchange plus one send. That is exactly the "at most
-three atomics ops" in specs/00 and specs/01 in the common case; the drain
-trigger adds a fourth op and a send once per `drain_threshold` reads, and
-the tracing test in specs/01 must account for that amortized case
-separately.
+Budget on a hit: one scheduler-id read, one add_get, one put, and once per
+`drain_threshold` reads one compare_exchange plus one send. That is inside
+the "at most three atomics ops" of specs/00 and specs/01 in every case; the
+tracing test in specs/01 pins the two-op common hit and the three-op
+trigger separately.
 
-When the ring is full, `tail` keeps advancing past `head + slots` because
-every dropped access still claims a sequence. That is intended: the drainer
-reads only the last `slots` sequences, and `tail - head` is a cheap measure
-of how far behind maintenance is (`info/1` reports it).
+`tail` keeps advancing past `head + slots` while the drainer lags, because
+every access claims a sequence whether or not its read survives. That is
+intended: the drainer reads only the last `slots` sequences, and
+`tail - head` is a cheap measure of how far behind maintenance is
+(`info/1` reports it).
 
 ### Hits from the tails
 
@@ -69,7 +80,8 @@ for every hit, including hits that are dropped and hits in a cache started
 with `stats: false`; the one add_get is the whole cost of counting.
 
 Note that a slot may hold a stale id (a reader claimed `t` but has not yet
-`put`), or 0. The drainer tolerates both.
+`put`), a newer id (a reader claimed `t + slots` and wrote it while the
+drain was visiting `t`), or 0. The drainer tolerates all three.
 
 ### `drain(config, fun)` — the maintenance side
 
@@ -78,7 +90,10 @@ For each stripe: read `head` and `tail`; for each sequence from
 `fun.(id)`; then `put(head, tail_read)`. Readers that claimed a sequence but
 have not yet written see their slot drained as 0 or as a previous id; both
 are harmless (a lost or duplicated sample). After draining, the drainer does
-not zero slots; sequence arithmetic alone decides what is live.
+not zero slots; sequence arithmetic alone decides what is live. A stripe
+counts as **full** when `tail - head >= slots` at the time it is read: the
+ring reached its capacity since the last drain, so reads may have been
+overwritten and the pass follows up (specs/04 §The pass).
 
 The drainer processes at most `stripes * slots` ids per pass, which bounds
 pass time.
@@ -178,3 +193,42 @@ new process registers, and the mutation preceded the send.
   `Theine.Maintenance.init/1` already clears the flag, and the restart
   rebuild schedules its own `:drain` when over capacity (specs/04), so no
   trigger is owed to the reader whose message was lost.
+- 2026-10-28 (M2.8b): `record/2` is two atomics ops. The original protocol
+  read the head on every hit to refuse a write into a full ring and to
+  compare the lag with `drain_threshold`, and called `schedule_drain/1` on
+  every read past the threshold. Measured in a compiled loop with the M2.8
+  tree, that was about 105 ns over the unbounded hit (each `:atomics` op
+  18–25 ns, the `schedule_drain/1` call about 40 ns), against a 65 ns
+  budget, and on a full ring every hit paid the compare_exchange, one cache
+  line bouncing between all readers at full parallelism; `theine` p50 ran
+  at 1.62–1.86× `ets` (IMPLEMENTATION_PLAN.md, discovered issue 6). Now the
+  reader always writes slot `rem(t, slots)`, so the ring keeps the most
+  recent `slots` reads instead of the first `slots` after a drain, and the
+  drain flag is tested on every `drain_threshold`-th sequence
+  (`rem(t + 1, drain_threshold) == 0`; `t + 1` so that a fresh stripe's
+  first read does not trigger a pass of an empty ring). Nothing on the
+  maintenance side changed: the drainer already visited only
+  `max(head, tail - slots)..tail - 1`, `full?` is still `tail - head >=
+  slots`, and the tails still count every hit. What the policy loses is the
+  choice of sample: under a lagging drainer it now sees the newest `slots`
+  reads of a stripe rather than the oldest, which is the better sample. A
+  trigger lost to a set flag is recovered `drain_threshold` reads later,
+  which is why `slots` should be at least `2 * drain_threshold`; a cache
+  configured otherwise still works, it just drains a smaller fraction of
+  its reads. Measured in the same loop on the same day, the two-op
+  protocol with `rem` was still 99 ns over the loop and 77 ns over the
+  unbounded hit, because each of the three `rem` operations (stripe, slot,
+  trigger) is an integer division; with `stripes`, `slots` and
+  `drain_threshold` restricted to powers of two and the masks precomputed
+  in the `hit` tuple, the same protocol measures 65 ns, so the three
+  options now require powers of two and the default `stripes` is the
+  online scheduler count rounded up (Caffeine sizes its buffers the same
+  way). Rounding `stripes` up costs the drainer two atomics reads per
+  empty stripe per pass and nothing else; rounding the two user-facing
+  sizes silently was rejected in favour of an `ArgumentError`, since a
+  size the user wrote would otherwise not be the size they got. With this
+  protocol the bounded hit measures 53–64 ns over the unbounded one; what
+  the bench's p99 still shows at parallel 1 is the pass frequency (the
+  `send` on each trigger that finds the flag clear, and the drainer's
+  cache traffic on the stripe), which specs/04's drain rate limit
+  addresses (IMPLEMENTATION_PLAN.md M2.8c).

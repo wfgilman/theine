@@ -87,7 +87,9 @@ test/                         mirrors lib/; test/support for shared helpers
   `mise exec -- env ERL_FLAGS=... mix run script.exs`; anonymous funs in
   `mix run -e` are interpreted). Measured there (M2.8): `:erlang.system_info(:scheduler_id)`
   7 ns, each `:atomics` op 18–25 ns, `:counters.add` 22 ns, `:persistent_term.get`
-  13 ns plus ~8 ns per extra map key matched; ets lookup 220 ns. Summing
+  13 ns plus ~8 ns per extra map key matched; ets lookup 220 ns; `rem/2` on
+  small integers about 11 ns each (a division), `Bitwise.band/2` about 1 ns,
+  so size options on a hot path should be powers of two (M2.8b). Summing
   `[:theine, :maintenance, :pass]` durations in a telemetry handler shows
   whether the maintenance process is saturated.
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown

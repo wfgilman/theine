@@ -34,9 +34,9 @@ defmodule Theine do
   | `loader` | `(key -> {:commit, v} \\| {:commit, v, ttl: ms} \\| {:ignore, v})` or `nil` | `nil` |
   | `window_percent` | 1..80 | 1 |
   | `adaptive` | boolean | `false` |
-  | `stripes` | pos_integer | `System.schedulers_online()` |
-  | `read_buffer_slots` | pos_integer | 64 |
-  | `drain_threshold` | pos_integer | 32 |
+  | `stripes` | power of two | `System.schedulers_online()` rounded up to one |
+  | `read_buffer_slots` | power of two | 64 |
+  | `drain_threshold` | power of two | 32 |
   | `write_hwm` | pos_integer | 1024 |
   | `write_batch` | pos_integer | 256 |
   | `expire_batch` | pos_integer | 1024 |
@@ -122,7 +122,7 @@ defmodule Theine do
   A hit costs one ETS lookup, one `:persistent_term` read, a clock read
   only when the entry carries an expiry, and then either one counter
   increment (unbounded cache; none with `stats: false`) or, in a bounded
-  cache, one scheduler-id read and three `:atomics` ops that record the
+  cache, one scheduler-id read and two `:atomics` ops that record the
   read in the read buffer (specs/03), plus one more op and a message to
   the maintenance process once per `drain_threshold` reads. It never
   writes to the table. An expired entry is deleted by the reader and
@@ -158,8 +158,8 @@ defmodule Theine do
           # the unbounded-only version measured in M2.3 (a bigger body
           # cost the unbounded hit about 10 ns in the bench).
           case :persistent_term.get(cache) do
-            %{hit: {buffer, stripes, slots, threshold}} = config ->
-              record(config, buffer, stripes, slots, threshold, id)
+            %{hit: {buffer, stripe_mask, width, slot_mask, trigger_mask}} = config ->
+              record(config, buffer, stripe_mask, width, slot_mask, trigger_mask, id)
 
             %{hit: nil} ->
               :ok
@@ -182,24 +182,20 @@ defmodule Theine do
   end
 
   # The bounded hit: `Theine.ReadBuffer.record/2` with the sizes taken from
-  # the `hit` tuple (specs/01 §Read path step 5, specs/03 §`record/2`),
-  # local so that no call leaves the module. Claim a sequence in the
-  # scheduler's stripe, write the id unless the ring is full, and ask for a
-  # pass when the ring is full or the lag reached the drain threshold. The
-  # sum of the tails is the hit count, so no counter op (specs/03 §Hits
-  # from the tails). Not inlined: the point is to keep `get/2` small.
-  defp record(config, buffer, stripes, slots, threshold, id) do
-    base = rem(:erlang.system_info(:scheduler_id) - 1, stripes) * (2 + slots) + 1
-    t = :atomics.add_get(buffer, base, 1) - 1
-    lag = t - :atomics.get(buffer, base + 1)
-
-    if lag < slots do
-      :atomics.put(buffer, base + 2 + rem(t, slots), id)
-      if lag >= threshold, do: ReadBuffer.schedule_drain(config)
-    else
-      ReadBuffer.schedule_drain(config)
-    end
-
+  # the `hit` tuple as masks (specs/01 §Read path step 5, specs/03
+  # §`record/2`), local so that no call leaves the module. Claim a sequence
+  # in the scheduler's stripe, write the id into its slot (overwriting an
+  # undrained read rather than reading the head to refuse it; specs/03
+  # §Decisions M2.8b), and ask for a pass on every `drain_threshold`-th
+  # sequence. Masks, not `rem`: the three divisions cost about 34 ns of a
+  # 65 ns budget in a compiled loop. The sum of the tails is the hit
+  # count, so no counter op (specs/03 §Hits from the tails). Not inlined:
+  # the point is to keep `get/2` small.
+  defp record(config, buffer, stripe_mask, width, slot_mask, trigger_mask, id) do
+    base = Bitwise.band(:erlang.system_info(:scheduler_id) - 1, stripe_mask) * width + 1
+    n = :atomics.add_get(buffer, base, 1)
+    :atomics.put(buffer, base + 2 + Bitwise.band(n - 1, slot_mask), id)
+    if Bitwise.band(n, trigger_mask) == 0, do: ReadBuffer.schedule_drain(config)
     :ok
   end
 

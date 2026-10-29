@@ -14,20 +14,25 @@ defmodule Theine.ReadBuffer do
       base + 1      head   next sequence number the drainer will read
       base + 2 ..   slots  ring of ids, slot `rem(seq, slots)`; 0 means empty
 
-  Every call to `record/2` claims a sequence from its stripe's tail, dropped
-  or not, so the sum of the tails is the exact number of hits recorded since
-  the array was created (§Hits from the tails); `Theine.Stats` reads it
-  through `hits/1`. The tails are never reset. `tail - head` of a stripe is
-  how far behind the drainer is (`lag/1`).
+  Every call to `record/2` claims a sequence from its stripe's tail and
+  writes its id into slot `rem(seq, slots)`, so the ring always holds the
+  most recent `slots` reads and a reader never looks at the head: an
+  undrained read is overwritten (dropped) rather than refused (specs/03
+  §Decisions M2.8b). The sum of the tails is the exact number of hits
+  recorded since the array was created (§Hits from the tails);
+  `Theine.Stats` reads it through `hits/1`. The tails are never reset.
+  `tail - head` of a stripe is how far behind the drainer is (`lag/1`).
 
   Only the maintenance process moves heads (`drain/3`, `reset_heads/1`). It
   is the sole consumer, so heads need no compare-exchange, and it clears the
   drain flag before draining so that readers can schedule the next pass
   while one runs (specs/04 §The pass step 2).
 
-  `record/2` is the reference implementation of the hot-path side. Readers
-  that claimed a sequence but have not yet written their slot, and drains
-  that race them, cost a lost or duplicated sample and nothing else.
+  `record/2` is the reference implementation of the hot-path side;
+  `Theine.get/2` carries a copy of its body. Readers that claimed a sequence
+  but have not yet written their slot, drains that race them, and readers
+  overwriting a slot the drainer is visiting cost a lost or duplicated
+  sample and nothing else.
   """
 
   alias Theine.Config
@@ -66,16 +71,19 @@ defmodule Theine.ReadBuffer do
   Records a read of entry `id` in the stripe of the current scheduler
   (specs/03 §`record/2`).
 
-  Claims a sequence `t` with one `add_get` on the stripe's tail, reads the
-  head, and writes `id` into slot `rem(t, slots)` unless the ring is full
-  (`t - head >= slots`), in which case the access is dropped and the
-  sequence stays claimed. Calls `schedule_drain/1` when the ring was full or
-  `t - head` reached `drain_threshold`. Never blocks, never loops, never
-  raises on the way to the maintenance process. Returns `:ok`.
+  Claims a sequence `t` with one `add_get` on the stripe's tail and writes
+  `id` into slot `rem(t, slots)` with one `put`, whatever the head says: an
+  undrained read in that slot is overwritten, which is the drop. Calls
+  `schedule_drain/1` on every `drain_threshold`-th sequence of the stripe
+  (`rem(t + 1, drain_threshold) == 0`), so the drain flag is tested once per
+  `drain_threshold` reads per stripe rather than on every read past it.
+  `stripes`, `slots` and `drain_threshold` are powers of two
+  (`Theine.Config`), so every `rem` is a mask. Never blocks, never loops,
+  never raises on the way to the maintenance process. Returns `:ok`.
 
-  Cost on the common hit: one scheduler-id read, one `add_get`, one `get`,
-  one `put`; once per `drain_threshold` reads one `compare_exchange` and one
-  `send` on top.
+  Cost on the common hit: one scheduler-id read, one `add_get`, one `put`;
+  once per `drain_threshold` reads one `compare_exchange` and one `send` on
+  top.
   """
   @spec record(Config.t(), id()) :: :ok
   def record(
@@ -87,16 +95,10 @@ defmodule Theine.ReadBuffer do
         } = config,
         id
       ) do
-    base = rem(:erlang.system_info(:scheduler_id) - 1, stripes) * (2 + slots) + 1
-    t = :atomics.add_get(buffer, base, 1) - 1
-    pending = t - :atomics.get(buffer, base + 1)
-
-    if pending >= slots do
-      schedule_drain(config)
-    else
-      :atomics.put(buffer, base + 2 + rem(t, slots), id)
-      if pending >= threshold, do: schedule_drain(config), else: :ok
-    end
+    base = Bitwise.band(:erlang.system_info(:scheduler_id) - 1, stripes - 1) * (2 + slots) + 1
+    n = :atomics.add_get(buffer, base, 1)
+    :atomics.put(buffer, base + 2 + Bitwise.band(n - 1, slots - 1), id)
+    if Bitwise.band(n, threshold - 1) == 0, do: schedule_drain(config), else: :ok
   end
 
   @doc """
@@ -152,7 +154,8 @@ defmodule Theine.ReadBuffer do
   calls `fun` for every slot that is not 0, then moves `head` to the `tail`
   it read. Slots are not zeroed; sequence arithmetic alone decides what is
   live. A stripe counts as full when `tail - head >= slots` at the time it
-  is read, which means reads were dropped since the last drain.
+  is read: the ring reached its capacity since the last drain, and every
+  read past that overwrote an undrained one.
 
   Only the maintenance process may call this.
   """

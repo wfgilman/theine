@@ -107,9 +107,13 @@ defmodule Theine.Owner do
         request_counters: request_counters,
         # The hit path fetches this one key: the read-buffer tuple when
         # bounded, else the request counters (specs/08 §Decisions M2.8).
+        # The sizes are precomputed as the stripe mask, the stripe width,
+        # the slot mask and the trigger mask (specs/03 §Decisions M2.8b).
         hit:
           if(bounded?,
-            do: {read_buffer, config.stripes, config.read_buffer_slots, config.drain_threshold},
+            do:
+              {read_buffer, config.stripes - 1, 2 + config.read_buffer_slots,
+               config.read_buffer_slots - 1, config.drain_threshold - 1},
             else: request_counters
           ),
         sizes: :atomics.new(@size_fields, signed: true),

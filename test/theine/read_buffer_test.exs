@@ -10,8 +10,9 @@ defmodule Theine.ReadBufferTest do
 
   @drain_flag Owner.drain_flag()
 
-  # A config with a read buffer and flags but no running cache: the buffer
-  # is standalone until M2.8 wires it into get/2. `stripes: 1` makes every
+  # A config with a read buffer and flags but no running cache, so the ring
+  # protocol is tested on its own (`Theine.get/2` carries a copy of
+  # `record/2`; tracing_test pins that copy). `stripes: 1` makes every
   # scheduler record into stripe 0, so single-process tests are
   # deterministic whatever scheduler the test runs on. The maintenance name
   # is unregistered unless the test registers itself under it.
@@ -99,7 +100,7 @@ defmodule Theine.ReadBufferTest do
 
   describe "record/2" do
     test "writes ids into the ring in sequence order and only claims a tail" do
-      config = config(slots: 8, threshold: 100)
+      config = config(slots: 8, threshold: 128)
       record_all(config, 1..5)
 
       assert ReadBuffer.dump(config) == [%{tail: 5, head: 0, ids: [1, 2, 3, 4, 5, 0, 0, 0]}]
@@ -109,7 +110,7 @@ defmodule Theine.ReadBufferTest do
     end
 
     test "wraps around the ring while the drainer keeps up" do
-      config = config(slots: 8, threshold: 100)
+      config = config(slots: 8, threshold: 128)
       record_all(config, 1..6)
       assert {Enum.to_list(1..6), 6, false} == drain_list(config)
 
@@ -119,60 +120,89 @@ defmodule Theine.ReadBufferTest do
       assert {Enum.to_list(7..12), 6, false} == drain_list(config)
     end
 
-    test "drops once the ring is full and keeps claiming sequences" do
-      config = config(slots: 4, threshold: 100)
+    test "overwrites the oldest undrained reads once the ring is full and keeps claiming sequences" do
+      config = config(slots: 4, threshold: 128)
       record_all(config, 1..10)
 
-      # Sequences 0..3 were written; 4..9 found tail - head >= slots and
-      # were dropped, slot untouched. The tail counts them all the same.
-      assert ReadBuffer.dump(config) == [%{tail: 10, head: 0, ids: [1, 2, 3, 4]}]
+      # Every sequence was written into slot rem(t, 4) without a look at the
+      # head: the ring holds the most recent four reads (sequences 6..9) and
+      # the six older ones were overwritten, which is the drop. The tail
+      # counts them all the same.
+      assert ReadBuffer.dump(config) == [%{tail: 10, head: 0, ids: [9, 10, 7, 8]}]
       assert ReadBuffer.hits(config) == 10
       assert ReadBuffer.lag(config) == 10
 
-      # The drainer visits the last `slots` sequences (6..9) and finds the
-      # stale ids of 2..5 in their slots: a duplicated sample, never an id
-      # that was not recorded, and never more than `slots` of them.
-      assert {[3, 4, 1, 2], 4, true} = drain_list(config)
+      # The drainer visits the last `slots` sequences (6..9) and finds
+      # exactly the ids they wrote: never an id that was not recorded, and
+      # never more than `slots` of them.
+      assert {[7, 8, 9, 10], 4, true} = drain_list(config)
       assert ReadBuffer.lag(config) == 0
       assert ReadBuffer.hits(config) == 10
       assert {[], 0, false} = drain_list(config)
     end
 
-    test "sends exactly one :drain when a stripe crosses drain_threshold" do
+    test "sends exactly one :drain on every drain_threshold-th sequence" do
       name = register_as_maintenance()
       config = config(slots: 8, threshold: 4, maintenance: name)
 
-      record_all(config, 1..4)
+      record_all(config, 1..3)
       refute_received :drain
       assert flag(config) == 0
 
-      # Sequence 4: t - head == 4 == drain_threshold.
-      :ok = ReadBuffer.record(config, 5)
+      # Sequence 3 is the fourth of the stripe: rem(t + 1, 4) == 0.
+      :ok = ReadBuffer.record(config, 4)
       assert_received :drain
       assert flag(config) == 1
 
-      # The flag is set, so no further trigger reaches the mailbox until the
-      # maintenance process clears it at the start of its pass.
-      record_all(config, 6..40)
+      # Sequences 7, 11, ... test the flag again and find it set, so no
+      # further trigger reaches the mailbox until the maintenance process
+      # clears it at the start of its pass; the reads in between do not
+      # test it at all.
+      record_all(config, 5..40)
       refute_received :drain
 
       :atomics.put(config.flags, @drain_flag, 0)
       assert {_, 8, true} = drain_list(config)
-      record_all(config, 41..45)
+      # Sequences 40..42 are not multiples of 4 minus one; 43 is.
+      record_all(config, 41..43)
+      refute_received :drain
+      :ok = ReadBuffer.record(config, 44)
       assert_received :drain
       refute_received :drain
+      assert flag(config) == 1
     end
 
-    test "a full stripe schedules a drain even when drain_threshold is above slots" do
+    test "a drain_threshold above slots still triggers every drain_threshold reads and the ring keeps the newest slots" do
       name = register_as_maintenance()
-      config = config(slots: 4, threshold: 100, maintenance: name)
+      config = config(slots: 4, threshold: 8, maintenance: name)
 
+      record_all(config, 1..7)
+      refute_received :drain
+      assert ReadBuffer.dump(config) == [%{tail: 7, head: 0, ids: [5, 6, 7, 4]}]
+
+      :ok = ReadBuffer.record(config, 8)
+      assert_received :drain
+      assert ReadBuffer.dump(config) == [%{tail: 8, head: 0, ids: [5, 6, 7, 8]}]
+      assert {[5, 6, 7, 8], 4, true} = drain_list(config)
+    end
+
+    test "a trigger lost to a set flag is retried drain_threshold reads later" do
+      name = register_as_maintenance()
+      config = config(slots: 8, threshold: 4, maintenance: name)
+
+      # The flag is set by a pass still in flight; the reader at sequence 3
+      # pays one failed compare_exchange and sends nothing.
+      :atomics.put(config.flags, @drain_flag, 1)
       record_all(config, 1..4)
       refute_received :drain
+      assert ReadBuffer.hits(config) == 4
 
-      :ok = ReadBuffer.record(config, 5)
+      # The pass clears the flag; sequences 4..6 do not test it, 7 does.
+      :atomics.put(config.flags, @drain_flag, 0)
+      record_all(config, 5..7)
+      refute_received :drain
+      :ok = ReadBuffer.record(config, 8)
       assert_received :drain
-      assert ReadBuffer.dump(config) == [%{tail: 5, head: 0, ids: [1, 2, 3, 4]}]
     end
 
     test "never raises when the maintenance name is not registered" do
@@ -189,7 +219,7 @@ defmodule Theine.ReadBufferTest do
     test "the stripe is the scheduler id minus one, modulo stripes" do
       stripes = 2
       per_reader = 3
-      config = config(stripes: stripes, slots: 8, threshold: 100)
+      config = config(stripes: stripes, slots: 8, threshold: 128)
 
       schedulers = record_pinned(config, fn n -> for i <- 1..per_reader, do: n * 100 + i end)
 
@@ -202,28 +232,36 @@ defmodule Theine.ReadBufferTest do
     end
 
     test "each stripe receives records with one reader pinned per scheduler" do
-      stripes = System.schedulers_online()
+      # The default stripe count is the scheduler count rounded up to a
+      # power of two; stripes past the scheduler count stay empty.
+      stripes = Config.default_stripes()
+      schedulers = System.schedulers_online()
       slots = 16
       per_reader = 12
-      config = config(stripes: stripes, slots: slots, threshold: 100)
+      config = config(stripes: stripes, slots: slots, threshold: 128)
 
       record_pinned(config, fn n -> for i <- 1..per_reader, do: n * 1_000 + i end)
 
       for {%{tail: tail, head: head, ids: ids}, s} <- Enum.with_index(ReadBuffer.dump(config)) do
-        assert tail == per_reader, "stripe #{s} received #{tail} records"
         assert head == 0
-        # Scheduler s + 1 is the only one mapping to stripe s here.
-        assert Enum.take(ids, per_reader) == for(i <- 1..per_reader, do: (s + 1) * 1_000 + i)
+
+        if s < schedulers do
+          assert tail == per_reader, "stripe #{s} received #{tail} records"
+          # Scheduler s + 1 is the only one mapping to stripe s here.
+          assert Enum.take(ids, per_reader) == for(i <- 1..per_reader, do: (s + 1) * 1_000 + i)
+        else
+          assert tail == 0, "stripe #{s} has no scheduler and received #{tail} records"
+        end
       end
 
       assert {_, reads, false} = ReadBuffer.drain(config, [], &[&1 | &2])
-      assert reads == stripes * per_reader
+      assert reads == schedulers * per_reader
     end
   end
 
   describe "drain" do
     test "drain/2 calls the function per live id and reports the count and fullness" do
-      config = config(slots: 4, threshold: 100)
+      config = config(slots: 4, threshold: 128)
       record_all(config, [10, 20, 30])
       test = self()
 
@@ -238,7 +276,7 @@ defmodule Theine.ReadBufferTest do
     end
 
     test "skips the zero slots of readers that claimed a sequence but have not written" do
-      config = config(slots: 4, threshold: 100)
+      config = config(slots: 4, threshold: 128)
       buffer = config.read_buffer
       # Three sequences claimed, the middle one not yet written.
       :atomics.put(buffer, 1, 3)
@@ -250,7 +288,7 @@ defmodule Theine.ReadBufferTest do
     end
 
     test "drains every stripe in order and moves each head to the tail it read" do
-      config = config(stripes: 3, slots: 4, threshold: 100)
+      config = config(stripes: 3, slots: 4, threshold: 128)
       buffer = config.read_buffer
 
       for {s, ids} <- [{0, [1, 2]}, {1, []}, {2, [3, 4, 5, 6]}] do
@@ -265,7 +303,7 @@ defmodule Theine.ReadBufferTest do
     end
 
     test "reset_heads/1 moves every head to its tail so a drain yields nothing" do
-      config = config(stripes: 2, slots: 4, threshold: 100)
+      config = config(stripes: 2, slots: 4, threshold: 128)
       buffer = config.read_buffer
       :atomics.put(buffer, 1, 9)
       :atomics.put(buffer, 3, 5)
@@ -284,9 +322,9 @@ defmodule Theine.ReadBufferTest do
 
   describe "properties (specs/03 §Acceptance)" do
     property "drain yields a sub-multiset of recorded ids, never more than slots per stripe" do
-      check all slots <- integer(1..16),
+      check all slots <- member_of([1, 2, 4, 8, 16]),
                 lists <- list_of(list_of(positive_integer(), max_length: 40), length: 1..4) do
-        config = config(slots: slots, threshold: 1_000)
+        config = config(slots: slots, threshold: 1_024)
 
         lists
         |> Enum.map(fn ids -> Task.async(fn -> record_all(config, ids) end) end)
@@ -310,9 +348,9 @@ defmodule Theine.ReadBufferTest do
     end
 
     property "ids drained while readers are still recording were all recorded" do
-      check all slots <- integer(1..8),
+      check all slots <- member_of([1, 2, 4, 8]),
                 lists <- list_of(list_of(positive_integer(), max_length: 30), length: 1..3) do
-        config = config(slots: slots, threshold: 1_000)
+        config = config(slots: slots, threshold: 1_024)
         tasks = Enum.map(lists, fn ids -> Task.async(fn -> record_all(config, ids) end) end)
         recorded = MapSet.new(List.flatten(lists))
 
@@ -346,7 +384,8 @@ defmodule Theine.ReadBufferTest do
 
   describe "concurrency (specs/03 §Acceptance)" do
     test "drops instead of blocking: readers run with no drainer and a later drain yields at most slots per stripe" do
-      stripes = System.schedulers_online()
+      stripes = Config.default_stripes()
+      schedulers = System.schedulers_online()
       slots = 64
       per_reader = 20_000
       config = config(stripes: stripes, slots: slots, threshold: 32)
@@ -355,25 +394,27 @@ defmodule Theine.ReadBufferTest do
       # returns regardless; a blocking record would hang the receive below.
       record_pinned(config, fn n -> for i <- 1..per_reader, do: n * 100_000 + i end)
 
-      assert ReadBuffer.hits(config) == stripes * per_reader
-      assert ReadBuffer.lag(config) == stripes * per_reader
-      assert Enum.all?(ReadBuffer.dump(config), &(&1.tail == per_reader))
+      assert ReadBuffer.hits(config) == schedulers * per_reader
+      assert ReadBuffer.lag(config) == schedulers * per_reader
+
+      assert Enum.map(ReadBuffer.dump(config), & &1.tail) ==
+               for(s <- 0..(stripes - 1), do: if(s < schedulers, do: per_reader, else: 0))
 
       {drained, reads, full?} = drain_list(config)
 
       assert full?
-      assert reads <= stripes * slots
+      assert reads <= schedulers * slots
       assert ReadBuffer.lag(config) == 0
 
       for id <- drained do
-        assert rem(id, 100_000) in 1..per_reader and div(id, 100_000) in 1..stripes,
+        assert rem(id, 100_000) in 1..per_reader and div(id, 100_000) in 1..schedulers,
                "drained #{id}, which no reader recorded"
       end
     end
 
     test "a flood of reads with the drainer paused sends exactly one :drain message" do
       name = register_as_maintenance()
-      stripes = System.schedulers_online()
+      stripes = Config.default_stripes()
       config = config(stripes: stripes, slots: 64, threshold: 32, maintenance: name)
 
       record_pinned(config, fn n -> for i <- 1..5_000, do: n * 10_000 + i end)

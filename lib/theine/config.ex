@@ -22,12 +22,15 @@ defmodule Theine.Config do
   @typedoc """
   What `Theine.get/2` does on a hit, as one field so the hot path fetches a
   single key from the config (specs/08 §Decisions M2.8): in a bounded cache
-  the read-buffer tuple `{buffer, stripes, slots, drain_threshold}` that
-  `record/2` needs; in an unbounded cache the request counters, or nil with
-  `stats: false`.
+  the read-buffer tuple `{buffer, stripes - 1, 2 + slots, slots - 1,
+  drain_threshold - 1}` that `record/2` needs, the sizes precomputed as the
+  bit masks and the stripe width the ring arithmetic uses (specs/03
+  §Decisions M2.8b); in an unbounded cache the request counters, or nil
+  with `stats: false`.
   """
   @type hit ::
-          {:atomics.atomics_ref(), pos_integer(), pos_integer(), pos_integer()}
+          {:atomics.atomics_ref(), non_neg_integer(), pos_integer(), non_neg_integer(),
+           non_neg_integer()}
           | :counters.counters_ref()
           | nil
 
@@ -176,7 +179,7 @@ defmodule Theine.Config do
       table: name,
       maintenance: Module.concat(Theine.Maintenance, name),
       task_supervisor: Module.concat(Theine.TaskSupervisor, name),
-      stripes: System.schedulers_online()
+      stripes: default_stripes()
     }
 
     opts
@@ -197,6 +200,36 @@ defmodule Theine.Config do
     raise ArgumentError,
           "option :policy_module (#{inspect(module)}) needs test_hooks: true in Theine.start_link/1"
   end
+
+  @doc """
+  The default number of read-buffer stripes: `System.schedulers_online()`
+  rounded up to a power of two, so that the hot path picks its stripe with
+  a mask rather than a division (specs/03 §Decisions M2.8b). Schedulers
+  beyond the online count leave their stripes empty, which costs the
+  drainer two atomics reads per empty stripe per pass.
+
+      iex> Theine.Config.default_stripes() >= System.schedulers_online()
+      true
+      iex> Theine.Config.power_of_two?(Theine.Config.default_stripes())
+      true
+  """
+  @spec default_stripes() :: pos_integer()
+  def default_stripes, do: ceil_pow2(System.schedulers_online(), 1)
+
+  @doc """
+  True for a positive power of two.
+
+      iex> Theine.Config.power_of_two?(64)
+      true
+      iex> Theine.Config.power_of_two?(6)
+      false
+  """
+  @spec power_of_two?(term()) :: boolean()
+  def power_of_two?(n) when is_integer(n) and n > 0, do: Bitwise.band(n, n - 1) == 0
+  def power_of_two?(_), do: false
+
+  defp ceil_pow2(n, acc) when acc >= n, do: acc
+  defp ceil_pow2(n, acc), do: ceil_pow2(n, acc * 2)
 
   @doc """
   Fetches the config of a running cache from `:persistent_term`. Raises
@@ -260,11 +293,15 @@ defmodule Theine.Config do
 
   defp validate!(:policy_module, module) when is_atom(module) and not is_nil(module), do: module
 
+  # The ring arithmetic of the hot path uses masks (specs/03 §Decisions
+  # M2.8b), so these three must be powers of two.
+  defp validate!(key, n)
+       when key in [:stripes, :read_buffer_slots, :drain_threshold] and is_integer(n) and
+              n > 0 and Bitwise.band(n, n - 1) == 0,
+       do: n
+
   defp validate!(key, n)
        when key in [
-              :stripes,
-              :read_buffer_slots,
-              :drain_threshold,
               :write_hwm,
               :write_batch,
               :expire_batch,
@@ -288,6 +325,9 @@ defmodule Theine.Config do
 
   defp expected(key) when key in [:expire_after_write, :refresh_after_write],
     do: "expected a positive number of milliseconds or :infinity"
+
+  defp expected(key) when key in [:stripes, :read_buffer_slots, :drain_threshold],
+    do: "expected a power of two"
 
   defp expected(_), do: "expected a positive integer"
 end

@@ -16,7 +16,10 @@ defmodule Theine.ConfigTest do
     assert config.loader == nil
     assert config.window_percent == 1
     assert config.adaptive == false
-    assert config.stripes == System.schedulers_online()
+    assert config.stripes == Config.default_stripes()
+    assert config.stripes >= System.schedulers_online()
+    assert config.stripes < 2 * System.schedulers_online()
+    assert Config.power_of_two?(config.stripes)
     assert config.read_buffer_slots == 64
     assert config.drain_threshold == 32
     assert config.write_hwm == 1024
@@ -60,7 +63,7 @@ defmodule Theine.ConfigTest do
         loader: loader,
         window_percent: 80,
         adaptive: true,
-        stripes: 3,
+        stripes: 4,
         read_buffer_slots: 16,
         drain_threshold: 8,
         write_hwm: 2,
@@ -79,7 +82,7 @@ defmodule Theine.ConfigTest do
     assert config.refresh_after_write == 5
     assert config.window_percent == 80
     assert config.adaptive
-    assert config.stripes == 3
+    assert config.stripes == 4
     assert config.read_buffer_slots == 16
     assert config.drain_threshold == 8
     assert config.write_hwm == 2
@@ -118,8 +121,11 @@ defmodule Theine.ConfigTest do
       window_percent: 81,
       adaptive: 1,
       stripes: 0,
+      stripes: 3,
       read_buffer_slots: 1.5,
+      read_buffer_slots: 6,
       drain_threshold: -1,
+      drain_threshold: 12,
       write_hwm: 0,
       write_batch: nil,
       expire_batch: :many,
@@ -135,6 +141,22 @@ defmodule Theine.ConfigTest do
       opts = Keyword.merge(@required, [{key, value}])
 
       assert_raise ArgumentError, ~r/#{inspect(key)}/, fn -> Config.new!(opts) end
+    end
+  end
+
+  test "the read-buffer sizes accept powers of two only, naming the option" do
+    for key <- [:stripes, :read_buffer_slots, :drain_threshold] do
+      for n <- [1, 2, 4, 64, 1024] do
+        assert Map.fetch!(Config.new!(Keyword.put(@required, key, n)), key) == n
+      end
+
+      for n <- [3, 6, 12, 100, 1_000] do
+        message = ~r/#{inspect(key)}.*#{n}.*power of two/
+
+        assert_raise ArgumentError, message, fn ->
+          Config.new!(Keyword.put(@required, key, n))
+        end
+      end
     end
   end
 

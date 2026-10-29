@@ -311,7 +311,7 @@ defmodule Theine.StatsTest do
 
       bounded = unique_cache()
       start_supervised!({Theine, name: bounded, max_size: 10, stats: false})
-      assert %Config{request_counters: nil, hit: {_, _, _, _}} = Config.get(bounded)
+      assert %Config{request_counters: nil, hit: {_, _, _, _, _}} = Config.get(bounded)
     end
   end
 end

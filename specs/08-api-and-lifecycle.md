@@ -24,9 +24,9 @@ children = [
 | `loader` | loader fun or nil | nil | 07 |
 | `window_percent` | 1..80 | 1 | 05 |
 | `adaptive` | boolean | false | 05 (M6) |
-| `stripes` | pos_integer | schedulers_online | 03 |
-| `read_buffer_slots` | pos_integer | 64 | 03 |
-| `drain_threshold` | pos_integer | 32 | 03 |
+| `stripes` | power of two | schedulers_online rounded up to a power of two | 03 |
+| `read_buffer_slots` | power of two | 64 | 03 |
+| `drain_threshold` | power of two | 32 | 03 |
 | `write_hwm` | pos_integer | 1024 | 03 |
 | `write_batch` | pos_integer | 256 | 04 |
 | `expire_batch` | pos_integer | 1024 | 04, 06 |
@@ -216,8 +216,10 @@ specs/09.
   therefore returns 0 when `request_counters` is nil, bounded or not, and
   the documented contract ("`hits` and `misses` read 0, `hit_rate` 0.0",
   M1.6 above) holds in both modes. The hit path reads one config key,
-  the runtime field `hit`: `{buffer, stripes, slots, drain_threshold}`
-  in a bounded cache, else the `request_counters` value. A first version
+  the runtime field `hit`: `{buffer, stripes - 1, 2 + slots, slots - 1,
+  drain_threshold - 1}` in a bounded cache (the masks and stripe width of
+  specs/03 §Decisions M2.8b; M2.8 stored the plain sizes), else the
+  `request_counters` value. A first version
   matched five keys in one pattern; measured in a compiled loop, that
   five-key `get_map_elements` cost about 8 ns more than a one-key match
   on the 31-key config flatmap and the full `mix bench get` showed the

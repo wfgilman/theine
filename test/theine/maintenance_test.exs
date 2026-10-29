@@ -445,18 +445,20 @@ defmodule Theine.MaintenanceTest do
            max_size: 100,
            stripes: 1,
            read_buffer_slots: 4,
-           drain_threshold: 100,
+           drain_threshold: 8,
            test_hooks: true
          ] ++ @quiet}
       )
 
       config = Config.get(cache)
       :ok = Maintenance.pause(cache)
+      # The eighth read sends the one :drain; the ring of four is lapped.
       for i <- 1..10, do: :ok = ReadBuffer.record(config, i)
       :ok = Maintenance.resume(cache)
 
-      # The reader's :drain ran a pass that found the stripe full and
-      # scheduled one more; that one found it empty and stopped.
+      # The reader's :drain ran a pass that found the stripe full (ten
+      # sequences claimed against four slots) and scheduled one more; that
+      # one found it empty and stopped.
       assert_eventually(fn -> Maintenance.info(cache).passes == 2 end)
       Process.sleep(20)
       assert %{passes: 2, read_buffer: %{lag: 0}} = Maintenance.info(cache)

@@ -236,3 +236,16 @@ new process registers, and the mutation preceded the send.
   `send` on each trigger that finds the flag clear, and the drainer's
   cache traffic on the stripe), which specs/04's drain rate limit
   addresses (IMPLEMENTATION_PLAN.md M2.8c).
+- 2026-10-28 (M2.8d): the layout stays `2 + slots` words per stripe. Padding
+  `head` onto its own line (`16 + slots`), a slots-first layout with tail and
+  head each padded after the ring, 32 slots, and writing the slot on even
+  sequences only were each measured in a compiled replica of `record/2` with
+  a drainer on another scheduler (specs/09 §Decisions M2.8d): none moves the
+  one-reader cost, which is the two atomics ops and flat in n, and the best
+  of them gains 8–25 ns at four readers on the two-core reference machine,
+  inside the bench's wander. The padded layout the plan proposed does not
+  even remove the cross-stripe false sharing it was for, because the array's
+  alignment is unknown and a tail at the start of a stripe can share a line
+  with the previous stripe's last slots either way; a slots-first order would.
+  Worth revisiting only on a machine with more cores, where cross-stripe
+  sharing and the per-op cost under SMT both change.

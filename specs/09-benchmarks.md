@@ -197,3 +197,58 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   there, the task records both tables in IMPLEMENTATION_PLAN.md and is not
   failed by the noisy run. A second failure in the targeted run, or a
   failure at any other shape, is a regression.
+- 2026-10-28 (M2.8d): the measured floor of the bounded hit on the
+  reference machine, recorded because the levers the plan listed do not
+  reach the nine A1/A2 checks the bounded subject still fails (A2 on the
+  three tuple3 shapes at parallel 4, A1 p50 at n=100000 parallel 1, and
+  the discovered-issue-4 p99 row; M2.8c's table). The thresholds stand.
+  What a compiled probe (one reader pinned per row, Zipf keys as the
+  bench draws them, 2 M hits per row, `+sbt db +sbwt very_long`; tables in
+  IMPLEMENTATION_PLAN.md §Benchmark log) measured, in ns over the
+  unbounded hit:
+
+  | n | bounded, maintenance paused | bounded, maintenance running | running, 2 schedulers on separate cores |
+  | --- | --- | --- | --- |
+  | 1_000 | 48–56 | 67–82 | 65 |
+  | 100_000 | 51–52 | 93–102 | 102 |
+  | 1_000_000 | 44–47 | 91–98 | 102 |
+
+  With no passes running the bounded hit costs the same 44–56 ns at every
+  n: the two atomics ops of specs/03 (a replica of the path in the probe
+  module puts the claim at 23–30 ns and the slot write at 22–25 ns, both
+  flat in n). The growth with n that M2.8d was to explain is therefore not
+  the ring's cache lines, not the `tail`/`head` line, and not the id
+  write; it is the maintenance process running passes at the same time,
+  and it survives moving that process to the other physical core (`+S 2`),
+  so it is not the SMT sibling either but the pass's own memory traffic
+  through the private policy tables and the sketch, which grow with n and
+  share the 3 MB L3 with the reader (the reference laptop is an i5-5257U:
+  two cores, two threads each, so `parallel: 4` runs two readers per
+  core). A replica drainer that reads the stripe and writes `head` once
+  per millisecond from another scheduler costs the reader 1–5 ns at
+  n ≤ 100_000, so the layout levers have nothing to recover at one reader:
+  `head` on its own line (`16 + slots`, the plan's first lever) measured
+  0 ns at one reader and 0–3 ns at four, because the array's alignment is
+  not known and the tail then shares a line with the previous stripe's
+  last slots exactly as before; a slots-first layout (`slots + 16`, tail
+  and head each padded after the ring, alignment-proof) 0 ns at one
+  reader and 8–16 ns at four; 32 slots 0 ns; the put on even sequences
+  only 0 ns at one reader and 10–25 ns at four. All of those are inside
+  the bench's ±0.1× wander, so none is adopted and the layout of specs/03
+  stays. `drain_backoff` 7 halves the running-minus-paused gap at four
+  schedulers (82→72, 102→80, 91→77 at the three n) and removes most of it
+  at two, which would put n=100000 parallel 1 at about 1.50×, on the
+  line; the default stays 3 (specs/04 §Decisions M2.8c) and the pass's
+  footprint is the lever left (IMPLEMENTATION_PLAN.md M2.11b). At four
+  readers the two ops cost about 65 ns each instead of 23, since a locked
+  read-modify-write stalls the thread while its SMT sibling runs, so the
+  bounded hit sits 87–91 ns over the unbounded one with maintenance
+  paused and 130–150 with it running; A2 at 0.65× `ets` asks the bounded
+  subject to be within 3–7% of `theine_unbounded` on the tuple3 shapes,
+  which two atomics ops on this machine cannot be. The bounded subject's
+  floor on this machine is thus: p50 about 1.45–1.55× at parallel 1 and
+  ips about 0.57–0.62× `ets` at parallel 4 on tuple3, 0.71–0.72× on
+  binary_1kb (where the longer `ets` lookup dilutes the constant). A
+  machine with four physical cores would show the two-op cost at about 48
+  ns at full parallelism and the A2 rows nearer 0.65; the final gate (M5)
+  records which machine it ran on.

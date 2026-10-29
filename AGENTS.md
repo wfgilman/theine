@@ -96,6 +96,15 @@ test/                         mirrors lib/; test/support for shared helpers
   about 4× longer per read than with one reader (M2.8c), so compare the
   duty cycle (sum of durations / wall), not pass lengths, across loads; the
   `drain_backoff` option sets the drain-pass gap (0 = back to back).
+- The reference laptop is an i5-5257U: 2 cores × 2 SMT threads, 3 MB L3.
+  With `+sbt db` schedulers 1 and 3 share a core, as do 2 and 4, so
+  `parallel: 4` is two readers per core and an `:atomics` op there costs
+  about 65 ns, not 23. To take the SMT sibling out of a measurement run the
+  probe with `ERL_FLAGS="+S 2 +sbt db +sbwt very_long"` (the two schedulers
+  land on separate cores). `Theine.Maintenance.pause/1` (with `test_hooks:
+  true`) is the way to measure a bounded hit with no passes running (M2.8d).
+- Probe scripts under `bench/results/` are gitignored but still formatted
+  by `mix format --check-formatted`; run `mix format` on them before the gate.
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

@@ -27,7 +27,7 @@ defmodule Theine do
   | option | type | default |
   |---|---|---|
   | `name` | atom | required |
-  | `max_size` | `:infinity` (bounded caches arrive with the policy) | required |
+  | `max_size` | pos_integer (total weight) or `:infinity` | required |
   | `weigher` | `(key, value -> pos_integer)` or `nil` | `nil` (weight 1) |
   | `expire_after_write` | ms or `:infinity` | `:infinity` |
   | `refresh_after_write` | ms or `:infinity` | `:infinity` |
@@ -47,6 +47,12 @@ defmodule Theine do
 
   An unknown option, a missing `name` or `max_size`, or a value of the wrong
   type raises `ArgumentError` naming the option.
+
+  `max_size: :infinity` disables the policy entirely: no frequency sketch,
+  no read buffer, no eviction; expiration and loading still work. A finite
+  `max_size` bounds the total entry weight and allocates both. Eviction
+  itself arrives with the policy's `evict/1` (M2.6); until then a bounded
+  cache tracks its segments without trimming them.
 
   The `weigher` is called on every write without a `weight:` option and
   must return a positive integer; an entry heavier than `max_size` is never

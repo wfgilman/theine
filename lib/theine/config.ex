@@ -208,11 +208,7 @@ defmodule Theine.Config do
   defp validate!(:name, name) when is_atom(name) and name not in [nil, true, false], do: name
 
   defp validate!(:max_size, :infinity), do: :infinity
-
-  defp validate!(:max_size, n) when is_integer(n) and n > 0 do
-    raise ArgumentError,
-          "option :max_size supports only :infinity in this version (bounded caches arrive with the policy), got: #{n}"
-  end
+  defp validate!(:max_size, n) when is_integer(n) and n > 0, do: n
 
   defp validate!(:weigher, nil), do: nil
   defp validate!(:weigher, fun) when is_function(fun, 2), do: fun

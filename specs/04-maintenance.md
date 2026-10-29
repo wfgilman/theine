@@ -132,3 +132,10 @@ rebuild are applied after it completes (they are queued in the mailbox).
   expiry tests need to observe. `info/1` and `run/1` therefore also wait
   until `resume/1`; tests inspect `pending` and the mailbox from outside
   (`Process.info/2`) while paused.
+- 2026-10-28 (M2.4): `info/1` reports, besides the pass count, last pass
+  duration, `pending` and the two sizes, three bounded-only fields that are
+  `nil` for `max_size: :infinity`: `segments` (the window, probation and
+  protected weights), `read_buffer` (`stripes`, `slots` and the `lag` of
+  specs/03) and `sketch` (`words` and the `increments` since the last
+  completed reset). That is how specs/08 §Acceptance's "`info/1` shows them
+  absent" is observable without reading the config.

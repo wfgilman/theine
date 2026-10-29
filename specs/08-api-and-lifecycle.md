@@ -40,8 +40,9 @@ Unknown options raise `ArgumentError` with the option name. `max_size:
 `order` table, no eviction; expiration and loading still work. The
 maintenance process still keeps the `policy` and `ids` tables for every key
 (specs/05 §State), because `size/1` must not use `:ets.info/2` and the
-expiry index needs each key's previous `expires_at`. M1 ships with only
-`:infinity` supported; M2 adds the bound.
+expiry index needs each key's previous `expires_at`. M1 shipped with only
+`:infinity` supported; a finite `max_size` is accepted from M2.4, which
+allocates the sketch and the read buffer in `Theine.Owner`.
 
 ## Calls
 

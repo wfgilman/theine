@@ -186,3 +186,21 @@ default false, and must not change any non-adaptive test result.
   assigned so the row shape is the same in both modes. `size` and
   `weighted_size` are published to a two-field `sizes` atomics as each event
   is applied, which is what `Theine.size/1` and `weighted_size/1` read.
+- 2026-10-28 (M2.4): the bounded struct carries `order`, the sketch, the
+  region limits (`window_max`, `protected_max`), the three segment weights
+  and `sketch_size`, the number of `Sketch.increment/2` calls since the
+  last completed reset. specs/04 §Responsibilities puts the sketch's size
+  with the maintenance process; the policy struct is that process's state
+  and the only place that increments, so the count lives there and the
+  reset cursor (M2.7) stays in the maintenance state. The limits use
+  integer arithmetic, `max(1, div(max_size * window_percent, 100))` and
+  `div(main_max * 80, 100)`, which equal the `trunc` forms above for every
+  integer input without a float on the way. `Policy.new/1` clears the
+  sketch it is handed, so a maintenance restart starts cold (specs/04
+  §Restart semantics step 2) and `reset/1` clears it for `clear/1`. The
+  `seq` sentinel is enforced in the policy: the write that would be given
+  `max_seq()` raises before touching any table, which crashes the
+  maintenance process into a rebuild rather than corrupting the order
+  table; `lru/2` and `mru/2` expose the segment ends for the later tasks
+  and the tests. An overwrite in a non-window segment stays in that segment
+  (the "current segment" rule above) and moves to its MRU.

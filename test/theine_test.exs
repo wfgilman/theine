@@ -95,6 +95,69 @@ defmodule TheineTest do
       assert config.sketch == nil
     end
 
+    test "max_size: :infinity shows no sketch or read buffer in info/1" do
+      cache = unique_cache()
+      start_supervised!({Theine, name: cache, max_size: :infinity})
+
+      assert %{sketch: nil, read_buffer: nil, segments: nil} = Theine.Maintenance.info(cache)
+      assert %Config{sketch: nil, read_buffer: nil} = Config.get(cache)
+    end
+
+    test "a finite max_size allocates the sketch and the read buffer once" do
+      cache = unique_cache()
+
+      start_supervised!({Theine, name: cache, max_size: 5_000, stripes: 3, read_buffer_slots: 16})
+
+      config = Config.get(cache)
+      assert %Theine.Sketch{words: 8192} = config.sketch
+      assert :atomics.info(config.sketch.ref).size == 8192
+      assert :atomics.info(config.read_buffer).size == 3 * (2 + 16)
+      assert Theine.ReadBuffer.hits(config) == 0
+
+      assert %{
+               sketch: %{words: 8192, increments: 0},
+               read_buffer: %{stripes: 3, slots: 16, lag: 0},
+               segments: %{window: 0, probation: 0, protected: 0}
+             } = Theine.Maintenance.info(cache)
+
+      # Writes and reads work as before; the policy places keys in the window.
+      Theine.put(cache, :a, 1)
+      assert Theine.get(cache, :a) == {:ok, 1}
+      assert Theine.get(cache, :missing) == :error
+      Theine.run_maintenance(cache)
+      assert Theine.size(cache) == 1
+      assert {:ok, {:a, _, :window, _, 1, :infinity}} = Theine.Maintenance.policy_row(cache, :a)
+
+      # Killing Maintenance keeps the same sketch and buffer: the Owner
+      # allocated them, and the config is written once.
+      pid = Process.whereis(Theine.Maintenance.name(cache))
+      Process.exit(pid, :kill)
+
+      assert_eventually(fn ->
+        Process.whereis(Theine.Maintenance.name(cache)) not in [nil, pid]
+      end)
+
+      assert Config.get(cache) == config
+    end
+
+    test "a bounded cache rejects an oversized entry at start_link level" do
+      cache = unique_cache()
+      start_supervised!({Theine, name: cache, max_size: 10, weigher: fn _k, v -> v end})
+
+      assert Theine.put(cache, :big, 11) == :ok
+      assert Theine.put_new(cache, :big, 11) == :ok
+      assert Theine.put(cache, :also_big, 1, weight: 11) == :ok
+      assert Theine.get(cache, :big) == :error
+      assert Theine.get(cache, :also_big) == :error
+      assert :atomics.get(Config.get(cache).ids, 1) == 0
+
+      assert Theine.put(cache, :fits, 10) == :ok
+      assert Theine.get(cache, :fits) == {:ok, 10}
+      Theine.run_maintenance(cache)
+      assert %{pending: 0, size: 1, weighted_size: 10} = Theine.Maintenance.info(cache)
+      assert Theine.Maintenance.policy_row(cache, :big) == :error
+    end
+
     test "stopping the cache removes persistent_term, named tables and registered names" do
       cache = unique_cache()
       start_supervised!({Theine, name: cache, max_size: :infinity})
@@ -373,8 +436,8 @@ defmodule TheineTest do
     end
 
     test "oversized entry is not stored and produces no write event", %{cache: cache} do
-      # Only max_size: :infinity starts until M2.4; the write path is
-      # exercised with a bounded copy of the running cache's config.
+      # The write path is exercised with a bounded copy of the running
+      # cache's config; the start_link-level case is under start_link/1.
       config = %{Config.get(cache) | max_size: 10}
 
       assert Entry.put(config, :big, 1, weight: 11) == :ok

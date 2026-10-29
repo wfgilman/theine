@@ -20,11 +20,40 @@ defmodule Theine.MaintenanceTest do
              last_pass_duration: nil,
              pending: 0,
              size: 0,
-             weighted_size: 0
+             weighted_size: 0,
+             segments: nil,
+             read_buffer: nil,
+             sketch: nil
            }
 
     :atomics.add(Config.get(cache).pending, 1, 3)
     assert Maintenance.info(cache).pending == 3
+  end
+
+  test "info/1 of a bounded cache reports segments, read buffer and sketch" do
+    cache = unique_cache()
+
+    start_supervised!({Theine, name: cache, max_size: 1_000, stripes: 2, read_buffer_slots: 8})
+
+    assert %{segments: %{window: 0, probation: 0, protected: 0}} = Maintenance.info(cache)
+    assert %{read_buffer: %{stripes: 2, slots: 8, lag: 0}} = Maintenance.info(cache)
+    assert %{sketch: %{words: 1024, increments: 0}} = Maintenance.info(cache)
+
+    Theine.put(cache, :a, 1, weight: 3)
+    Theine.put(cache, :b, 1)
+    Theine.put(cache, :a, 2, weight: 4)
+    Maintenance.run(cache)
+
+    assert %{size: 2, weighted_size: 5, segments: %{window: 5, probation: 0, protected: 0}} =
+             Maintenance.info(cache)
+
+    assert %{sketch: %{increments: 3}} = Maintenance.info(cache)
+    assert {:ok, {:a, _, :window, _, 4, :infinity}} = Maintenance.policy_row(cache, :a)
+
+    # A read claimed in the buffer shows up as lag until a drain (M2.7).
+    config = Config.get(cache)
+    :atomics.put(config.read_buffer, 1, 5)
+    assert %{read_buffer: %{lag: 5}} = Maintenance.info(cache)
   end
 
   test "run/1 returns :ok after one pass and info/1 counts it", %{cache: cache} do

@@ -27,15 +27,24 @@ defmodule Theine.Maintenance do
 
   use GenServer
 
-  alias Theine.{Config, Policy}
+  alias Theine.{Config, Policy, ReadBuffer, Sketch}
 
+  @typedoc """
+  The process's view of the cache. `segments`, `read_buffer` and `sketch`
+  are `nil` in an unbounded cache, which allocates neither buffer nor
+  sketch (specs/08 §Acceptance).
+  """
   @type info :: %{
           cache: Config.cache(),
           passes: non_neg_integer(),
           last_pass_duration: non_neg_integer() | nil,
           pending: integer(),
           size: non_neg_integer(),
-          weighted_size: non_neg_integer()
+          weighted_size: non_neg_integer(),
+          segments: Policy.weights() | nil,
+          read_buffer:
+            %{stripes: pos_integer(), slots: pos_integer(), lag: non_neg_integer()} | nil,
+          sketch: %{words: pos_integer(), increments: non_neg_integer()} | nil
         }
 
   defstruct [:cache, :config, :policy, passes: 0, last_pass_duration: nil, writes: 0]
@@ -120,11 +129,15 @@ defmodule Theine.Maintenance do
 
   @doc """
   Returns the process's view of the cache: pass count, last pass duration in
-  native time units, the `pending` write-event count, and the entry count
-  and weighted size as last seen by the policy.
+  native time units, the `pending` write-event count, the entry count and
+  weighted size as last seen by the policy, and for a bounded cache the
+  segment weights, the read buffer's shape and lag (specs/03) and the
+  sketch's size and increments since its last reset; those three are `nil`
+  for `max_size: :infinity`.
 
       Theine.Maintenance.info(:sessions)
-      #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, size: 0, weighted_size: 0}
+      #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, size: 0,
+      #=>   weighted_size: 0, segments: nil, read_buffer: nil, sketch: nil}
   """
   @spec info(Config.cache()) :: info()
   def info(cache) when is_atom(cache), do: GenServer.call(name(cache), :info)
@@ -152,14 +165,31 @@ defmodule Theine.Maintenance do
     {:reply, :ok, pass(state)}
   end
 
-  def handle_call(:info, _from, state) do
+  def handle_call(:info, _from, %{config: config, policy: policy} = state) do
+    bounded? = is_integer(config.max_size)
+
     info = %{
       cache: state.cache,
       passes: state.passes,
       last_pass_duration: state.last_pass_duration,
-      pending: :atomics.get(state.config.pending, 1),
-      size: Policy.size(state.config.sizes),
-      weighted_size: Policy.weighted_size(state.config.sizes)
+      pending: :atomics.get(config.pending, 1),
+      size: Policy.size(config.sizes),
+      weighted_size: Policy.weighted_size(config.sizes),
+      segments: if(bounded?, do: Policy.weights(policy), else: nil),
+      read_buffer:
+        if(bounded?,
+          do: %{
+            stripes: config.stripes,
+            slots: config.read_buffer_slots,
+            lag: ReadBuffer.lag(config)
+          },
+          else: nil
+        ),
+      sketch:
+        if(bounded?,
+          do: %{words: Sketch.words(config.max_size), increments: policy.sketch_size},
+          else: nil
+        )
     }
 
     {:reply, info, state}

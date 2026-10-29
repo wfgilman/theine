@@ -4,8 +4,11 @@ defmodule Theine.Owner do
   (specs/08 §Supervision tree, specs/01 §Tables and handles).
 
   `init/1` creates the public entries table, allocates the `ids`, `pending`,
-  `flags` and `sizes` atomics and the stats counters, and writes the completed
-  `%Theine.Config{}` to `:persistent_term`. After that the process does
+  `flags` and `sizes` atomics and the stats counters, plus the read buffer
+  (specs/03) and the frequency sketch (specs/02) when the cache is bounded,
+  and writes the completed `%Theine.Config{}` to `:persistent_term`. An
+  unbounded cache (`max_size: :infinity`) allocates neither, so its hits
+  never touch `:atomics` (specs/08 §Acceptance). After that the process does
   nothing but hold the table, so it never crashes on its own; if it is
   killed, the `rest_for_one` supervisor restarts it together with the task
   supervisor and the maintenance process, and the cache comes back empty.
@@ -19,7 +22,7 @@ defmodule Theine.Owner do
 
   use GenServer
 
-  alias Theine.Config
+  alias Theine.{Config, ReadBuffer, Sketch}
 
   @table_options [
     :set,
@@ -87,6 +90,7 @@ defmodule Theine.Owner do
 
   defp allocate(%Config{stats: stats} = config) do
     counters = :counters.new(@counter_fields, [:write_concurrency])
+    bounded? = is_integer(config.max_size)
 
     %{
       config
@@ -97,7 +101,10 @@ defmodule Theine.Owner do
         # The hit and miss paths count through this field only, so
         # `stats: false` is one nil match there (specs/08 §Stats).
         request_counters: if(stats, do: counters, else: nil),
-        sizes: :atomics.new(@size_fields, signed: true)
+        sizes: :atomics.new(@size_fields, signed: true),
+        read_buffer:
+          if(bounded?, do: ReadBuffer.new(config.stripes, config.read_buffer_slots), else: nil),
+        sketch: if(bounded?, do: Sketch.new(config.max_size), else: nil)
     }
   end
 

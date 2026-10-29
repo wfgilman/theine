@@ -86,8 +86,10 @@ defmodule Theine.ConfigTest do
     assert_raise ArgumentError, ~r/:max_size/, fn -> Config.new!(name: :x) end
   end
 
-  test "a finite max_size is rejected until the policy exists" do
-    assert_raise ArgumentError, ~r/:max_size/, fn -> Config.new!(name: :x, max_size: 100) end
+  test "max_size accepts a positive integer or :infinity" do
+    assert Config.new!(name: :x, max_size: 100).max_size == 100
+    assert Config.new!(name: :x, max_size: 1).max_size == 1
+    assert Config.new!(name: :x, max_size: :infinity).max_size == :infinity
   end
 
   test "every option rejects a value of the wrong type, naming the option" do

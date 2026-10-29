@@ -20,7 +20,9 @@
 # reset time comes from the newest transcript's `resetsAt` field, or from the
 # "resets 9:10pm (America/Los_Angeles)" text, or failing both from an
 # exponential backoff starting at LIMIT_BACKOFF seconds. Limit waits do not
-# count as iterations.
+# count as iterations. A per-model limit ("You've reached your Fable limit.
+# Switch to another model") reports no reset time, so the loop exits 2 and
+# leaves the model choice to a person.
 #
 # Unproductive iterations: an iteration that ends in under MIN_ITERATION_SECS
 # without a new commit (denied permissions, a broken prompt, an API outage)
@@ -49,6 +51,10 @@ log() { echo "=== theine $MODE: $* ($(date -u +%FT%TZ))"; }
 
 hit_limit() {  # $1 = iteration output file
   grep -qiE "hit your [a-z ]*limit|usage limit reached|usage_limit_reached" "$1"
+}
+
+model_limit() {  # $1 = iteration output file; a per-model cap ("reached your Fable limit")
+  grep -qiE "reached your [a-z0-9. ]* limit|switch to another model|model_requires_usage_credits" "$1"
 }
 
 limit_reset_epoch() {  # $1 = iteration output file; prints a unix time in the future, or nothing
@@ -98,6 +104,14 @@ while :; do
   set -e
   elapsed=$(( $(date +%s) - started ))
   (( rc != 0 )) && echo "iteration $i exited $rc"
+
+  if model_limit "$OUT"; then
+    # No reset time is reported and waiting may mean days; a person has to
+    # pick another model (the "model" key in .claude/settings.json, or
+    # CLAUDE_FLAGS="--model ...") and restart.
+    log "model usage limit reached; switch models and restart. Stopping"
+    exit 2
+  fi
 
   if hit_limit "$OUT"; then
     i=$((i - 1))                       # a rejected request is not an iteration

@@ -78,7 +78,8 @@ Look up `ids`; if `id` is not the key's current id in `policy`, skip. Else
 - `:window` → move to window MRU.
 - `:probation` → move to protected MRU; `probation_weight -= w`,
   `protected_weight += w`; if `protected_weight > protected_max`, demote
-  protected LRU entries to probation MRU until it fits.
+  protected LRU entries to probation MRU until it fits. An entry with
+  `w > protected_max` moves to probation MRU instead (§Decisions M2.5).
 - `:protected` → move to protected MRU.
 
 ### `evict()`
@@ -204,3 +205,16 @@ default false, and must not change any non-adaptive test result.
   table; `lru/2` and `mru/2` expose the segment ends for the later tasks
   and the tests. An overwrite in a non-window segment stays in that segment
   (the "current segment" rule above) and moves to its MRU.
+- 2026-10-28 (M2.5): `on_access` of a probation entry heavier than
+  `protected_max` reorders it to the probation MRU instead of promoting it.
+  Promoting it would demote every other protected entry and then the entry
+  itself (alone, it is the LRU and still over the limit), emptying the
+  protected segment for nothing; Caffeine's `reorderProbation` has the same
+  guard. With it, the accessed key always ends at the MRU of the segment
+  the rule names, and demotion never touches it, since once the others are
+  gone its weight alone fits. Demotion is immediate, inside `on_access`, as
+  the rule says; Caffeine defers it to the end of the pass, which makes no
+  observable difference without the adaptive climber (M6). Unbounded
+  policies return the state unchanged (no order, no sketch, no read buffer
+  to drain), and an access whose fresh `seq` would be the sentinel raises
+  as a write does.

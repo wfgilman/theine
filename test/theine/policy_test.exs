@@ -285,8 +285,185 @@ defmodule Theine.PolicyTest do
     end
   end
 
-  # Moves a row into `segment` at its MRU end by hand, standing in for
-  # on_access/2 (M2.5) and evict/1 (M2.6).
+  describe "on_access/2" do
+    test "moves a window key to the window MRU and counts it" do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 2, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 1, :infinity)
+      policy = Policy.on_write(policy, :c, 3, 1, :infinity)
+
+      policy = Policy.on_access(policy, 1)
+
+      assert keys_in_order(policy, :window) == [:b, :c, :a]
+      assert {:ok, {:a, 1, :window, seq, 2, :infinity}} = Policy.lookup(policy, :a)
+      assert seq == 4
+      assert policy.next_seq == 5
+      assert Policy.weights(policy) == %{window: 4, probation: 0, protected: 0}
+      assert Policy.weighted_size(policy.sizes) == 4
+      assert Sketch.frequency(policy.sketch, :a) == 2
+      assert policy.sketch_size == 4
+    end
+
+    test "promotes a probation entry to protected and demotes when over protected_max" do
+      # protected_max is 79 at max_size 100 (specs/05 §Regions and sizes).
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :w, 1, 1, :infinity)
+      policy = Policy.on_write(policy, :p1, 2, 30, :infinity)
+      policy = Policy.on_write(policy, :p2, 3, 30, :infinity)
+      policy = Policy.on_write(policy, :p3, 4, 30, :infinity)
+      policy = Policy.on_write(policy, :p4, 5, 5, :infinity)
+      policy = Enum.reduce([:p1, :p2, :p3, :p4], policy, &place(&2, &1, :probation))
+      assert Policy.weights(policy) == %{window: 1, probation: 95, protected: 0}
+
+      policy = Policy.on_access(policy, 2)
+      assert keys_in_order(policy, :probation) == [:p2, :p3, :p4]
+      assert keys_in_order(policy, :protected) == [:p1]
+      assert {:ok, {:p1, 2, :protected, _, 30, :infinity}} = Policy.lookup(policy, :p1)
+      assert Policy.weights(policy) == %{window: 1, probation: 65, protected: 30}
+      assert Sketch.frequency(policy.sketch, :p1) == 2
+
+      policy = Policy.on_access(policy, 3)
+      assert keys_in_order(policy, :probation) == [:p3, :p4]
+      assert keys_in_order(policy, :protected) == [:p1, :p2]
+      assert Policy.weights(policy) == %{window: 1, probation: 35, protected: 60}
+
+      # 90 > 79: the protected LRU (p1) is demoted to the probation MRU,
+      # behind p4, and the accessed key stays at the protected MRU.
+      policy = Policy.on_access(policy, 4)
+      assert keys_in_order(policy, :probation) == [:p4, :p1]
+      assert keys_in_order(policy, :protected) == [:p2, :p3]
+      assert {:ok, {:p1, 2, :probation, _, 30, :infinity}} = Policy.lookup(policy, :p1)
+      assert Policy.mru(policy, :protected) == {:ok, :p3}
+      assert Policy.weights(policy) == %{window: 1, probation: 35, protected: 60}
+      assert Policy.weighted_size(policy.sizes) == 96
+      assert Policy.size(policy.sizes) == 5
+      assert Policy.count(policy) == 5
+      assert length(Policy.order_rows(policy)) == 5
+      assert policy.sketch_size == 8
+    end
+
+    test "demotes as many protected LRU entries as it takes to fit" do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 20, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 20, :infinity)
+      policy = Policy.on_write(policy, :c, 3, 20, :infinity)
+      policy = Policy.on_write(policy, :d, 4, 70, :infinity)
+      policy = Enum.reduce([:a, :b, :c], policy, &place(&2, &1, :protected))
+      policy = place(policy, :d, :probation)
+      assert Policy.weights(policy) == %{window: 0, probation: 70, protected: 60}
+
+      # 130 > 79, and 110 and 90 still are: a, b and c are all demoted, in
+      # LRU order, and the protected segment is left with d at 70.
+      policy = Policy.on_access(policy, 4)
+
+      assert keys_in_order(policy, :protected) == [:d]
+      assert keys_in_order(policy, :probation) == [:a, :b, :c]
+      assert Policy.weights(policy) == %{window: 0, probation: 60, protected: 70}
+      assert Policy.weighted_size(policy.sizes) == 130
+    end
+
+    test "moves a protected key to the protected MRU" do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 1, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 1, :infinity)
+      policy = Policy.on_write(policy, :c, 3, 1, :infinity)
+      policy = Enum.reduce([:a, :b], policy, &place(&2, &1, :protected))
+      policy = place(policy, :c, :probation)
+
+      policy = Policy.on_access(policy, 1)
+
+      assert keys_in_order(policy, :protected) == [:b, :a]
+      assert keys_in_order(policy, :probation) == [:c]
+      assert Policy.weights(policy) == %{window: 0, probation: 1, protected: 2}
+      assert Sketch.frequency(policy.sketch, :a) == 2
+      assert policy.sketch_size == 4
+    end
+
+    test "a probation entry heavier than protected_max moves to the probation MRU instead" do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :other, 1, 10, :infinity)
+      policy = Policy.on_write(policy, :big, 2, 80, :infinity)
+      policy = Policy.on_write(policy, :small, 3, 1, :infinity)
+      policy = place(policy, :other, :protected)
+      policy = place(policy, :big, :probation)
+      policy = place(policy, :small, :probation)
+      assert keys_in_order(policy, :probation) == [:big, :small]
+
+      policy = Policy.on_access(policy, 2)
+
+      assert keys_in_order(policy, :probation) == [:small, :big]
+      assert keys_in_order(policy, :protected) == [:other]
+      assert {:ok, {:big, 2, :probation, _, 80, :infinity}} = Policy.lookup(policy, :big)
+      assert Policy.weights(policy) == %{window: 0, probation: 81, protected: 10}
+      assert Sketch.frequency(policy.sketch, :big) == 2
+
+      # Exactly protected_max still fits.
+      policy = Policy.on_write(policy, :fit, 4, 79, :infinity)
+      policy = place(policy, :fit, :probation)
+      policy = Policy.on_access(policy, 4)
+      assert keys_in_order(policy, :protected) == [:fit]
+      assert keys_in_order(policy, :probation) == [:small, :big, :other]
+      assert Policy.weights(policy) == %{window: 0, probation: 91, protected: 79}
+    end
+
+    test "with an old id after the key was rewritten has no effect", %{table: table} do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 1, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 1, :infinity)
+      :ets.insert(table, entry(:a, 3))
+      policy = Policy.on_write(policy, :a, 3, 1, :infinity)
+      policy = Policy.on_access(policy, 2)
+      assert keys_in_order(policy, :window) == [:a, :b]
+      before = policy
+
+      policy = Policy.on_access(policy, 1)
+
+      assert policy == before
+      assert keys_in_order(policy, :window) == [:a, :b]
+      assert Policy.order_rows(policy) == Policy.order_rows(before)
+      assert Sketch.frequency(policy.sketch, :a) == 2
+      assert policy.sketch_size == 4
+    end
+
+    test "with an unknown or removed id has no effect" do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 1, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 1, :infinity)
+      policy = Policy.on_remove(policy, :b, 2)
+      before = policy
+
+      policy = policy |> Policy.on_access(2) |> Policy.on_access(99)
+
+      assert policy == before
+      assert Policy.order_rows(policy) == [{{:window, 1}, :a}]
+      assert Policy.weights(policy) == %{window: 1, probation: 0, protected: 0}
+      assert policy.sketch_size == 2
+    end
+
+    test "is a no-op without a bound", %{policy: policy, sizes: sizes} do
+      policy = Policy.on_write(policy, :a, 1, 3, :infinity)
+      before = policy
+
+      policy = policy |> Policy.on_access(1) |> Policy.on_access(2)
+
+      assert policy == before
+      assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 3, :infinity}}
+      assert Policy.weighted_size(sizes) == 3
+    end
+
+    test "refuses the move that would reach the seq sentinel" do
+      policy = %{bounded(100) | next_seq: Policy.max_seq() - 1}
+      policy = Policy.on_write(policy, :a, 1, 1, :infinity)
+
+      assert_raise RuntimeError, ~r/sentinel/, fn -> Policy.on_access(policy, 1) end
+
+      assert Policy.order_rows(policy) == [{{:window, Policy.max_seq() - 1}, :a}]
+      assert Sketch.frequency(policy.sketch, :a) == 1
+    end
+  end
+
+  # Moves a row into `segment` at its MRU end by hand, standing in for the
+  # window overflow of evict/1 (M2.6), the only way a key leaves the window.
   defp place(policy, key, segment) do
     {:ok, {^key, _id, from, seq, weight, _}} = Policy.lookup(policy, key)
     new_seq = policy.next_seq
@@ -420,21 +597,104 @@ defmodule Theine.PolicyTest do
   # the policy applied last while the table kept another version (specs/05
   # §Decisions M1.5). A `:removed` deletes the table's version when it names
   # it, as `delete/2` and the expired read do, then reaches the policy.
-  defp events do
+  # With `:access` and `:overflow` in `kinds`, an `:access` names any id ever
+  # issued, as a drained read-buffer slot does, and an `:overflow` moves a
+  # window key to the probation MRU as evict/1's step 1 will (M2.6).
+  @write_kinds [{3, :put}, {1, :racy_put}, {2, :removed}]
+  @access_kinds [{3, :put}, {1, :racy_put}, {2, :removed}, {4, :access}, {2, :overflow}]
+
+  defp events(kinds \\ @write_kinds) do
     gen all keys <- list_of(member_of(1..6), min_length: 1, max_length: 40),
-            kinds <-
-              list_of(frequency([{3, :put}, {1, :racy_put}, {2, :removed}]),
-                length: length(keys)
-              ),
+            kinds <- list_of(frequency(kinds), length: length(keys)),
             weights <- list_of(integer(1..9), length: length(keys)),
-            removes <- list_of(integer(0..length(keys)), length: length(keys)) do
-      Enum.zip([Enum.with_index(keys, 1), kinds, weights, removes])
+            picks <- list_of(integer(0..length(keys)), length: length(keys)) do
+      Enum.zip([Enum.with_index(keys, 1), kinds, weights, picks])
       |> Enum.map(fn
         {{key, id}, :put, weight, _} -> {:put, key, id, weight, :infinity}
         {{key, id}, :racy_put, weight, _} -> {:racy_put, key, id, weight, :infinity}
         {{key, _id}, :removed, _, stale} -> {:removed, key, stale}
+        {{_key, _id}, :access, _, pick} -> {:access, pick}
+        {{key, _id}, :overflow, _, _} -> {:overflow, key}
       end)
     end
+  end
+
+  property "bounded: the invariant holds after every write, access, overflow and removal",
+           %{table: table} do
+    # max_size 20: window_max 1, protected_max 15. Weights of 1..9 across
+    # six keys overflow both freely (specs/05 §Acceptance invariant).
+    policy = bounded(20)
+
+    check all events <- events(@access_kinds) do
+      policy = Policy.reset(policy)
+      :ets.delete_all_objects(table)
+
+      Enum.reduce(events, {policy, %{}}, fn event, {policy, model} ->
+        expected = expected_access(policy, model, event)
+        {policy, model} = apply_event(policy, table, event, model)
+        assert_invariant(policy, model)
+        assert_access(policy, expected)
+        {policy, model}
+      end)
+    end
+  end
+
+  # What a current-id access must leave behind: the key at the MRU of its
+  # new segment, one more sketch count and increment. Stale and unknown ids
+  # must leave the sketch alone.
+  defp expected_access(policy, model, {:access, id}) do
+    before = {Policy.weights(policy), policy.sketch_size, Policy.order_rows(policy)}
+
+    case Enum.find(model, fn {_key, {i, _weight}} -> i == id end) do
+      {key, {^id, weight}} ->
+        {:ok, {^key, ^id, segment, _seq, ^weight, _}} = Policy.lookup(policy, key)
+
+        segment =
+          case segment do
+            :probation when weight <= policy.protected_max -> :protected
+            :probation -> :probation
+            other -> other
+          end
+
+        {:current, key, segment, Sketch.frequency(policy.sketch, key), policy.sketch_size}
+
+      nil ->
+        {:stale, before}
+    end
+  end
+
+  defp expected_access(_policy, _model, _event), do: nil
+
+  defp assert_access(_policy, nil), do: :ok
+
+  defp assert_access(policy, {:current, key, segment, frequency, sketch_size}) do
+    assert Policy.mru(policy, segment) == {:ok, key}
+    assert Sketch.frequency(policy.sketch, key) == min(frequency + 1, 15)
+    assert policy.sketch_size == sketch_size + 1
+  end
+
+  defp assert_access(policy, {:stale, before}) do
+    assert {Policy.weights(policy), policy.sketch_size, Policy.order_rows(policy)} == before
+  end
+
+  defp assert_invariant(policy, model) do
+    assert_model(policy, model, :any)
+    rows = for {key, _} <- model, {:ok, row} = Policy.lookup(policy, key), do: row
+    order = Policy.order_rows(policy)
+    assert length(order) == map_size(model)
+
+    for {key, _id, segment, seq, _weight, _} <- rows do
+      assert segment in [:window, :probation, :protected]
+      assert :ets.lookup(policy.order, {segment, seq}) == [{{segment, seq}, key}]
+    end
+
+    sums =
+      Enum.reduce(rows, %{window: 0, probation: 0, protected: 0}, fn
+        {_, _, segment, _, weight, _}, acc -> Map.update!(acc, segment, &(&1 + weight))
+      end)
+
+    assert Policy.weights(policy) == sums
+    assert policy.protected_weight <= policy.protected_max
   end
 
   property "after any event sequence the rows, ids and sizes agree with a model", %{
@@ -450,7 +710,7 @@ defmodule Theine.PolicyTest do
 
   property "bounded: every key has one order row and one ids row and the segment weights add up",
            %{table: table} do
-    # No on_access or evict yet, so every key stays in the window and the
+    # Writes and removals only, so every key stays in the window and the
     # window weight is the weighted size; weights up to 9 against a bound
     # of 20 overflow it freely, as they may between passes (specs/03 slack).
     policy = bounded(20)
@@ -482,34 +742,52 @@ defmodule Theine.PolicyTest do
   defp replay(policy, table, events) do
     :ets.delete_all_objects(table)
 
-    Enum.reduce(events, {policy, %{}}, fn
-      {:put, key, id, weight, expires_at}, {policy, model} ->
-        :ets.insert(table, entry(key, id, weight))
-        {Policy.on_write(policy, key, id, weight, expires_at), Map.put(model, key, {id, weight})}
-
-      {:racy_put, key, id, weight, expires_at}, {policy, model} ->
-        {Policy.on_write(policy, key, id, weight, expires_at), Map.put(model, key, {id, weight})}
-
-      {:removed, key, id}, {policy, model} ->
-        case :ets.lookup(table, key) do
-          [{^key, _, ^id, _, _, _} = version] -> :ets.delete_object(table, version)
-          _ -> :ok
-        end
-
-        model =
-          case model do
-            %{^key => {^id, _}} ->
-              Map.delete(model, key)
-
-            %{^key => _} ->
-              if :ets.member(table, key), do: model, else: Map.delete(model, key)
-
-            _ ->
-              model
-          end
-
-        {Policy.on_remove(policy, key, id), model}
+    Enum.reduce(events, {policy, %{}}, fn event, {policy, model} ->
+      apply_event(policy, table, event, model)
     end)
+  end
+
+  # Applies one event to the policy and to the model, a map of the keys the
+  # policy must hold to `{id, weight}`.
+  defp apply_event(policy, table, {:put, key, id, weight, expires_at}, model) do
+    :ets.insert(table, entry(key, id, weight))
+    {Policy.on_write(policy, key, id, weight, expires_at), Map.put(model, key, {id, weight})}
+  end
+
+  defp apply_event(policy, _table, {:racy_put, key, id, weight, expires_at}, model) do
+    {Policy.on_write(policy, key, id, weight, expires_at), Map.put(model, key, {id, weight})}
+  end
+
+  defp apply_event(policy, table, {:removed, key, id}, model) do
+    case :ets.lookup(table, key) do
+      [{^key, _, ^id, _, _, _} = version] -> :ets.delete_object(table, version)
+      _ -> :ok
+    end
+
+    model =
+      case model do
+        %{^key => {^id, _}} ->
+          Map.delete(model, key)
+
+        %{^key => _} ->
+          if :ets.member(table, key), do: model, else: Map.delete(model, key)
+
+        _ ->
+          model
+      end
+
+    {Policy.on_remove(policy, key, id), model}
+  end
+
+  defp apply_event(policy, _table, {:access, id}, model) do
+    {Policy.on_access(policy, id), model}
+  end
+
+  defp apply_event(policy, _table, {:overflow, key}, model) do
+    case Policy.lookup(policy, key) do
+      {:ok, {^key, _, :window, _, _, _}} -> {place(policy, key, :probation), model}
+      _ -> {policy, model}
+    end
   end
 
   defp assert_model(policy, model, segment) do
@@ -521,7 +799,8 @@ defmodule Theine.PolicyTest do
              model |> Map.values() |> Enum.sum_by(&elem(&1, 1))
 
     for {key, {id, weight}} <- model do
-      assert {:ok, {^key, ^id, ^segment, _seq, ^weight, :infinity}} = Policy.lookup(policy, key)
+      assert {:ok, {^key, ^id, found, _seq, ^weight, :infinity}} = Policy.lookup(policy, key)
+      assert segment == :any or found == segment
     end
   end
 end

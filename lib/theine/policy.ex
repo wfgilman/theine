@@ -16,8 +16,9 @@ defmodule Theine.Policy do
   before `{segment, max_seq()}` (specs/05 §State). New keys enter at the
   window MRU and an overwrite is an access that moves the key to the MRU of
   its current segment; both count the key in the frequency sketch
-  (specs/02). Admission and eviction (`evict/1`) and read-driven promotion
-  (`on_access/2`) arrive with M2.6 and M2.5.
+  (specs/02). A read drained from the read buffer (`on_access/2`) moves the
+  key to the MRU of its segment, promoting a probation key to protected.
+  Admission and eviction (`evict/1`) arrive with M2.6.
 
   `max_size: :infinity` disables admission and eviction (specs/08 §Starting
   a cache): there is no `order` table and no sketch, and `segment` is `nil`.
@@ -279,6 +280,71 @@ defmodule Theine.Policy do
   defp sample(%__MODULE__{sketch: sketch, sketch_size: size} = state, key) do
     :ok = Sketch.increment(sketch, key)
     %{state | sketch_size: size + 1}
+  end
+
+  @doc """
+  Applies one read of the version `id`, as drained from the read buffer
+  (specs/05 §Events `on_access`). Without a bound there is no order to keep
+  and no read buffer to drain, so the state is returned unchanged.
+
+  An unknown id, or one that is no longer its key's current id, is a read
+  of a version since overwritten or removed and is skipped (specs/04 §The
+  pass step 3). Otherwise the key is moved and counted in the sketch:
+
+  - `:window` → window MRU;
+  - `:probation` → protected MRU, and while `protected_weight` exceeds
+    `protected_max` the protected LRU entries are demoted to probation MRU.
+    An entry heavier than `protected_max` on its own would only empty the
+    protected segment to be demoted straight back, so it moves to probation
+    MRU instead, as Caffeine's `reorderProbation` does (specs/05
+    §Decisions M2.5);
+  - `:protected` → protected MRU.
+  """
+  @spec on_access(t(), Entry.id()) :: t()
+  def on_access(%__MODULE__{order: nil} = state, _id), do: state
+
+  def on_access(%__MODULE__{} = state, id) do
+    with [{^id, key}] <- :ets.lookup(state.ids, id),
+         [{^key, ^id, segment, seq, weight, _expires_at}] <- :ets.lookup(state.policy, key) do
+      state |> access(key, segment, seq, weight) |> sample(key)
+    else
+      _ -> state
+    end
+  end
+
+  defp access(state, key, :window, seq, _weight), do: move(state, key, :window, seq, :window)
+
+  defp access(state, key, :protected, seq, _weight),
+    do: move(state, key, :protected, seq, :protected)
+
+  defp access(%__MODULE__{protected_max: max} = state, key, :probation, seq, weight)
+       when weight > max,
+       do: move(state, key, :probation, seq, :probation)
+
+  defp access(state, key, :probation, seq, weight) do
+    state
+    |> move(key, :probation, seq, :protected)
+    |> add_segment(:probation, -weight)
+    |> add_segment(:protected, weight)
+    |> demote()
+  end
+
+  # Demotes protected LRU entries to probation MRU until the protected
+  # segment fits. Every step removes a positive weight, and the segment is
+  # never empty while its weight exceeds a non-negative limit.
+  defp demote(%__MODULE__{protected_weight: w, protected_max: max} = state) when w <= max,
+    do: state
+
+  defp demote(%__MODULE__{order: order, policy: policy} = state) do
+    {:protected, seq} = order_key = :ets.next(order, {:protected, 0})
+    key = :ets.lookup_element(order, order_key, 2)
+    weight = :ets.lookup_element(policy, key, @row_weight)
+
+    state
+    |> move(key, :protected, seq, :probation)
+    |> add_segment(:protected, -weight)
+    |> add_segment(:probation, weight)
+    |> demote()
   end
 
   defp next_seq(%__MODULE__{next_seq: seq}) when seq < @max_seq, do: seq

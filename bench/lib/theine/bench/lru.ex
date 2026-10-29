@@ -20,6 +20,13 @@ defmodule Theine.Bench.LRU do
           seq: non_neg_integer()
         }
 
+  # Measured (M2.10): 144 B of ETS per entry at 1_000_000 entries.
+  @bytes_per_entry 160
+
+  @doc "Estimated ETS bytes per entry, for the harness's memory budget."
+  @spec bytes_per_entry() :: 160
+  def bytes_per_entry, do: @bytes_per_entry
+
   @spec new(pos_integer()) :: t()
   def new(capacity) when is_integer(capacity) and capacity > 0 do
     %__MODULE__{

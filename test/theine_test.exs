@@ -364,6 +364,88 @@ defmodule TheineTest do
       assert %Theine.Stats{evictions: evictions, hits: 1_001} = Theine.stats(cache)
       assert evictions >= 900
     end
+
+    # What `mix bench hitrate` relies on (specs/09 §Decisions M2.10): with the
+    # reader's trigger out of reach and the interval timer far away, the
+    # passes a replay runs with run_maintenance/1 are the only ones, so the
+    # same key sequence through a cache of the same name (same :rand seed)
+    # hits the same keys and keeps the same entries, run after run.
+    test "a key sequence replayed twice through a cache of one name, driven by run_maintenance/1 alone, gives identical hits" do
+      cache = unique_cache()
+
+      # 20_000 accesses over 1_500 keys at max_size 500: a hot set drawn
+      # from a seeded generator, interleaved with a scan.
+      _ = :rand.seed(:exsss, {2026, 10, 29})
+
+      keys =
+        for i <- 1..20_000 do
+          if rem(i, 3) == 0, do: {:scan, rem(i, 1_500)}, else: {:hot, :rand.uniform(300)}
+        end
+
+      replay = fn ->
+        # drain_threshold 2^30: no reader's :drain within this replay; the
+        # timer is far away; one stripe, so the pass applies a batch's reads
+        # in access order wherever this process ran. The bench starts its
+        # caches the same way.
+        opts = [
+          name: cache,
+          max_size: 500,
+          stripes: 1,
+          drain_threshold: 1_073_741_824,
+          maintenance_interval: 60_000
+        ]
+
+        start_supervised!({Theine, opts})
+
+        {hits, runs} =
+          keys
+          |> Enum.with_index(1)
+          |> Enum.reduce({0, 0}, fn {key, i}, {hits, runs} ->
+            hits =
+              case Theine.get(cache, key) do
+                {:ok, _} ->
+                  hits + 1
+
+                :error ->
+                  Theine.put(cache, key, i)
+                  hits
+              end
+
+            if rem(i, 32) == 0 do
+              Theine.run_maintenance(cache)
+              {hits, runs + 1}
+            else
+              {hits, runs}
+            end
+          end)
+
+        Theine.run_maintenance(cache)
+        %{passes: passes, pending: pending} = Theine.Maintenance.info(cache)
+        %Theine.Stats{hits: counted} = Theine.stats(cache)
+
+        resident =
+          cache |> :ets.select([{{:"$1", :_, :_, :_, :_, :_}, [], [:"$1"]}]) |> Enum.sort()
+
+        :ok = stop_supervised!({Theine, cache})
+
+        %{
+          hits: hits,
+          runs: runs + 1,
+          passes: passes,
+          pending: pending,
+          counted: counted,
+          resident: resident
+        }
+      end
+
+      first = replay.()
+      second = replay.()
+
+      assert first == second
+      assert %{hits: hits, runs: runs, passes: runs, pending: 0, counted: hits} = first
+      assert hits > 2_000
+      assert length(first.resident) <= 500
+    end
   end
 
   describe "put_new/4, delete/2 and clear/1" do

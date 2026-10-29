@@ -100,23 +100,55 @@ Thresholds (specs/09). They are evaluated for `theine` and `theine_unbounded`.
 ## `hitrate` (A3)
 
 ```bash
-mix bench hitrate                    # every trace in bench/traces.exs
-mix bench hitrate --traces loop,zipf # a subset, by name
+mix bench hitrate                          # every trace in bench/traces.exs
+mix bench hitrate --traces loop,zipf       # a subset, by name
+mix bench hitrate --window-percent 1,5,20  # sweep the window size (specs/05)
+mix bench hitrate --memory-gb 2            # smaller replay passes
 ```
 
 A replay harness, not Benchee. Each trace in the manifest is replayed at each
-of its `sizes` through every policy, all instances driven in one pass over
-the file. Every entry has weight 1; a hit is a key present in the policy at
-the time of its access. Traces are not downloaded or generated here: each
-must already be in `bench/traces/` with its recorded SHA-256
-(`mix bench.traces`). A trace that is missing, has no recorded hash, or does
-not match fails one A3 threshold per size instead of being skipped.
+of its `sizes` through every policy. Every entry has weight 1; a hit is a key
+present in the policy at the time of its access. Traces are not downloaded
+or generated here: each must already be in `bench/traces/` with its recorded
+SHA-256 (`mix bench.traces`). A trace that is missing, has no recorded hash,
+or does not match fails one A3 threshold per size instead of being skipped.
 `--manifest` and `--dir` select another manifest and trace directory.
 
-Policies: `lru` (`Theine.Bench.LRU`, two private ETS tables, a baseline and
-not a product). M2.10 adds `theine`.
+The (size, policy) instances of a trace are packed, in order, into replay
+passes over the file whose estimated ETS footprint (size × the policy's
+bytes per entry: 160 for `lru`, 400 for `theine`) stays within
+`--memory-gb` (default 4); an instance over the budget by itself gets a pass
+of its own. DS1 at 8 M entries alone is about 3 GB of theine. Every
+instance of a pass sees every key of the trace, in order.
 
-Extra `system` fields: `traces` (names replayed), `policies` (names).
+Policies:
+
+- `lru` (`Theine.Bench.LRU`): two private ETS tables, a baseline and not a
+  product.
+- `theine` (`Theine.Bench.Cache`): a real bounded cache at `max_size: size`
+  and the specs/05 default window (`window_percent` 1), replayed
+  synchronously. Every access is a `Theine.get/2`, a miss is followed by a
+  `Theine.put/3`, and after every 32 accesses (the specs/08 default
+  `drain_threshold`) the harness runs one pass with
+  `Theine.run_maintenance/1`. Those are the only passes that run: the cache
+  is started with `drain_threshold` 2^30 (above any trace length, so no
+  reader sends `:drain`), `maintenance_interval` a day and a single ring
+  stripe (so a batch's reads are drained in access order wherever the
+  replaying process ran), and `close/1`
+  raises if the maintenance process's pass count differs from the number
+  of calls, if the cache's own hit count (specs/03 §Hits from the tails)
+  differs from the replay's, if write events are still pending, or if the
+  cache is over its bound after the last pass (specs/09 §Decisions M2.10).
+  The admission guard's `:rand` is seeded from the cache name, which is
+  derived from the trace, the size and the window percentage, so a run is
+  reproducible to the hit.
+- `theine_w<p>`: the same cache at `window_percent` `p`, one per extra value
+  of `--window-percent`, reported with no threshold. The value 1 is always
+  the `theine` row; if it is left out, no threshold is evaluated.
+
+Extra `system` fields: `traces` (names replayed), `policies` (names),
+`window_percents` (the list replayed), `accesses_per_pass` (32),
+`memory_budget_bytes`.
 
 Each `results` row:
 
@@ -124,13 +156,13 @@ Each `results` row:
 |---|---|---|
 | `trace` | string | manifest name |
 | `size` | integer | cache capacity in entries |
-| `policy` | string | `lru`, `theine` |
+| `policy` | string | `lru`, `theine`, `theine_w<p>` |
 | `status` | string | `"ok"`, or `"error"` when the trace could not be replayed |
 | `error` | string or null | why the trace could not be replayed |
 | `requests` | integer or null | keys replayed (an ARC line counts once per block) |
 | `hits` | integer or null | |
 | `hit_rate` | number or null | `100 * hits / requests`, in percent |
-| `seconds` | number or null | wall time of the shared replay pass, so equal across the trace's rows |
+| `seconds` | number or null | wall time of the replay pass the row ran in, shared by the rows of that pass |
 
 Thresholds (specs/09):
 
@@ -138,7 +170,8 @@ Thresholds (specs/09):
   every row whose trace could not be replayed.
 - A3 `theine - lru hit rate (points), <trace> at <size>`: `>= 0.0` on every
   row; also `>= 10.0` on `loop` 1 000 and `OLTP` 1 000 and 2 000. Evaluated
-  only where both policies ran; until then the summary says "none evaluated".
+  only where both `theine` and `lru` ran; otherwise the summary says "none
+  evaluated".
 
 ## `maintenance` (A5, specs/04 budget)
 

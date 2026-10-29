@@ -1,30 +1,54 @@
 # mix bench hitrate — hit rate of each policy on the replay traces (specs/09, A3).
 #
 #   mix bench hitrate
-#   mix bench hitrate --traces loop,zipf     # a subset, by name
+#   mix bench hitrate --traces loop,zipf         # a subset, by name
+#   mix bench hitrate --window-percent 1,5,20    # sweep the window size (specs/05)
+#   mix bench hitrate --memory-gb 2              # smaller replay passes
+#   mix bench hitrate --accesses-per-pass 1      # synchronous, like Caffeine's simulator
 #
 # Replays every trace in bench/traces.exs at each of its sizes through every
-# policy, all in one pass over the trace. Traces must already be in
-# bench/traces/ with their recorded SHA-256 (mix bench.traces); a missing one
-# fails its rows instead of being skipped. Evaluates to the list of failed
-# threshold descriptions (Mix.Tasks.Bench).
+# policy. Traces must already be in bench/traces/ with their recorded SHA-256
+# (mix bench.traces); a missing one fails its rows instead of being skipped.
+# Evaluates to the list of failed threshold descriptions (Mix.Tasks.Bench).
 
 defmodule Theine.Bench.Hitrate do
-  alias Theine.Bench.{LRU, Report, Traces}
+  alias Theine.Bench.{Cache, LRU, Report, Traces}
 
   # A3: theine >= lru everywhere, and by this many points on these rows.
   @margin 10.0
   @margin_rows [{"loop", 1_000}, {"OLTP", 1_000}, {"OLTP", 2_000}]
 
+  # The `theine` row runs at the specs/05 default window; other percentages
+  # of a sweep are reported as `theine_w<p>` with no threshold.
+  @default_window_percent 1
+
+  # Instances replayed together may hold this much ETS (estimated from each
+  # policy's bytes per entry). DS1's theine instances alone would need about
+  # 5 GB; the reference laptop has 8.
+  @default_memory_gb 4.0
+
   def run(argv) do
     {opts, _rest} =
-      OptionParser.parse!(argv, strict: [traces: :string, manifest: :string, dir: :string])
+      OptionParser.parse!(argv,
+        strict: [
+          traces: :string,
+          manifest: :string,
+          dir: :string,
+          window_percent: :string,
+          memory_gb: :float,
+          accesses_per_pass: :integer
+        ]
+      )
 
     manifest = Traces.manifest(Keyword.get(opts, :manifest, Traces.default_manifest()))
     dir = Keyword.get(opts, :dir, Traces.default_dir())
     entries = select(manifest, opts[:traces])
+    percents = window_percents(opts[:window_percent])
+    budget = round(Keyword.get(opts, :memory_gb, @default_memory_gb) * 1_073_741_824)
+    batch = accesses_per_pass(opts[:accesses_per_pass])
+    policies = policies(percents, batch)
 
-    rows = Enum.flat_map(entries, &run_trace(&1, dir))
+    rows = Enum.flat_map(entries, &run_trace(&1, dir, policies, budget))
     thresholds = availability(rows) ++ comparisons(rows)
 
     path =
@@ -32,7 +56,10 @@ defmodule Theine.Bench.Hitrate do
         system:
           Report.system(%{
             traces: Enum.map(entries, & &1.name),
-            policies: Enum.map(policies(), & &1.name)
+            policies: Enum.map(policies, & &1.name),
+            window_percents: percents,
+            accesses_per_pass: batch,
+            memory_budget_bytes: budget
           }),
         results: rows,
         thresholds: thresholds
@@ -54,33 +81,111 @@ defmodule Theine.Bench.Hitrate do
     end
   end
 
-  # Each policy: new(size) -> state, access(state, key) -> {:hit | :miss, state},
-  # close(state). M2.10 adds `theine`, a real cache driven by run_maintenance/1.
-  defp policies do
-    [%{name: "lru", new: &LRU.new/1, access: &LRU.access/2, close: &LRU.close/1}]
+  defp window_percents(nil), do: [@default_window_percent]
+
+  defp window_percents(csv) do
+    percents =
+      csv
+      |> String.split(",", trim: true)
+      |> Enum.map(fn s -> s |> String.trim() |> Integer.parse() end)
+
+    case Enum.all?(percents, &match?({n, ""} when n in 1..80, &1)) do
+      true -> percents |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+      false -> Mix.raise("mix bench hitrate: --window-percent takes integers in 1..80")
+    end
   end
 
-  defp run_trace(entry, dir) do
+  defp accesses_per_pass(nil), do: Cache.accesses_per_pass()
+
+  defp accesses_per_pass(n) do
+    if n in 1..Cache.max_accesses_per_pass(),
+      do: n,
+      else:
+        Mix.raise(
+          "mix bench hitrate: --accesses-per-pass takes 1..#{Cache.max_accesses_per_pass()}"
+        )
+  end
+
+  # Each policy: new(trace, size) -> state, access(state, key) -> {:hit |
+  # :miss, state}, close(state), and bytes_per_entry for the memory budget.
+  defp policies(percents, batch) do
+    lru = %{
+      name: "lru",
+      new: fn _trace, size -> LRU.new(size) end,
+      access: &LRU.access/2,
+      close: &LRU.close/1,
+      bytes_per_entry: LRU.bytes_per_entry()
+    }
+
+    theine =
+      for percent <- percents do
+        %{
+          name: theine_name(percent),
+          new: fn trace, size ->
+            Cache.new(trace, size, window_percent: percent, accesses_per_pass: batch)
+          end,
+          access: &Cache.access/2,
+          close: &Cache.close/1,
+          bytes_per_entry: Cache.bytes_per_entry()
+        }
+      end
+
+    [lru | theine]
+  end
+
+  defp theine_name(@default_window_percent), do: "theine"
+  defp theine_name(percent), do: "theine_w#{percent}"
+
+  defp run_trace(entry, dir, policies, budget) do
     case Traces.verify(entry, dir) do
       :ok ->
-        replay(entry, dir)
+        passes = passes(entry, policies, budget)
+
+        passes
+        |> Enum.with_index(1)
+        |> Enum.flat_map(fn {instances, index} ->
+          replay(entry, dir, instances, {index, length(passes)})
+        end)
 
       {:error, message} ->
         IO.puts(:stderr, "hitrate: " <> message)
 
-        for size <- entry.sizes, policy <- policies() do
+        for size <- entry.sizes, policy <- policies do
           row(entry.name, size, policy.name, %{status: "error", error: message})
         end
     end
   end
 
-  # One pass over the trace drives every (size, policy) instance at once.
-  defp replay(entry, dir) do
-    IO.puts(:stderr, "hitrate: #{entry.name} at #{Enum.join(entry.sizes, ", ")}")
+  # The (size, policy) instances of a trace, packed in order into passes
+  # over the file whose estimated ETS footprint stays within the budget. An
+  # instance over the budget by itself gets a pass of its own.
+  defp passes(entry, policies, budget) do
+    instances = for policy <- policies, size <- entry.sizes, do: {size, policy}
+
+    instances
+    |> Enum.reduce([], fn {size, policy} = instance, passes ->
+      cost = size * policy.bytes_per_entry
+
+      case passes do
+        [{current, used} | rest] when used + cost <= budget ->
+          [{[instance | current], used + cost} | rest]
+
+        _ ->
+          [{[instance], cost} | passes]
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.map(fn {instances, _used} -> Enum.reverse(instances) end)
+  end
+
+  # One pass over the trace drives every instance of the pass at once.
+  defp replay(entry, dir, instances, {index, count}) do
+    names = Enum.map_join(instances, ", ", fn {size, policy} -> "#{policy.name} at #{size}" end)
+    IO.puts(:stderr, "hitrate: #{entry.name} pass #{index}/#{count}: #{names}")
 
     instances =
-      for size <- entry.sizes, policy <- policies() do
-        {size, policy, policy.new.(size), 0}
+      for {size, policy} <- instances do
+        {size, policy, policy.new.(entry.name, size), 0}
       end
 
     {micros, {requests, instances}} =
@@ -175,7 +280,7 @@ defmodule Theine.Bench.Hitrate do
 
     #{Report.table(header, table_rows)}
 
-    #{Report.thresholds_markdown(thresholds, "none evaluated (no theine subject yet)")}
+    #{Report.thresholds_markdown(thresholds, "none evaluated (no theine row at window_percent #{@default_window_percent})")}
 
     Result: #{path}
     """

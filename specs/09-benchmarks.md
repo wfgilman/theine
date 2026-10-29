@@ -252,3 +252,61 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   machine with four physical cores would show the two-op cost at about 48
   ns at full parallelism and the A2 rows nearer 0.65; the final gate (M5)
   records which machine it ran on.
+- 2026-10-29 (M2.10): how the `theine` policy of `mix bench hitrate` is
+  driven, where the text above says "synchronously by calling
+  `run_maintenance/1` every `drain_threshold` accesses". The harness
+  (`Theine.Bench.Cache`, `bench/lib`) replays every access as a
+  `Theine.get/2` with a `Theine.put/3` after a miss, and runs one pass with
+  `Theine.run_maintenance/1` after every 32 accesses (the specs/08 default
+  `drain_threshold`; `--accesses-per-pass` sets it, 1 being the fully
+  synchronous replay of Caffeine's simulator, 64 the ring's capacity). For
+  those to be the only passes, the cache is started with its own
+  `drain_threshold` at 2^30, above the length of every trace, so no
+  reader's `:drain` ever fires, `maintenance_interval` a day away, and
+  `stripes: 1`; the `write_batch` (256) and follow-up triggers (a full
+  stripe at 64 slots, a capped eviction at 1024) cannot fire within a
+  batch of at most 64. A reader-triggered pass would run at a
+  scheduler-dependent point of the batch and change which reads and
+  writes it sees, and a second pass in a batch advances a sketch reset by
+  an extra chunk, so a run would not be reproducible to the hit. The
+  single stripe is for the same reason: with one stripe per scheduler the
+  reads of a batch land in the stripes of whichever schedulers the
+  replaying process ran on, and the pass, which drains stripe by stripe,
+  applies them in an order that changes from run to run (the first two
+  OLTP runs of M2.10, with the default stripes, differed by 59, 351 and
+  577 hits at the three sizes). The writes of a batch are applied as they
+  arrive and sit ahead of the `run/1` call in the mailbox; the reads sit in
+  the one stripe until that pass drains them, so each pass sees the
+  batch's writes, then its reads in access order, then evicts (specs/04
+  §The pass). `close/1`
+  raises when the maintenance process's pass count differs from the
+  harness's call count, when the cache's own hit count (specs/03 §Hits from
+  the tails) differs from the replay's, when events are still pending, or
+  when the cache is over its bound after the last pass, so a run that was
+  not the synchronous one fails instead of reporting a number. The `:rand`
+  seed comes from the cache name, which is built from the trace, the size
+  and the window percentage, so two runs admit the same keys; a run is
+  checked to the exact hit count (IMPLEMENTATION_PLAN.md §Benchmark log,
+  M2.10). `window_percent` is swept with `--window-percent 1,5,20`: the
+  row at the specs/05 default 1 is `theine` and carries the thresholds,
+  every other value is reported as `theine_w<p>` with none. Instances are
+  packed into replay passes within `--memory-gb` (default 4) from each
+  policy's measured ETS bytes per entry (theine 378, rounded to 400, lru
+  144, rounded to 160), because DS1's three theine instances alone would
+  need about 5 GB and the reference laptop has 8; the `seconds` column is
+  per pass. What the first run measured, and what it leaves open: `loop`
+  1_000 at 58.84% against LRU's 0 meets its margin; OLTP does not. The
+  harness's `lru` reproduces the ARC paper's LRU figures for OLTP exactly
+  (32.83, 42.47, 53.65 at 1_000, 2_000, 5_000), and `theine` with the
+  specs/05 default window sits at +3.61, +0.18 and −1.01 points
+  (+2.61, −0.52, −1.24 replayed one access per pass as Caffeine's
+  simulator does), which is where a static-window W-TinyLFU is known to
+  sit on this recency-biased trace; Caffeine's authors use OLTP to
+  motivate the adaptive window (§Adaptive window of specs/05, M6.1). The
+  +10 margin at 1_000 would need 42.8%, above the ARC paper's own 38.93
+  for ARC. specs/00 A3 puts the margin on "the looping and scan traces"
+  and the table above types OLTP as "database", so the two specs disagree
+  about OLTP; the thresholds here are not changed by the loop, the bench
+  exits non-zero on the three OLTP checks, and the question is recorded
+  for a human in IMPLEMENTATION_PLAN.md §Open questions (1) with a
+  recommended resolution.

@@ -105,6 +105,12 @@ test/                         mirrors lib/; test/support for shared helpers
   true`) is the way to measure a bounded hit with no passes running (M2.8d).
 - Probe scripts under `bench/results/` are gitignored but still formatted
   by `mix format --check-formatted`; run `mix format` on them before the gate.
+- `mix bench hitrate --traces OLTP` (about 3 min) is the quick policy check;
+  `--traces loop` takes seconds. `--accesses-per-pass 1` replays like
+  Caffeine's simulator, `--window-percent 1,5,20` sweeps the window. The
+  full run replays DS1 at 8 M entries (about 3 GB of ETS) and takes about
+  46 min (LRU-only was 8); run it in the background. Two runs must agree
+  to the hit (the harness raises if a pass it did not request ran).
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

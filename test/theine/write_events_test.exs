@@ -71,8 +71,14 @@ defmodule Theine.WriteEventsTest do
     setup do
       cache = unique_cache()
 
+      # The long interval keeps the timer out of the mailbox counts below.
       start_supervised!(
-        {Theine, name: cache, max_size: :infinity, write_hwm: @hwm, test_hooks: true}
+        {Theine,
+         name: cache,
+         max_size: :infinity,
+         write_hwm: @hwm,
+         test_hooks: true,
+         maintenance_interval: 60_000}
       )
 
       %{

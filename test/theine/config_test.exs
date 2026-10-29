@@ -26,6 +26,15 @@ defmodule Theine.ConfigTest do
     assert config.maintenance_interval == 1000
     assert config.stats == true
     assert config.test_hooks == false
+    assert config.policy_module == Theine.Policy
+  end
+
+  test "policy_module is accepted with test_hooks only" do
+    opts = Keyword.merge(@required, policy_module: Theine.Test.Policy)
+    assert Config.new!(opts ++ [test_hooks: true]).policy_module == Theine.Test.Policy
+    assert Config.new!(Keyword.put(@required, :policy_module, Theine.Policy)).test_hooks == false
+
+    assert_raise ArgumentError, ~r/:policy_module.*test_hooks: true/, fn -> Config.new!(opts) end
   end
 
   test "names the table, the maintenance process and the task supervisor after the cache" do
@@ -60,7 +69,8 @@ defmodule Theine.ConfigTest do
         evict_batch: 6,
         maintenance_interval: 50,
         stats: false,
-        test_hooks: true
+        test_hooks: true,
+        policy_module: Theine.Test.Policy
       )
 
     assert config.weigher == weigher
@@ -79,6 +89,7 @@ defmodule Theine.ConfigTest do
     assert config.maintenance_interval == 50
     refute config.stats
     assert config.test_hooks
+    assert config.policy_module == Theine.Test.Policy
   end
 
   test "missing name or max_size raises naming the option" do
@@ -115,7 +126,9 @@ defmodule Theine.ConfigTest do
       evict_batch: 0,
       maintenance_interval: 0,
       stats: :yes,
-      test_hooks: 1
+      test_hooks: 1,
+      policy_module: "Theine.Policy",
+      policy_module: nil
     ]
 
     for {key, value} <- bad do

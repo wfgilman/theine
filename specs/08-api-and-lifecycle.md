@@ -34,6 +34,7 @@ children = [
 | `maintenance_interval` | ms | 1000 | 04 |
 | `stats` | boolean | true | this file |
 | `test_hooks` | boolean | false | 04 (`pause/1`, `resume/1`; tests only) |
+| `policy_module` | module | `Theine.Policy` | 04, 10 (needs `test_hooks: true`; tests only) |
 
 Unknown options raise `ArgumentError` with the option name. `max_size:
 :infinity` disables the policy entirely: no sketch, no read buffer, no
@@ -198,3 +199,10 @@ specs/09.
   `%{request_counters: nil}` or `%{request_counters: c}`. Matching
   `%{stats: true, counters: c}` instead costs a second map fetch on every
   hit, visible as a few ns in the first M1.6 `mix bench get` run.
+- 2026-10-28 (M2.7): `policy_module` is the "test-only config field" of
+  specs/10 §Required helpers, surfaced as a `start_link` option so the
+  test suite can set it without a second `:persistent_term` write. It is
+  refused without `test_hooks: true` (`ArgumentError` naming it), which
+  keeps the table above honest about what production may set. The
+  maintenance process dispatches its policy calls through the field
+  (specs/04 §Decisions M2.7); nothing on the read or write path reads it.

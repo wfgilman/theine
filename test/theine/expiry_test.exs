@@ -15,7 +15,11 @@ defmodule Theine.ExpiryTest do
   setup do
     cache = unique_cache()
     start_supervised!({Clock, cache: cache, at: 1_000})
-    start_supervised!({Theine, name: cache, max_size: :infinity, test_hooks: true})
+    # The long interval keeps the timer out of the mailbox counts below.
+    start_supervised!(
+      {Theine, name: cache, max_size: :infinity, test_hooks: true, maintenance_interval: 60_000}
+    )
+
     %{cache: cache}
   end
 

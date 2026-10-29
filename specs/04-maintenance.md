@@ -140,3 +140,43 @@ rebuild are applied after it completes (they are queued in the mailbox).
   specs/03) and `sketch` (`words` and the `increments` since the last
   completed reset). That is how specs/08 §Acceptance's "`info/1` shows them
   absent" is observable without reading the config.
+- 2026-10-28 (M2.7): the pass as built, where §The pass left room.
+  - The instrumented policy of §Acceptance and specs/10 is injected with
+    the `start_link` option `policy_module` (default `Theine.Policy`),
+    accepted only together with `test_hooks: true` so it stays a test
+    hook (specs/08 table). The maintenance process calls `new/1`,
+    `on_write/5`, `on_remove/3`, `on_access/2`, `evict/1` and `reset/1`
+    through that module; the struct it returns is still `%Theine.Policy{}`,
+    read directly for `info/1` and the sketch count. `Theine.Test.Policy`
+    forwards every call to `Theine.Policy` and sends its name to a listener
+    registered per cache, so the order test reads the call order out of its
+    own mailbox.
+  - Step 1 receives `{:put, …}`, `{:removed, …}` and `{:"$gen_call", from,
+    {:event, …}}` selectively, in their mutual order, and leaves every
+    other message in place; the backpressure call is replied to as its
+    event is applied, as outside a pass.
+  - The `write_batch` trigger counts events applied on arrival since the
+    last pass, on the send and the call path alike; it is checked on
+    arrival only, never inside step 1, so a flush cannot start a pass
+    within a pass. On the call path the writer is answered before the pass
+    its event triggers.
+  - The follow-up pass after a full stripe or a capped eviction goes
+    through `ReadBuffer.schedule_drain/1`, not a bare `send`: step 2 has
+    cleared the flag, so the compare-exchange succeeds and one `:drain` is
+    queued, unless a reader got there first during the pass, in which case
+    that reader's message serves and the "at most one `:drain` in flight"
+    rule of specs/03 holds.
+  - The `writes` measurement is the number of write events applied since
+    the previous pass, on arrival and in step 1, so with the mailbox idle
+    before a pass it is exactly what step 1 consumed; `expired` is 0 until
+    `Theine.Expiry.sweep/2` lands (M3.1); `duration` is in native units.
+    The event's metadata is `%{cache: name}`.
+  - Sketch aging (step 6) is the maintenance process's own: it keeps the
+    cursor (`nil` or `Theine.Sketch.reset_cursor/0`) in its state, reported
+    by `info/1` as `sketch.reset`, starts a reset when the policy's
+    `sketch_size` reaches `Sketch.sample_size/1`, advances it by the module
+    default chunk once per pass, and applies `Sketch.size_after_reset/2` on
+    completion. `reset/1` (`clear/1`) drops a reset in progress with the
+    sketch.
+  - The periodic trigger is one `Process.send_after/3` timer, re-armed when
+    it fires, so the interval is the gap between pass starts.

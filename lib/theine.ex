@@ -44,6 +44,7 @@ defmodule Theine do
   | `maintenance_interval` | ms | 1000 |
   | `stats` | boolean | `true` |
   | `test_hooks` | boolean | `false` |
+  | `policy_module` | module | `Theine.Policy` (tests only, needs `test_hooks`) |
 
   An unknown option, a missing `name` or `max_size`, or a value of the wrong
   type raises `ArgumentError` naming the option.
@@ -60,8 +61,11 @@ defmodule Theine do
 
   `test_hooks: true` enables `Theine.Maintenance.pause/1` and `resume/1`,
   which stop and restart the maintenance process's consumption of write
-  events so tests can observe backpressure and lazy expiry. Never set it in
-  production: a paused cache blocks writers once `write_hwm` events queue.
+  events so tests can observe backpressure and lazy expiry, and unlocks
+  `policy_module`, the module the maintenance process calls in place of
+  `Theine.Policy` (the test suite injects an instrumented one that records
+  the call order of a pass). Never set it in production: a paused cache
+  blocks writers once `write_hwm` events queue.
   """
 
   alias Theine.{Config, Entry, Policy, Stats}

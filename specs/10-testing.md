@@ -77,6 +77,11 @@ correctness is in the branches (claim races, admission ties, stale ids).
   specs/06 §Clock keys the test clock by cache name (`now/1` takes the
   cache), so advancing needs the cache too; one global clock would couple
   async tests. Caches with no registered clock fall back to real time.
+- 2026-10-28 (M2.7): `Theine.Test.Policy` is injected with the
+  `start_link` option `policy_module`, accepted only with `test_hooks:
+  true` (specs/08 §Decisions M2.7). It records by sending each call's name
+  to the process that called `listen(cache)`; `calls(cache)` drains them
+  from the caller's mailbox in order.
 - 2026-10-27: `Theine.Test.Trace` uses an OTP 27 `:trace` session instead
   of global `:erlang.trace/3` + `trace_pattern/3`, so concurrent async
   tracing tests cannot see or reset each other's patterns. The call

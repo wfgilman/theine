@@ -38,6 +38,7 @@ defmodule Theine.Config do
           maintenance_interval: pos_integer(),
           stats: boolean(),
           test_hooks: boolean(),
+          policy_module: module(),
           table: cache(),
           maintenance: atom(),
           task_supervisor: atom(),
@@ -70,6 +71,7 @@ defmodule Theine.Config do
             maintenance_interval: 1000,
             stats: true,
             test_hooks: false,
+            policy_module: Theine.Policy,
             table: nil,
             maintenance: nil,
             task_supervisor: nil,
@@ -100,7 +102,8 @@ defmodule Theine.Config do
     :evict_batch,
     :maintenance_interval,
     :stats,
-    :test_hooks
+    :test_hooks,
+    :policy_module
   ]
 
   # Fields filled in by Theine.Owner, not by options. `request_counters` is
@@ -125,7 +128,9 @@ defmodule Theine.Config do
   Validates `opts` and returns a config with the runtime handles unset.
 
   Raises `ArgumentError` naming the option for an unknown option, a missing
-  required option (`name`, `max_size`) or a value of the wrong type.
+  required option (`name`, `max_size`), a value of the wrong type, or a
+  `policy_module` other than `Theine.Policy` without `test_hooks: true`
+  (specs/10 §Required helpers: the instrumented policy is for tests only).
 
       iex> Theine.Config.new!(name: :c, max_size: :infinity).write_hwm
       1024
@@ -166,6 +171,15 @@ defmodule Theine.Config do
     |> then(fn config ->
       %{config | name: validate!(:name, name), max_size: validate!(:max_size, max_size)}
     end)
+    |> check_policy_module!()
+  end
+
+  defp check_policy_module!(%__MODULE__{policy_module: Theine.Policy} = config), do: config
+  defp check_policy_module!(%__MODULE__{test_hooks: true} = config), do: config
+
+  defp check_policy_module!(%__MODULE__{policy_module: module}) do
+    raise ArgumentError,
+          "option :policy_module (#{inspect(module)}) needs test_hooks: true in Theine.start_link/1"
   end
 
   @doc """
@@ -228,6 +242,8 @@ defmodule Theine.Config do
   defp validate!(key, bool) when key in [:adaptive, :stats, :test_hooks] and is_boolean(bool),
     do: bool
 
+  defp validate!(:policy_module, module) when is_atom(module) and not is_nil(module), do: module
+
   defp validate!(key, n)
        when key in [
               :stripes,
@@ -252,6 +268,7 @@ defmodule Theine.Config do
   defp expected(:loader), do: "expected a function of arity 1 or nil"
   defp expected(:window_percent), do: "expected an integer in 1..80"
   defp expected(key) when key in [:adaptive, :stats, :test_hooks], do: "expected a boolean"
+  defp expected(:policy_module), do: "expected a module"
 
   defp expected(key) when key in [:expire_after_write, :refresh_after_write],
     do: "expected a positive number of milliseconds or :infinity"

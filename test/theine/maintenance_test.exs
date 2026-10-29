@@ -60,6 +60,17 @@ defmodule Theine.MaintenanceTest do
     if System.monotonic_time(:millisecond) < deadline, do: flood(cache, key, deadline), else: :ok
   end
 
+  # Puts `key`, `key + step`, ... into `cache` as fast as it can until the
+  # `stop` atomic is set, then exits normally.
+  defp write_until(cache, stop, key, step) do
+    if :atomics.get(stop, 1) == 0 do
+      Theine.put(cache, key, key)
+      write_until(cache, stop, key + step, step)
+    else
+      :ok
+    end
+  end
+
   # Every pass message of `cache` already in the test mailbox.
   defp passes_received(cache, acc \\ []) do
     receive do
@@ -369,6 +380,8 @@ defmodule Theine.MaintenanceTest do
       # anyway, so they send nothing). The pass that handles the :drain must
       # apply the writes in step 1 before draining the reads in step 3, which
       # is observable because the reads are of ids the writes introduce.
+      # Each applied :put evicts before it is consumed (specs/04 §The pass),
+      # so an evict call sits inside every write; the pass's own comes last.
       :ok = Maintenance.pause(cache)
       :atomics.put(config.flags, @drain_flag, 1)
       send(name, :drain)
@@ -380,7 +393,8 @@ defmodule Theine.MaintenanceTest do
       assert %{passes: 1, pending: 0, size: 3} = Maintenance.info(cache)
 
       assert Theine.Test.Policy.calls(cache) ==
-               [:on_write, :on_write, :on_write, :on_access, :on_access, :evict]
+               [:on_write, :evict, :on_write, :evict, :on_write, :evict] ++
+                 [:on_access, :on_access, :evict]
 
       # The reads were applied: keys 1 and 2 moved above key 3 in the window.
       assert seq_of(cache, 3) < seq_of(cache, 1)
@@ -513,23 +527,131 @@ defmodule Theine.MaintenanceTest do
       assert %{passes: 2, size: 20, pending: 0} = Maintenance.info(cache)
     end
 
-    test "a capped eviction schedules follow-up passes until the cache fits" do
+    test "a put heavier than evict_batch removals is capped and follow-up passes evict the rest" do
       cache = unique_cache()
 
+      # window_percent 80: eighty weight-1 entries in the window, twenty in
+      # probation, so a 50-weight entry overflows fifty window entries into
+      # probation and the cache is 50 over its bound.
       start_supervised!(
-        {Theine, [name: cache, max_size: 100, evict_batch: 5, write_batch: 1_000] ++ @quiet}
+        {Theine,
+         [name: cache, max_size: 100, window_percent: 80, evict_batch: 5, write_batch: 1_000] ++
+           @quiet}
       )
 
-      for i <- 1..150, do: Theine.put(cache, i, i)
-      assert %{passes: 0, size: 150} = Maintenance.info(cache)
+      for i <- 1..100, do: Theine.put(cache, i, i)
+
+      # One pass to zero the since-last-pass counts; it has nothing to evict.
+      Maintenance.run(cache)
+
+      assert %{passes: 1, size: 100, segments: %{window: 80, probation: 20, protected: 0}} =
+               Maintenance.info(cache)
+
+      # Five removals as the event is applied (the cap), then :more schedules
+      # a :drain; each follow-up pass removes five more and schedules the
+      # next until the cache fits: nine passes for the remaining 45.
+      attach_pass_handler(cache)
+      Theine.put(cache, :big, :big, weight: 50)
+      assert_eventually(fn -> Maintenance.info(cache).passes == 10 end)
+      info = Maintenance.info(cache)
+      assert %{weighted_size: 100, size: 51, passes: 10} = info
+      assert info.segments == %{window: 80, probation: 20, protected: 0}
+      assert Theine.stats(cache).evictions == 50
+      assert {:ok, :big} = Theine.get(cache, :big)
+      assert flag(cache) == 0
+
+      # The first pass reports the five evicted as the event was applied
+      # plus its own five; the event itself is its one write.
+      measurements = passes_received(cache) |> Enum.map(fn {m, _} -> {m.writes, m.evicted} end)
+      assert measurements == [{1, 10} | List.duplicate({0, 5}, 8)]
+    end
+
+    test "a put that takes the cache over max_size is evicted down before the writer's call returns" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, max_size: 10] ++ @quiet})
+      %Config{pending: pending, write_hwm: hwm} = Config.get(cache)
+
+      for i <- 1..10, do: Theine.put(cache, i, i)
+      assert %{passes: 0, pending: 0, size: 10, call_writes: 0} = Maintenance.info(cache)
+
+      # A pending held at write_hwm makes the next put a backpressure call
+      # (specs/03): when it returns, its event has been consumed, and the
+      # cache already fits, with no pass having run.
+      :atomics.add(pending, 1, hwm)
+      assert :ok = Theine.put(cache, 11, 11)
+      assert :ets.info(cache, :size) == 10
+      assert Theine.stats(cache).evictions == 1
+
+      assert %{passes: 0, pending: ^hwm, size: 10, weighted_size: 10, call_writes: 1} =
+               Maintenance.info(cache)
+
+      :atomics.sub(pending, 1, hwm)
+    end
+
+    test "the pass's evicted measurement counts the evictions since the previous pass" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, max_size: 10, write_batch: 1_000] ++ @quiet})
+      attach_pass_handler(cache)
+
+      # Fifteen puts into a bound of ten evict five as they are applied.
+      for i <- 1..15, do: Theine.put(cache, i, i)
+      assert %{passes: 0, size: 10} = Maintenance.info(cache)
+      assert Theine.stats(cache).evictions == 5
 
       Maintenance.run(cache)
-      assert_eventually(fn -> Theine.size(cache) <= 100 end)
-      info = Maintenance.info(cache)
-      assert info.size == 100
-      assert info.passes >= 10
-      assert Theine.stats(cache).evictions == 50
-      assert flag(cache) == 0
+      assert_receive {:pass, %{writes: 15, evicted: 5}, %{cache: ^cache}, _}
+
+      # Nothing since: the count is per pass, like writes.
+      Maintenance.run(cache)
+      assert_receive {:pass, %{writes: 0, evicted: 0}, %{cache: ^cache}, _}
+      refute_received {:pass, _, _, _}
+    end
+
+    test "under saturating writers the table never exceeds max_size + pending + writers at any of 200 samples" do
+      cache = unique_cache()
+      max_size = 10_000
+      start_supervised!({Theine, [name: cache, max_size: max_size] ++ @quiet})
+      config = Config.get(cache)
+      writers = System.schedulers_online()
+      stop = :atomics.new(1, [])
+
+      # One writer per scheduler, distinct keys, as mix bench maintenance's
+      # write run (specs/09 §`mix bench maintenance`).
+      pids = for i <- 1..writers, do: spawn_link(fn -> write_until(cache, stop, i, writers) end)
+      refs = Enum.map(pids, &Process.monitor/1)
+
+      # table = policy + pending + in flight: with every :put consumed only
+      # once the cache fits (specs/04 §The pass), the policy is at most
+      # max_size and the in-flight inserts at most one per writer. The
+      # three reads are not simultaneous, so pending is read before and
+      # after the table: a sample can only break the bound if pending
+      # peaked strictly between the two reads, which the backpressure band
+      # (pending within write_hwm..write_hwm + writers) rules out.
+      samples =
+        for _ <- 1..200 do
+          before = :atomics.get(config.pending, 1)
+          table = :ets.info(cache, :size)
+          after_table = :atomics.get(config.pending, 1)
+          Process.sleep(5)
+          {table, max(before, after_table)}
+        end
+
+      :atomics.put(stop, 1, 1)
+      for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal}, 5_000)
+
+      for {table, pending} <- samples do
+        assert table <= max_size + pending + writers
+        # The spec's own statement of the slack (specs/03 §Delivery with
+        # backpressure, A5), from the table reading alone.
+        assert table <= max_size + config.write_hwm + writers
+      end
+
+      # The writers did push the cache past its bound, and it comes back to
+      # it once their events are consumed, with no pass needed.
+      assert Enum.any?(samples, fn {table, _} -> table > max_size end)
+      assert_eventually(fn -> Maintenance.info(cache).pending == 0 end)
+      assert :ets.info(cache, :size) == max_size
+      assert Theine.weighted_size(cache) == max_size
     end
 
     test "a full stripe schedules exactly one follow-up pass" do
@@ -776,7 +898,9 @@ defmodule Theine.MaintenanceTest do
       for _ <- 1..3, do: {:ok, 1} = Theine.get(cache, 1)
       Maintenance.run(cache)
       assert %{passes: 1, size: 51, sketch: %{increments: 54}} = Maintenance.info(cache)
-      assert {:ok, {1, _, :window, _, 1, :infinity}} = Maintenance.policy_row(cache, 1)
+      # Key 1 overflowed into probation as the later puts were applied
+      # (eviction runs per applied :put) and the pass's reads promoted it.
+      assert {:ok, {1, _, :protected, _, 1, :infinity}} = Maintenance.policy_row(cache, 1)
 
       # Paused: ten more writes queue as events in the mailbox, and five
       # reads sit in the ring, when the process is killed. The events die
@@ -995,6 +1119,7 @@ defmodule Theine.MaintenanceTest do
       # and the rebuild alone must learn the entries.
       :ok = Maintenance.pause(cache)
       for i <- 1..150, do: Theine.put(cache, i, i)
+      attach_pass_handler(cache)
       restart(cache)
 
       assert_eventually(fn -> Theine.size(cache) == 100 end)
@@ -1005,6 +1130,10 @@ defmodule Theine.MaintenanceTest do
       assert info.passes >= 1
       assert info.segments == %{window: 0, probation: 100, protected: 0}
       assert flag(cache) == 0
+
+      # The pass's own step 5 did the evicting here, and its measurement
+      # counts them.
+      assert passes_received(cache) |> Enum.map(fn {m, _} -> m.evicted end) |> Enum.sum() == 50
     end
   end
 end

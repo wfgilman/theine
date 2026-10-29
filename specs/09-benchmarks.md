@@ -275,10 +275,11 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   applies them in an order that changes from run to run (the first two
   OLTP runs of M2.10, with the default stripes, differed by 59, 351 and
   577 hits at the three sizes). The writes of a batch are applied as they
-  arrive and sit ahead of the `run/1` call in the mailbox; the reads sit in
-  the one stripe until that pass drains them, so each pass sees the
-  batch's writes, then its reads in access order, then evicts (specs/04
-  §The pass). `close/1`
+  arrive, each followed by the eviction it forces (specs/04 §The pass,
+  M2.11c), and sit ahead of the `run/1` call in the mailbox; the reads sit
+  in the one stripe until that pass drains them, so each pass sees the
+  batch's writes with their evictions, then its reads in access order,
+  then its own step 5, which has nothing left to do. `close/1`
   raises when the maintenance process's pass count differs from the
   harness's call count, when the cache's own hit count (specs/03 §Hits from
   the tails) differs from the replay's, when events are still pending, or

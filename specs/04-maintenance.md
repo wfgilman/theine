@@ -22,6 +22,16 @@ policy (`Policy.on_write/4`, `Policy.on_remove/2`) and the expiry index,
 decrements `pending`, replies if it was a call, and counts it. Nothing
 waits for a pass.
 
+A `:put` is applied as `Policy.on_write` followed by `Policy.evict/1`, and
+`pending` is decremented (and the call answered) only after the eviction,
+so that the event counts as consumed once the cache fits again (specs/03
+§Delivery with backpressure, §Decisions M2.11c). Every entry the table
+holds beyond `max_size` is then either counted by `pending` or an insert in
+flight, which is the A5 slack. An entry that needs more than `evict_batch`
+removals leaves `evict/1` at `:more`; the process schedules `:drain` through
+`ReadBuffer.schedule_drain/1`, as after a capped step 5, and the follow-up
+pass finishes the job.
+
 A pass is triggered by a `:drain` message (specs/03), by a periodic timer
 every `maintenance_interval` ms (default 1000) so expiry runs even on an
 idle cache, by `run/1`, or by the count above reaching `write_batch`
@@ -56,16 +66,23 @@ Order, matching Caffeine:
 5. **Evict** (`Policy.evict/1`, called every pass): overflow the window
    into probation, then while the weighted size exceeds `max_size`, run
    W-TinyLFU admission between the window candidate and the probation
-   victim, removing the loser from the entries table and the policy.
+   victim, removing the loser from the entries table and the policy. Since
+   every applied `:put` already evicted what it displaced, this step finds
+   work only after a restart rebuild (§Restart semantics) or a per-event
+   eviction that stopped at `evict_batch`; it stays as the safety net that
+   makes "over capacity converges" true whatever the path.
 6. **Sketch aging**: if a reset is in progress, advance it by one chunk.
 7. **Adaptive step** (M6 only): `Policy.climb/1` if enabled.
 8. Record pass duration and queue depths in the maintenance state and emit
    `[:theine, :maintenance, :pass]` telemetry with measurements
-   `%{duration: native, reads: n, writes: n, expired: n, evicted: n}`.
+   `%{duration: native, reads: n, writes: n, expired: n, evicted: n}`;
+   `writes` and `evicted` count since the previous pass, on arrival and in
+   this pass alike.
 
-If step 3 drained a full stripe, or step 5 stopped because of the batch cap
-while still over capacity, the process sends itself `:drain` so the next pass
-follows immediately without waiting for a trigger.
+If step 3 drained a full stripe, or step 5 (or the eviction after an
+applied `:put`) stopped because of the batch cap while still over capacity,
+the process sends itself `:drain` so the next pass follows immediately
+without waiting for a trigger.
 
 ## Budget
 
@@ -121,8 +138,8 @@ reports the scan's `duration`, `entries` and `chunks`.
 ## Acceptance
 
 - Order: a test with an instrumented policy (test-only module injected via
-  config) records the call order within one pass as writes, reads, expire,
-  evict.
+  config) records the call order within one pass as writes (each `:put`
+  followed by its own evict), reads, expire, evict.
 - Caps: with 10,000 queued write events and a full read buffer, one pass
   consumes at most `write_batch * 4` events and at most `stripes * slots`
   reads, and schedules a follow-up pass.
@@ -279,3 +296,34 @@ reports the scan's `duration`, `entries` and `chunks`.
     process inside its next call of a given name until the test lets it
     go; that is how "a put during the rebuild is not lost" is tested
     deterministically rather than by racing a 20_000-entry scan.
+- 2026-10-29 (M2.11c): eviction on arrival. Batched eviction in step 5
+  cannot meet A5 as specs/00 and specs/03 state it. Under writers that keep
+  the mailbox full, the `write_batch` trigger fires after 256 applied
+  events and step 1 flushes up to 1024 more before step 5 evicts at most
+  `evict_batch` (1024): the policy grew by 256 entries per pass with
+  nothing to stop it but the deferred `:drain` follow-ups, which flush as
+  well (`mix bench maintenance` at 1_000_000: worst sample 156 k over the
+  bound, 128 k still over a second after the writers stopped; at 10_000
+  the policy sat at 3× `max_size` while `pending` stayed at its bound;
+  IMPLEMENTATION_PLAN.md discovered issue 8). Raising `evict_batch` does
+  not help, because the bound is stated against `pending` and the sampler
+  sees the pass mid-way: an entry applied but not yet evicted is in the
+  table and outside `pending` whatever the cap. The bound holds by
+  construction only if the `pending` decrement follows the eviction the
+  entry forces, so `apply_event/2` now runs `on_write`, then `evict/1`,
+  then the decrement (§The pass, second paragraph). The per-event call is
+  cheap: step 1 moves the one overflow, step 2 makes one admission
+  decision, and the cursor state is cleared on `:done`. Measured through
+  the bench before the change was committed (IMPLEMENTATION_PLAN.md
+  §Benchmark log M2.11), both A5 checks pass with the worst sample exactly
+  at the bound and write throughput about 10% higher, since the process no
+  longer carries a policy three times its size. Step 5 stays, for a
+  rebuild and for a heavy entry's `:more`, and is a no-op otherwise; the
+  `evicted` measurement is the count since the previous pass, so that a
+  telemetry handler summing it still sees every eviction. The order test's
+  multiset gains an `:evict` after each `:on_write`. The step-1 flush now
+  does no work the mailbox would not do on its own, which is what makes
+  its cap the pass-budget lever (M2.11d). What the change does to the
+  policy's view of a batch (each insert admitted before the reads around
+  it rather than after) is recorded in specs/05 §Decisions M2.11c with the
+  hit-rate run.

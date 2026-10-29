@@ -100,9 +100,10 @@ plain row, as `on_write` of an unknown key would make (§Decisions M2.9).
 
 ### `evict()`
 
-Called once in every maintenance pass; step 1 always runs, step 2 while
+Called after every applied `:put` event and once in every maintenance pass
+(specs/04 §The pass; §Decisions M2.11c); step 1 always runs, step 2 while
 `window_weight + probation_weight + protected_weight > max_size`, at most
-`evict_batch` removals per pass (§Decisions M2.6):
+`evict_batch` removals per call (§Decisions M2.6):
 
 1. While `window_weight > window_max`: take the window LRU entry, move it
    to probation MRU (`window_weight -= w`, `probation_weight += w`) and
@@ -134,10 +135,11 @@ Called once in every maintenance pass; step 1 always runs, step 2 while
      deletion).
    - Removal from the entries table follows specs/04 §Removing an entry.
 
-   `candidates` and the cursor are reset at the start of every pass. An
-   eviction that stops at `evict_batch` while candidates remain carries both
-   into the follow-up pass that specs/04 schedules, so that leftover window
-   overflows are still admission-tested rather than treated as settled.
+   `candidates` and the cursor are cleared whenever a call returns `:done`.
+   A call that stops at `evict_batch` while candidates remain returns
+   `:more` and carries both into the follow-up pass that specs/04
+   schedules, so that leftover window overflows are still admission-tested
+   rather than treated as settled.
 
    `:rand` is seeded once in the maintenance process's `init/1` from
    `:erlang.phash2(cache_name)` (via `:rand.seed(:exsss, {h, h, h})`), so a
@@ -294,3 +296,23 @@ default false, and must not change any non-adaptive test result.
   A rebuilt probation may exceed `main_max`, which `evict` handles like
   any over-capacity state: with `candidates` 0 the probation LRU goes
   first, oldest in scan order.
+- 2026-10-29 (M2.11c): `evict/1` runs after every applied `:put`, not only
+  in the pass. The A5 bound of specs/00 needs a `:put` to count as
+  consumed only once the cache fits again (specs/03 §Decisions M2.11c), so
+  the maintenance process calls `on_write/5` then `evict/1` and only then
+  decrements `pending`; the pass's own call (step 5) stays and finds work
+  only after a restart rebuild or a `:more`. Nothing in this section's
+  algorithm changes: step 1 moves the overflow the new entry caused (one
+  entry, or several for a heavy one), step 2 admits or rejects it against
+  the probation LRU at once, and `candidates`, the cursor and the floor
+  are per call, cleared on `:done`, which is now the usual outcome of
+  every call. What changes is *when* an entry is tested relative to the
+  reads around it: before, a batch of up to `write_batch` writes was
+  applied, the pass drained the reads recorded in between, and then the
+  batch's overflows were tested together, so a read of a just-inserted
+  key counted in its favour; now each insert is tested before the next
+  event and the reads of the batch land afterwards. With one access per
+  pass (Caffeine's simulator order, `mix bench hitrate --accesses-per-pass
+  1`) the two are identical, and the full `mix bench hitrate` run after
+  the change (IMPLEMENTATION_PLAN.md §Benchmark log M2.11c) is the record
+  of what the default 32-access batches lose or gain.

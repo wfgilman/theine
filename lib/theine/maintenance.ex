@@ -20,24 +20,32 @@ defmodule Theine.Maintenance do
   table. Write events
   (`{:put, key, id, weight, expires_at}` and `{:removed, key, id}`,
   specs/03) are applied to the policy as they arrive and decrement `pending`
-  per event; nothing waits for a pass (specs/04 §The pass). A writer above
-  `write_hwm` delivers its event as the call `{:event, event}` instead of a
-  plain message (specs/03 §Delivery with backpressure); calls and messages
-  are consumed in mailbox order and the call is replied to as its event is
-  consumed.
+  per event; nothing waits for a pass (specs/04 §The pass). A `:put` is
+  consumed only once the cache fits again: `Theine.Policy.on_write/5` is
+  followed by `Theine.Policy.evict/1` and then by the `pending` decrement,
+  so every entry the table holds beyond `max_size` is counted by `pending`
+  or is an insert in flight, which is the A5 bound of specs/00 (specs/04
+  §Decisions M2.11c). A writer above `write_hwm` delivers its event as the
+  call `{:event, event}` instead of a plain message (specs/03 §Delivery with
+  backpressure); calls and messages are consumed in mailbox order and the
+  call is replied to as its event is consumed, that is after the eviction
+  its entry caused.
 
   A pass runs on a `:drain` message from a reader (specs/03
   §`schedule_drain/1`), on the `maintenance_interval` timer, on `run/1`, and
   once `write_batch` events have been applied since the last pass. In order
   (specs/04 §The pass): flush up to `write_batch * 4` write events still
   queued in the mailbox, clear the drain flag, drain the read buffer into
-  `Theine.Policy.on_access/2`, evict with `Theine.Policy.evict/1`, advance
-  the sketch's reset by one chunk when one is due or running, and emit
-  `[:theine, :maintenance, :pass]`. The expiry sweep (step 4) arrives with
+  `Theine.Policy.on_access/2`, evict with `Theine.Policy.evict/1` (a no-op
+  unless a rebuild or a capped per-event eviction left the cache over
+  capacity), advance the sketch's reset by one chunk when one is due or
+  running, and emit `[:theine, :maintenance, :pass]`, whose `evicted` is
+  the number of entries evicted since the previous pass, on arrival and in
+  the pass alike, as `writes` is. The expiry sweep (step 4) arrives with
   `Theine.Expiry` (M3.1); the `expired` measurement is 0 until then. When
-  the drain found a full stripe or eviction stopped at `evict_batch`, the
-  pass schedules the next one at once through
-  `Theine.ReadBuffer.schedule_drain/1`.
+  the drain found a full stripe or an eviction, in the pass or after an
+  applied `:put`, stopped at `evict_batch` removals, the next pass is
+  scheduled at once through `Theine.ReadBuffer.schedule_drain/1`.
 
   Drain-triggered passes are rate limited (specs/04 §The pass, §Decisions
   M2.8c): after a pass of duration `d`, a `:drain` that arrives within
@@ -127,16 +135,19 @@ defmodule Theine.Maintenance do
     passes: 0,
     last_pass_duration: nil,
     writes: 0,
+    evicted: 0,
     call_writes: 0,
     sketch_reset: nil,
     drain_after: nil,
     deferred: nil
   ]
 
-  # `drain_after` is the monotonic time (native units) before which no
-  # drain-triggered pass may start, set at the end of every pass; `deferred`
-  # is the timer of the one `:drain` waiting for it, or nil. `call_writes`
-  # counts the `{:event, _}` calls consumed, for `info/1`.
+  # `writes` and `evicted` count the events applied and the entries evicted
+  # since the last pass, for its telemetry. `drain_after` is the monotonic
+  # time (native units) before which no drain-triggered pass may start, set
+  # at the end of every pass; `deferred` is the timer of the one `:drain`
+  # waiting for it, or nil. `call_writes` counts the `{:event, _}` calls
+  # consumed, for `info/1`.
   @typep state :: %__MODULE__{
            cache: Config.cache(),
            config: Config.t(),
@@ -145,6 +156,7 @@ defmodule Theine.Maintenance do
            passes: non_neg_integer(),
            last_pass_duration: non_neg_integer() | nil,
            writes: non_neg_integer(),
+           evicted: non_neg_integer(),
            call_writes: non_neg_integer(),
            sketch_reset: Sketch.reset_cursor() | nil,
            drain_after: integer() | nil,
@@ -358,6 +370,7 @@ defmodule Theine.Maintenance do
          passes: 0,
          last_pass_duration: nil,
          writes: 0,
+         evicted: 0,
          call_writes: 0,
          sketch_reset: nil
      }}
@@ -472,9 +485,19 @@ defmodule Theine.Maintenance do
     {:noreply, pass(state)}
   end
 
+  # A `:put` is consumed once the cache fits again (specs/03 §Delivery with
+  # backpressure, specs/04 §The pass): the policy learns the entry and
+  # evicts what it displaced, and only then is `pending` decremented and a
+  # call-path writer answered. Every entry beyond `max_size` is therefore
+  # counted by `pending` or in flight between its insert and its count,
+  # which is the A5 bound. An entry heavier than `evict_batch` removals
+  # leaves the cache over capacity with `:more`; the pass this schedules
+  # finishes the eviction, as after a capped step 5.
   @spec apply_event(state(), Theine.WriteEvents.event()) :: state()
-  defp apply_event(state, {:put, key, id, weight, expires_at}) do
-    consumed(state, state.module.on_write(state.policy, key, id, weight, expires_at))
+  defp apply_event(%__MODULE__{module: module, config: config} = state, {:put, key, id, w, exp}) do
+    {status, evicted, policy} = module.evict(module.on_write(state.policy, key, id, w, exp))
+    if status == :more, do: ReadBuffer.schedule_drain(config)
+    consumed(%{state | evicted: state.evicted + evicted}, policy)
   end
 
   defp apply_event(state, {:removed, key, id}) do
@@ -521,7 +544,9 @@ defmodule Theine.Maintenance do
     # 3. Drain the read buffer into the policy.
     {policy, reads, full?} = drain(config, module, state.policy)
 
-    # 5. Evict.
+    # 5. Evict. Every applied `:put` already evicted what it displaced, so
+    #    this finds work only after a restart rebuild or a capped per-event
+    #    eviction, and otherwise costs two comparisons.
     {status, evicted, policy} = module.evict(policy)
 
     # 6. Age the sketch by one chunk.
@@ -532,13 +557,20 @@ defmodule Theine.Maintenance do
     # reader already did, in which case that one serves.
     if full? or status == :more, do: ReadBuffer.schedule_drain(config)
 
-    # 8. Record and emit.
+    # 8. Record and emit. `writes` and `evicted` are counts since the
+    #    previous pass, on arrival and in this pass alike.
     finished = System.monotonic_time()
     duration = finished - started
 
     :telemetry.execute(
       [:theine, :maintenance, :pass],
-      %{duration: duration, reads: reads, writes: state.writes, expired: 0, evicted: evicted},
+      %{
+        duration: duration,
+        reads: reads,
+        writes: state.writes,
+        expired: 0,
+        evicted: state.evicted + evicted
+      },
       %{cache: state.cache}
     )
 
@@ -549,6 +581,7 @@ defmodule Theine.Maintenance do
         passes: state.passes + 1,
         last_pass_duration: duration,
         writes: 0,
+        evicted: 0,
         drain_after: finished + config.drain_backoff * duration
     }
   end

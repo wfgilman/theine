@@ -127,12 +127,18 @@ to the maintenance process, with backpressure so the mailbox stays bounded.
   write still succeeds and is never dropped; the writer just pays the
   maintenance process's lag.
 - The maintenance process does `:atomics.sub(pending, 1, 1)` per consumed
-  event. It must consume write events in its mailbox before it does policy
-  work in a pass, so that backpressure clears quickly (specs/04).
+  event. A `:removed` is consumed once the policy has applied it; a `:put`
+  is consumed once the policy has applied it *and* evicted whatever it
+  displaced, so that the cache fits again (specs/04 §The pass, §Decisions
+  M2.11c). The process must consume write events in its mailbox before it
+  does policy work in a pass, so that backpressure clears quickly (specs/04).
 
 `write_hwm` is also the **write-buffer slack** named in A5: the entries table
 may transiently exceed `max_size` by at most `write_hwm` entries' weight plus
-the weight of entries currently being inserted.
+the weight of entries currently being inserted. This holds by construction:
+every entry the table holds beyond `max_size` is either counted by `pending`
+(its `:put` not yet consumed) or in flight between its insert and its
+`add_get`, and `pending` never exceeds `write_hwm` plus one per writer.
 
 Every write event is sent *after* the ETS mutation it describes, so the
 maintenance process can always find the entry when it processes a `:put`.
@@ -260,3 +266,20 @@ new process registers, and the mutation preceded the send.
   operators read, while the maintenance process already sees each call one
   at a time, so the count is exact and free. The bench takes the difference
   of two `info/1` reads around the mixed run.
+- 2026-10-29 (M2.11c): what "consumed" means for a `:put`. Until M2.11
+  the maintenance process decremented `pending` as soon as the policy had
+  applied the event, and evicted only in a pass's step 5, capped at
+  `evict_batch`. The A5 bound above was then unprovable and in fact false:
+  an entry whose event was applied but not yet evicted was in the table,
+  outside `pending`, and under saturating writers a pass applied up to
+  `write_batch * 4 + write_batch` events for at most `evict_batch`
+  removals, so the table grew by 256 per pass (`mix bench maintenance`
+  measured 156 k over the bound at `max_size` 1_000_000, 128 k still over
+  a second after the writers stopped; IMPLEMENTATION_PLAN.md discovered
+  issue 8). Raising the cap cannot fix it: whatever the cap, the sampler
+  can see the pass mid-way. The bound holds by construction only if the
+  `pending` decrement comes after the eviction the entry forces, which is
+  what "consumed" now says and what specs/04 §The pass does (eviction after
+  every applied `:put`). The call-path writer therefore waits for its own
+  entry's eviction, as Caffeine's writer runs `maintenance` inline when the
+  write buffer is full. The slack statement itself is unchanged.

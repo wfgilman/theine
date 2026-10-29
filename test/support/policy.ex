@@ -11,7 +11,7 @@ defmodule Theine.Test.Policy do
                          policy_module: Theine.Test.Policy})
       ...
       Theine.Maintenance.info(cache)   # sync with the process
-      Theine.Test.Policy.calls(cache)  #=> [:new, :on_write, :on_access, :evict]
+      Theine.Test.Policy.calls(cache)  #=> [:new, :on_write, :evict, :on_access, :evict]
 
   Without a listener the calls are forwarded and nothing is recorded.
 

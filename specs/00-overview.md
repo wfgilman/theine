@@ -50,11 +50,14 @@ list is the contract.
 - **A2 Throughput.** Aggregate `get` hit throughput at all schedulers is at
   least 0.65× raw ETS, and at least 2× both Cachex and Nebulex local `get` on
   the same harness.
-- **A3 Hit rate.** On every trace in the hit-rate suite, theine's hit rate is
-  at least that of the reference LRU, and on the looping and scan traces it is
-  at least 10 percentage points above LRU. When the Caffeine simulator is run
-  on the same trace with the same maximum size, theine is within 1 percentage
-  point of its W-TinyLFU result (human-verified gate, see specs/09).
+- **A3 Hit rate.** On every trace in the hit-rate suite, theine's hit rate
+  with its default policy (W-TinyLFU with the adaptive window) is at least
+  that of the reference LRU, and on the looping trace it is at least 10
+  percentage points above LRU. On no row is the adaptive window more than 1
+  percentage point below the fixed 1% window. When the Caffeine simulator is
+  run on the same trace with the same maximum size, theine is within 1
+  percentage point of the matching Caffeine policy (human-verified gate, see
+  specs/09).
 - **A4 Single-flight.** For any key, concurrent `fetch` callers invoke the
   loader exactly once per miss, and every waiter receives the loaded value or
   the loader's error. Refresh-after-write never blocks a reader.
@@ -69,8 +72,8 @@ list is the contract.
 
 - Expire-after-access (needs the policy's view of access time on the read
   path; planned for v2 via the read buffer).
-- Removal/eviction listeners, bulk `fetch_all`, adaptive window sizing.
-  These are M6 optional tasks, after the gate above is green.
+- Removal/eviction listeners and bulk `fetch_all`. These are M6 optional
+  tasks, after the gate above is green.
 - Distribution, replication, persistence, or an L2 adapter library. The
   loader is a function; what it calls is the user's business.
 - Weak/soft references, cache-wide locks, transactions.
@@ -120,8 +123,9 @@ list is the contract.
   TTL with lazy expiry on read, stats counters. Done when A1 and A2 hold with
   policy disabled (the bound is `:infinity`).
 - **M2 Policy.** specs/02, 03, 04, 05: sketch, read buffer, write events,
-  maintenance process, W-TinyLFU. Done when A3 (LRU comparison part) and A5
-  hold, and A1/A2 still hold with policy enabled.
+  maintenance process, W-TinyLFU with the adaptive window (on by default).
+  Done when A3 (LRU comparison part) and A5 hold, and A1/A2 still hold with
+  policy enabled.
 - **M3 Expiration.** specs/06: expiry index and sweep, `expire_after_write`
   default, `expire`/`persist`. Done when the expiry tests and
   `mix bench maintenance` pass.
@@ -129,8 +133,8 @@ list is the contract.
   `refresh_after_write`. Done when A4 holds under the stress suite.
 - **M5 Gate.** specs/09 and specs/10 in full: Cachex and Nebulex comparison,
   Caffeine simulator cross-check instructions, docs, `mix hex.build` clean.
-- **M6 Optional.** Adaptive window (specs/05 §Adaptive), eviction listener,
-  `fetch_all`, expire-after-access design note. Only after M5 is green.
+- **M6 Optional.** Eviction listener, `fetch_all`, expire-after-access
+  design note. Only after M5 is green.
 
 ## Decisions
 
@@ -170,3 +174,19 @@ list is the contract.
   hot path as lean as it can be, hits in a bounded cache are no longer
   counted with `:counters`; they are derived from the read-buffer tails
   (specs/01, 03, 08). The 2× margin over Cachex and Nebulex is unchanged.
+- 2026-10-29 (after M2.10, human decision): A3 restated. The +10-point margin
+  applies to the looping trace only. It was also written onto the OLTP rows,
+  which was an error in the original spec: OLTP is a recency-driven
+  database trace on which LRU is already near the best a policy can do, and
+  the ARC paper's own ARC reaches only +6.1 points over LRU at size 1_000.
+  The `theine ≥ lru` clause still applies to every row, OLTP included,
+  because losing to LRU on a recency-heavy workload is a real weakness for
+  a cache in front of a database. M2.10 measured the fixed 1% window at
+  +3.61, +0.18 and −1.01 points against LRU on OLTP at 1_000, 2_000 and
+  5_000, and a 20% window at +8.5, +4.6 and +1.7, so the remedy is the
+  adaptive window: it moved from M6 into M2 (IMPLEMENTATION_PLAN.md M2.13)
+  and is on by default, as in Caffeine (specs/05, 08). A new clause keeps
+  the climber honest on the frequency traces: it may not fall more than 1
+  point below the fixed window on any row (specs/09). The human gate
+  compares the default policy with Caffeine's hill-climber policy and the
+  fixed window with Caffeine's `WindowTinyLfu`.

@@ -23,7 +23,7 @@ children = [
 | `refresh_after_write` | ms or `:infinity` | `:infinity` | 07 |
 | `loader` | loader fun or nil | nil | 07 |
 | `window_percent` | 1..80 | 1 | 05 |
-| `adaptive` | boolean | false | 05 (M6) |
+| `adaptive` | boolean | true | 05 |
 | `stripes` | power of two | schedulers_online rounded up to a power of two | 03 |
 | `read_buffer_slots` | power of two | 64 | 03 |
 | `drain_threshold` | power of two | 32 | 03 |
@@ -238,3 +238,6 @@ specs/09.
   including the first, so a handler sees one event per start rather than
   having to tell a restart from a start. Off the hot path, as §Telemetry
   requires.
+- 2026-10-29 (after M2.10, human decision): `adaptive` defaults to true, as in
+  Caffeine; `adaptive: false` is the fixed-window policy (specs/05
+  §Adaptive window, specs/00 §Decisions).

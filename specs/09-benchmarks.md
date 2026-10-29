@@ -91,14 +91,20 @@ records the URLs and hashes it actually downloaded.
 
 **Thresholds**:
 
+`theine` is the default configuration, which has the adaptive window
+(specs/05). `theine_static` is the same cache with `adaptive: false` and
+the 1% window; the harness reports it on every row.
+
 - On every trace and size, `theine` hit rate ≥ `lru` hit rate.
-- On `loop` at 1_000 and on `OLTP` at 1_000 and 2_000, `theine` ≥ `lru` + 10
-  percentage points.
+- On `loop` at 1_000, `theine` ≥ `lru` + 10 percentage points.
+- On every trace and size, `theine` ≥ `theine_static` − 1 percentage point.
 - Human gate (M5, not run by the loop): run Caffeine's simulator
   (`./gradlew simulator:run` with the trace and `maximum-size` set) on the
-  same traces; `theine` must be within 1 percentage point of its
-  `WindowTinyLfu` policy on every row. Record the comparison table in
-  `IMPLEMENTATION_PLAN.md` §Final gate and in the README.
+  same traces. On every row, `theine` must be within 1 percentage point of
+  `HillClimberWindowTinyLfu` with the `simple` strategy (the climber
+  Caffeine's cache itself uses), and `theine_static` within 1 point of
+  `WindowTinyLfu`. Record the comparison table in `IMPLEMENTATION_PLAN.md`
+  §Final gate and in the README.
 
 ## `mix bench maintenance` (A5, specs/04 budget)
 
@@ -311,3 +317,13 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   exits non-zero on the three OLTP checks, and the question is recorded
   for a human in IMPLEMENTATION_PLAN.md §Open questions (1) with a
   recommended resolution.
+- 2026-10-29 (after M2.10, human decision): open question 1 resolved. The +10
+  margin is on `loop` 1_000 only; `theine ≥ lru` stays on every row,
+  OLTP included, and is met by the adaptive window, now the default
+  (specs/00 §Decisions). A `theine_static` subject (`adaptive: false`) is
+  added with the check `theine ≥ theine_static − 1` on every row, and the
+  human gate compares each subject with its Caffeine counterpart.
+  `bench/hitrate.exs` `@margin_rows` drops the OLTP rows; the
+  `theine_static` subject and its check arrive with the adaptive window
+  (IMPLEMENTATION_PLAN.md M2.13). Until then the bench still fails
+  `theine ≥ lru` on OLTP, as it should.

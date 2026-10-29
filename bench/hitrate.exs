@@ -16,7 +16,8 @@ defmodule Theine.Bench.Hitrate do
 
   # A3: theine >= lru everywhere, and by this many points on these rows.
   @margin 10.0
-  @margin_rows [{"loop", 1_000}, {"OLTP", 1_000}, {"OLTP", 2_000}]
+  # OLTP carries no margin (specs/09 §Decisions 2026-10-29).
+  @margin_rows [{"loop", 1_000}]
 
   # The `theine` row runs at the specs/05 default window; other percentages
   # of a sweep are reported as `theine_w<p>` with no threshold.

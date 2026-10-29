@@ -16,7 +16,8 @@ Given `max_size` (total weight):
 
 These are Caffeine's defaults (1% window, 80/20 main split). The window
 percentage is a `start_link` option `window_percent` (default 1), so the
-hit-rate bench can sweep it; adaptive sizing (§Adaptive) is M6.
+hit-rate bench can sweep it, and it is the starting size for the adaptive
+window (§Adaptive window), which is on by default and moves it from there.
 
 ## State (private ETS, owned by maintenance)
 
@@ -148,15 +149,29 @@ Called after every applied `:put` event and once in every maintenance pass
 
 Frequencies come from `Sketch.frequency/2` at the moment of comparison.
 
-## Adaptive window (M6, optional)
+## Adaptive window
 
 Caffeine's hill climber: every `10 * max_size` reads, compare the hit rate
 of the sample with the previous sample; if it improved, keep moving the
 window size in the same direction, else reverse; step size starts at 6.25%
 of `max_size` and decays by 0.98 per step; restart with the full step when
 the hit-rate delta exceeds 5 percentage points. Resizing moves entries
-between window and probation at their LRU ends. Behind `adaptive: true`,
-default false, and must not change any non-adaptive test result.
+between window and probation at their LRU ends.
+
+On by default: `adaptive: true` (specs/08). `adaptive: false` keeps the
+window fixed at `window_percent` and must reproduce every fixed-window test
+result unchanged; the hit-rate bench runs both (specs/09).
+
+The climber runs in the maintenance pass (specs/04 step 7) and never on the
+hit path. Its sample is counted inside the maintenance process: a hit is an
+access drained from the read buffer, and a miss is a `:put` event for a key
+the policy does not hold (in a cache, an insert of a new key follows a
+miss). It therefore works with `stats: false` and never reads the stats
+counters. The read buffer drops accesses under load, so the sample
+under-counts hits when the cache is busiest; that biases the absolute rate
+but not the direction of a change between consecutive samples, which is all
+the climber compares. A sample is `10 * max_size` requests (hits plus
+misses as counted here).
 
 ## Acceptance
 
@@ -233,7 +248,9 @@ default false, and must not change any non-adaptive test result.
   the rule names, and demotion never touches it, since once the others are
   gone its weight alone fits. Demotion is immediate, inside `on_access`, as
   the rule says; Caffeine defers it to the end of the pass, which makes no
-  observable difference without the adaptive climber (M6). Unbounded
+  observable difference with a fixed window. The task that adds the
+adaptive window (§Adaptive window) checks whether it still makes none once
+the window moves, and records the answer in §Decisions. Unbounded
   policies return the state unchanged (no order, no sketch, no read buffer
   to drain), and an access whose fresh `seq` would be the sentinel raises
   as a write does.
@@ -316,3 +333,9 @@ default false, and must not change any non-adaptive test result.
   1`) the two are identical, and the full `mix bench hitrate` run after
   the change (IMPLEMENTATION_PLAN.md §Benchmark log M2.11c) is the record
   of what the default 32-access batches lose or gain.
+- 2026-10-29 (after M2.10, human decision): the adaptive window moved from M6
+  into M2 and is on by default (`adaptive: true`), so that `theine ≥ lru`
+  holds on recency-driven traces such as OLTP (specs/00 §Decisions). Its
+  sample is counted from drained accesses and new-key `:put` events inside
+  the maintenance process (§Adaptive window), so it adds nothing to the hit
+  path and works with `stats: false`.

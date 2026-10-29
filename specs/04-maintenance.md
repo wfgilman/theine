@@ -53,9 +53,11 @@ cache over capacity still converges.
 Order, matching Caffeine:
 
 1. **Flush write events.** Before touching the buffers, receive whatever
-   write events are still queued in the mailbox, up to `write_batch * 4`,
+   write events are still queued in the mailbox, up to `write_batch`,
    applying them exactly as above. This keeps a pass from acting on a policy
-   view that is behind the mailbox and lets backpressure clear quickly.
+   view that is far behind the mailbox. It does no work the process would
+   not do anyway, since events are applied on arrival; the cap bounds how
+   much of it lands inside one pass (§Decisions M2.11d).
 2. **Clear the drain flag** (`:atomics.put(flags, drain_flag, 0)`), so that
    readers can schedule the next pass while this one runs.
 3. **Drain the read buffer** via `ReadBuffer.drain/2`, calling
@@ -88,7 +90,7 @@ without waiting for a trigger.
 
 One pass must complete in at most `pass_budget` ms of wall time (default 5)
 on the reference machine for a `max_size` of 1,000,000, measured by
-`mix bench maintenance`. The caps above (`write_batch * 4`, `stripes *
+`mix bench maintenance`. The caps above (`write_batch`, `stripes *
 slots`, `expire_batch`, `reset_chunk`, and an eviction cap of
 `evict_batch` = 1024 per pass) are what make this hold. Do not remove a cap
 to simplify code; raise the cap and re-measure instead.
@@ -141,7 +143,7 @@ reports the scan's `duration`, `entries` and `chunks`.
   config) records the call order within one pass as writes (each `:put`
   followed by its own evict), reads, expire, evict.
 - Caps: with 10,000 queued write events and a full read buffer, one pass
-  consumes at most `write_batch * 4` events and at most `stripes * slots`
+  consumes at most `write_batch` events and at most `stripes * slots`
   reads, and schedules a follow-up pass.
 - Budget: `mix bench maintenance` reports p99 pass duration under
   `pass_budget` at `max_size` 1,000,000 under the mixed workload in specs/09.
@@ -327,3 +329,36 @@ reports the scan's `duration`, `entries` and `chunks`.
   policy's view of a batch (each insert admitted before the reads around
   it rather than after) is recorded in specs/05 §Decisions M2.11c with the
   hit-rate run.
+- 2026-10-29 (M2.11d): the step-1 flush is capped at `write_batch`, down
+  from `write_batch * 4`. §Budget says to raise a cap rather than remove
+  it; this one goes down, because it bounds work that is not the pass's own.
+  Since M2.11c every event is applied, and its eviction run, the moment it
+  is received, in a pass or out of one, so the flush moves no work in or
+  out of the process. It only decides how much of the mailbox's work is
+  counted inside one pass's duration, and with it how long the reads in
+  step 3 wait. The budget limits a pass's latency, not the process's
+  throughput. Measured with the pass split by step (a temporary
+  instrumentation, probe `bench/results/pass-steps-m211d.exs`, gitignored)
+  in the `mix bench maintenance` mixed run at `max_size` 1_000_000: a
+  saturated process flushed the full 1024 events in most passes, at 6.3 µs
+  each with their evictions under four workers on the two-core reference
+  machine. The flush was the pass: p50 6.3 ms of 6.5, and all of the
+  slowest 1% (12.1 ms, no reads drained). Drain took 0.5 ms at p50 (3.6 µs
+  per read), and evict and age 1 µs each (the 30 s run never reaches the
+  10 M increments that start a reset at that size). At `write_batch` the
+  flush is 1.5 ms at p50 and 2.6 ms at p99, and the pass is 1.6 ms and
+  3.2 ms. The process runs about 2.5 times as many passes, with the same
+  mixed-run throughput (1_918_383 against 1_915_998 writes in 15 s) and
+  about the same reads drained in total. Through the bench the pass went
+  from p99 8.7–9.4 ms and max 15.7–23.5 ms to p99 3.3 ms and max 5.9–6.1
+  ms, with both A5 checks still at the bound. The write run's throughput
+  varies by ±15% from run to run whichever cap is in place: 2_477_144
+  and 2_710_076 puts with this cap, 2_340_764 with the old cap on the same
+  day, and 2_796_211 for M2.11c. A cap of `write_batch` is also the
+  smallest that keeps one pass per `write_batch` arrivals under a full
+  mailbox, since the write-count trigger counts the flushed events too. A
+  `start_link` option was not needed. The remaining risk to the budget is
+  sketch aging: at `max_size` 10_000 a 16_384-word chunk took 2.4 ms under
+  this load, so a pass that ages while it flushes a full cap reaches about
+  6 ms. That is at most 64 passes per reset at 1_000_000, under 1% of
+  passes, so the p99 still holds there.

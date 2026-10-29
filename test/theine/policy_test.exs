@@ -9,10 +9,21 @@ defmodule Theine.PolicyTest do
   # The entries table the policy consults on a stale removal (specs/05
   # §Events `on_remove`). Named after the config's table, owned by the test
   # process, so it disappears with it; tests in one module run one at a time.
+  # The runtime frees a dead owner's tables asynchronously, so the next
+  # test's `:ets.new/2` could find the name still taken: each test waits
+  # for its table to be gone before the next one starts.
   setup do
     config = config(:infinity)
     table = :ets.new(config.table, [:set, :public, :named_table])
+    on_exit(fn -> await_table_gone(config.table) end)
     %{policy: Policy.new(config), sizes: config.sizes, table: table}
+  end
+
+  defp await_table_gone(name) do
+    if :ets.whereis(name) != :undefined do
+      Process.sleep(1)
+      await_table_gone(name)
+    end
   end
 
   # A config as Theine.Owner would complete it, without starting a cache:

@@ -32,7 +32,7 @@ defmodule Theine.MaintenanceTest do
   # emission time.
   defp attach_pass_handler(cache) do
     handler = {__MODULE__, cache}
-    config = %{test: self(), flags: Config.get(cache).flags}
+    config = %{test: self(), cache: cache, flags: Config.get(cache).flags}
 
     :ok =
       :telemetry.attach(
@@ -45,12 +45,16 @@ defmodule Theine.MaintenanceTest do
     on_exit(fn -> :telemetry.detach(handler) end)
   end
 
-  def handle_pass(_event, measurements, metadata, %{test: test, flags: flags}) do
+  # Only the attached cache's passes: the async tests' caches all emit the
+  # same event, and a test that refutes a further pass must not see theirs.
+  def handle_pass(_event, measurements, %{cache: cache} = metadata, %{cache: cache} = config) do
     at = System.monotonic_time()
     {:message_queue_len, len} = Process.info(self(), :message_queue_len)
-    flag = :atomics.get(flags, @drain_flag)
-    send(test, {:pass, measurements, metadata, %{at: at, queue: len, flag: flag}})
+    flag = :atomics.get(config.flags, @drain_flag)
+    send(config.test, {:pass, measurements, metadata, %{at: at, queue: len, flag: flag}})
   end
+
+  def handle_pass(_event, _measurements, _metadata, _config), do: :ok
 
   defp ms(n), do: System.convert_time_unit(n, :millisecond, :native)
 
@@ -441,7 +445,7 @@ defmodule Theine.MaintenanceTest do
       assert Theine.stats(cache).evictions == 5
     end
 
-    test "10_000 queued write events and a full read buffer: one pass consumes at most write_batch * 4 events and stripes * slots reads and schedules a follow-up" do
+    test "10_000 queued write events and a full read buffer: one pass consumes at most write_batch events and stripes * slots reads and schedules a follow-up" do
       cache = unique_cache()
 
       start_supervised!(
@@ -463,14 +467,15 @@ defmodule Theine.MaintenanceTest do
       for i <- 1..10_000, do: send(name, {:put, i, i, 1, :infinity})
       :ok = Maintenance.resume(cache)
 
-      # The first pass: 1024 of the events in step 1, at most 16 reads in
-      # step 3, and, because a stripe was full, the follow-up :drain queued
-      # behind the 8_976 events still in the mailbox with the flag set again.
+      # The first pass: 256 of the events in step 1 (the cap is write_batch,
+      # specs/04 §Decisions M2.11d), at most 16 reads in step 3, and,
+      # because a stripe was full, the follow-up :drain queued behind the
+      # 9_744 events still in the mailbox with the flag set again.
       assert_receive {:pass, measurements, %{cache: ^cache}, %{queue: queue, flag: 1}}, 5_000
-      assert measurements.writes == config.write_batch * 4
+      assert measurements.writes == config.write_batch
       assert measurements.reads <= config.stripes * config.read_buffer_slots
       assert measurements.reads > 0
-      assert queue == 10_000 - config.write_batch * 4 + 1
+      assert queue == 10_000 - config.write_batch + 1
 
       # The rest drains through the write-count trigger and the follow-up.
       assert_eventually(fn -> Maintenance.info(cache).pending == 0 end, 5_000)

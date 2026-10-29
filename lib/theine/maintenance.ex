@@ -34,7 +34,7 @@ defmodule Theine.Maintenance do
   A pass runs on a `:drain` message from a reader (specs/03
   §`schedule_drain/1`), on the `maintenance_interval` timer, on `run/1`, and
   once `write_batch` events have been applied since the last pass. In order
-  (specs/04 §The pass): flush up to `write_batch * 4` write events still
+  (specs/04 §The pass): flush up to `write_batch` write events still
   queued in the mailbox, clear the drain flag, drain the read buffer into
   `Theine.Policy.on_access/2`, evict with `Theine.Policy.evict/1` (a no-op
   unless a rebuild or a capped per-event eviction left the cache over
@@ -531,9 +531,11 @@ defmodule Theine.Maintenance do
   defp pass(%__MODULE__{config: config, module: module} = state) do
     started = System.monotonic_time()
 
-    # 1. Flush queued write events, capped, so the pass sees a policy that is
-    #    not behind the mailbox and backpressure clears quickly.
-    state = flush(state, config.write_batch * 4)
+    # 1. Flush queued write events, capped at `write_batch`, so the pass sees
+    #    a policy that is not far behind the mailbox. Events are applied on
+    #    arrival anyway, so the cap bounds the pass's length, not the
+    #    process's throughput (specs/04 §Decisions M2.11d).
+    state = flush(state, config.write_batch)
 
     # 2. Clear the drain flag before reading the buffer: a reader that
     #    crosses the threshold from here on schedules the next pass. Not

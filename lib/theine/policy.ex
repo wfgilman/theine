@@ -18,7 +18,11 @@ defmodule Theine.Policy do
   its current segment; both count the key in the frequency sketch
   (specs/02). A read drained from the read buffer (`on_access/2`) moves the
   key to the MRU of its segment, promoting a probation key to protected.
-  Admission and eviction (`evict/1`) arrive with M2.6.
+  `evict/1`, run once per maintenance pass, overflows the window into
+  probation and, while the cache is over `max_size`, decides between the
+  probation LRU victim and each window overflow by their sketch
+  frequencies, removing the loser from the entries table and the tables
+  here (specs/05 §Events `evict`).
 
   `max_size: :infinity` disables admission and eviction (specs/08 §Starting
   a cache): there is no `order` table and no sketch, and `segment` is `nil`.
@@ -61,34 +65,53 @@ defmodule Theine.Policy do
           order: :ets.table() | nil,
           table: Config.cache(),
           sizes: :atomics.atomics_ref(),
+          counters: :counters.counters_ref(),
           sketch: Sketch.t() | nil,
           max_size: pos_integer() | :infinity,
           window_max: pos_integer() | nil,
           protected_max: non_neg_integer() | nil,
+          evict_batch: pos_integer() | nil,
           window_weight: non_neg_integer(),
           probation_weight: non_neg_integer(),
           protected_weight: non_neg_integer(),
           sketch_size: non_neg_integer(),
-          next_seq: pos_integer()
+          next_seq: pos_integer(),
+          candidates: non_neg_integer(),
+          cursor: non_neg_integer() | nil,
+          candidate_floor: pos_integer() | nil
         }
 
-  @enforce_keys [:policy, :ids, :table, :sizes, :max_size]
+  @enforce_keys [:policy, :ids, :table, :sizes, :counters, :max_size]
   defstruct [
     :policy,
     :ids,
     :order,
     :table,
     :sizes,
+    :counters,
     :sketch,
     :max_size,
     :window_max,
     :protected_max,
+    :evict_batch,
     window_weight: 0,
     probation_weight: 0,
     protected_weight: 0,
     sketch_size: 0,
-    next_seq: 1
+    next_seq: 1,
+    candidates: 0,
+    cursor: nil,
+    candidate_floor: nil
   ]
+
+  # Caffeine's hash-DoS guard (specs/05 §Events `evict`): a candidate that
+  # ties or loses but has at least this frequency is still admitted one
+  # time in 128, so a flood of fresh keys cannot pin the main region.
+  @admit_threshold 6
+  @admit_odds 128
+
+  # The `evictions` counter (specs/08 §Stats), resolved at compile time.
+  @evictions Theine.Stats.evictions()
 
   # Positions in a policy row (1-based, for :ets.update_element/3).
   @row_id 2
@@ -149,12 +172,13 @@ defmodule Theine.Policy do
   (specs/04 §Restart semantics).
   """
   @spec new(Config.t()) :: t()
-  def new(%Config{table: table, sizes: sizes, max_size: :infinity}) do
+  def new(%Config{table: table, sizes: sizes, counters: counters, max_size: :infinity}) do
     state = %__MODULE__{
       policy: :ets.new(__MODULE__, [:set, :private]),
       ids: :ets.new(__MODULE__.Ids, [:set, :private]),
       table: table,
       sizes: sizes,
+      counters: counters,
       max_size: :infinity
     }
 
@@ -165,8 +189,10 @@ defmodule Theine.Policy do
   def new(%Config{
         table: table,
         sizes: sizes,
+        counters: counters,
         max_size: max_size,
         window_percent: window_percent,
+        evict_batch: evict_batch,
         sketch: %Sketch{} = sketch
       })
       when is_integer(max_size) do
@@ -179,10 +205,12 @@ defmodule Theine.Policy do
       order: :ets.new(__MODULE__.Order, [:ordered_set, :private]),
       table: table,
       sizes: sizes,
+      counters: counters,
       sketch: sketch,
       max_size: max_size,
       window_max: window_max,
-      protected_max: protected_max
+      protected_max: protected_max,
+      evict_batch: evict_batch
     }
 
     publish(state, 0, 0)
@@ -216,7 +244,10 @@ defmodule Theine.Policy do
           ])
 
         add(state, 0, weight - old_weight)
-        add_segment(state, segment, weight - old_weight)
+
+        state
+        |> add_segment(segment, weight - old_weight)
+        |> fit(key, segment, weight, old_weight)
 
       [{^key, old_id, segment, old_seq, old_weight, _old_expires_at}] ->
         # The access first: it claims the seq, and a refused seq (the
@@ -233,9 +264,31 @@ defmodule Theine.Policy do
           ])
 
         add(state, 0, weight - old_weight)
-        add_segment(state, segment, weight - old_weight)
+
+        state
+        |> add_segment(segment, weight - old_weight)
+        |> fit(key, segment, weight, old_weight)
     end
   end
+
+  # After a protected key grew heavier the segment must still fit
+  # (specs/05 §Decisions M2.6): a key now heavier than `protected_max`
+  # moves to the probation MRU, as a promotion would send it there, and
+  # otherwise the protected LRU entries are demoted until the segment fits.
+  defp fit(state, key, :protected, weight, old_weight) when weight > old_weight do
+    if weight > state.protected_max do
+      [{^key, _id, :protected, seq, ^weight, _expires_at}] = :ets.lookup(state.policy, key)
+
+      state
+      |> move(key, :protected, seq, :probation)
+      |> add_segment(:protected, -weight)
+      |> add_segment(:probation, weight)
+    else
+      demote(state)
+    end
+  end
+
+  defp fit(state, _key, _segment, _weight, _old_weight), do: state
 
   defp insert(%__MODULE__{order: nil} = state, key, id, weight, expires_at) do
     seq = next_seq(state)
@@ -354,6 +407,202 @@ defmodule Theine.Policy do
   end
 
   @doc """
+  One eviction step of the maintenance pass (specs/05 §Events `evict`;
+  specs/04 §The pass step 5). Returns `{status, evicted, state}` where
+  `evicted` is the number of entries removed from the entries table and
+  `status` is `:done` when the weight fits `max_size`, or `:more` when the
+  pass stopped at `evict_batch` removals while still over it, in which case
+  the caller schedules a follow-up pass. Without a bound it is `{:done, 0,
+  state}`.
+
+  1. While `window_weight > window_max`, the window LRU entry moves to the
+     probation MRU and counts as a candidate.
+  2. While the three segment weights sum to more than `max_size`: the
+     victim is the probation LRU (the protected LRU when probation is
+     empty, the window LRU when both are). With no candidate left the
+     victim is removed outright. Otherwise the candidate is the entry under
+     the cursor, which starts at the probation MRU and walks toward the LRU
+     one entry per decision, so each window overflow is tested once. When
+     the candidate is the victim it is removed; else the candidate is
+     admitted, and the victim removed, when its sketch frequency exceeds
+     the victim's, or with odds of 1 in #{@admit_odds} when it is at least
+     #{@admit_threshold} (the hash-DoS guard); otherwise the candidate is
+     removed.
+
+  Removal re-reads the entries table and deletes the exact tuple only when
+  its id is the policy's (specs/04 §Removing an entry), counting it in
+  `evictions`; a key the table holds under another id, or not at all, was
+  replaced or deleted concurrently and only its policy rows go, since the
+  event already in flight will account for the live version.
+
+  The candidate count and the cursor are carried in the state across a
+  `:more` so that a follow-up pass keeps testing the overflows the capped
+  pass left; a follow-up whose step 1 appended new overflows restarts the
+  cursor at the probation MRU. The walk never goes below the `seq` of the
+  batch's first overflow: an entry under it was in probation before the
+  batch and has been tested already, so reaching one, or the LRU end,
+  settles whatever count is left (specs/05 §Decisions M2.6).
+  """
+  @spec evict(t()) :: {:done | :more, non_neg_integer(), t()}
+  def evict(%__MODULE__{order: nil} = state), do: {:done, 0, state}
+
+  def evict(%__MODULE__{} = state) do
+    first_seq = state.next_seq
+    {state, overflowed} = overflow(state, 0)
+
+    state =
+      if overflowed > 0 do
+        %{
+          state
+          | candidates: state.candidates + overflowed,
+            cursor: nil,
+            candidate_floor: if(state.candidates == 0, do: first_seq, else: state.candidate_floor)
+        }
+      else
+        state
+      end
+
+    evict_main(state, 0, 0)
+  end
+
+  # Step 1: window overflow into the probation MRU, each move a candidate.
+  defp overflow(%__MODULE__{window_weight: w, window_max: max} = state, n) when w <= max,
+    do: {state, n}
+
+  defp overflow(%__MODULE__{order: order, policy: policy} = state, n) do
+    {:window, seq} = order_key = :ets.next(order, {:window, 0})
+    key = :ets.lookup_element(order, order_key, 2)
+    weight = :ets.lookup_element(policy, key, @row_weight)
+
+    state
+    |> move(key, :window, seq, :probation)
+    |> add_segment(:window, -weight)
+    |> add_segment(:probation, weight)
+    |> overflow(n + 1)
+  end
+
+  # Step 2, one removal per round, `removals` capped by `evict_batch`.
+  defp evict_main(%__MODULE__{} = state, removals, evicted) do
+    cond do
+      total(state) <= state.max_size ->
+        {:done, evicted, settled(state)}
+
+      removals >= state.evict_batch ->
+        {:more, evicted, state}
+
+      true ->
+        {state, n} = decide(state)
+        evict_main(state, removals + 1, evicted + n)
+    end
+  end
+
+  defp total(%__MODULE__{window_weight: w, probation_weight: p, protected_weight: m}),
+    do: w + p + m
+
+  defp decide(%__MODULE__{order: order, candidates: candidates} = state) do
+    case :ets.next(order, {:probation, 0}) do
+      {:probation, _victim_seq} = victim_key when candidates == 0 ->
+        remove(state, :ets.lookup_element(order, victim_key, 2))
+
+      {:probation, victim_seq} = victim_key ->
+        victim = :ets.lookup_element(order, victim_key, 2)
+
+        case candidate(state) do
+          nil ->
+            # The cursor walked past the batch's overflows: every remaining
+            # probation entry has been tested, so the leftover count is
+            # settled.
+            remove(settled(state), victim)
+
+          {^victim_seq, ^victim} ->
+            remove(%{state | candidates: candidates - 1, cursor: 0}, victim)
+
+          {seq, candidate} ->
+            # The next cursor position is fixed before anything is deleted.
+            state = %{state | candidates: candidates - 1, cursor: previous(order, seq)}
+
+            if admit?(state, candidate, victim),
+              do: remove(state, victim),
+              else: remove(state, candidate)
+        end
+
+      _probation_empty ->
+        case :ets.next(order, {:protected, 0}) do
+          {:protected, _seq} = order_key ->
+            remove(state, :ets.lookup_element(order, order_key, 2))
+
+          _protected_empty ->
+            {:window, _seq} = order_key = :ets.next(order, {:window, 0})
+            remove(state, :ets.lookup_element(order, order_key, 2))
+        end
+    end
+  end
+
+  defp settled(state), do: %{state | candidates: 0, cursor: nil, candidate_floor: nil}
+
+  # The entry under the cursor: the probation entry at the cursor's seq
+  # when it still exists, else the nearest one below it, as long as it was
+  # placed since the batch began. `nil` cursor means the probation MRU, `0`
+  # means the walk is over.
+  defp candidate(%__MODULE__{order: order, cursor: cursor, candidate_floor: floor}) do
+    bound = cursor || @max_seq
+
+    found =
+      case :ets.lookup(order, {:probation, bound}) do
+        [{{:probation, ^bound}, key}] ->
+          {bound, key}
+
+        [] ->
+          case :ets.prev(order, {:probation, bound}) do
+            {:probation, seq} = order_key -> {seq, :ets.lookup_element(order, order_key, 2)}
+            _ -> nil
+          end
+      end
+
+    case found do
+      {seq, _key} when is_integer(floor) and seq < floor -> nil
+      other -> other
+    end
+  end
+
+  defp previous(order, seq) do
+    case :ets.prev(order, {:probation, seq}) do
+      {:probation, prev} -> prev
+      _ -> 0
+    end
+  end
+
+  defp admit?(%__MODULE__{sketch: sketch}, candidate, victim) do
+    candidate_freq = Sketch.frequency(sketch, candidate)
+
+    cond do
+      candidate_freq > Sketch.frequency(sketch, victim) -> true
+      candidate_freq >= @admit_threshold -> :rand.uniform(@admit_odds) == 1
+      true -> false
+    end
+  end
+
+  # Removes `key` (specs/04 §Removing an entry): the entries table keeps a
+  # version under another id, or none, when a put or delete raced the
+  # policy, and that version's event settles the rows this drops.
+  defp remove(%__MODULE__{policy: policy, table: table, counters: counters} = state, key) do
+    [{^key, id, _segment, _seq, _weight, _expires_at} = row] = :ets.lookup(policy, key)
+
+    evicted =
+      case :ets.lookup(table, key) do
+        [{^key, _value, ^id, _weight, _written_at, _expires_at} = entry] ->
+          true = :ets.delete_object(table, entry)
+          :counters.add(counters, @evictions, 1)
+          1
+
+        _replaced_or_gone ->
+          0
+      end
+
+    {drop(state, row), evicted}
+  end
+
+  @doc """
   Applies a `{:removed, key, id}` event (specs/05 §Events `on_remove`).
 
   The rows are deleted when `id` is the key's current id. A removal with
@@ -397,7 +646,17 @@ defmodule Theine.Policy do
     if state.order, do: true = :ets.delete_all_objects(state.order)
     if state.sketch, do: :ok = Sketch.clear(state.sketch)
     publish(state, 0, 0)
-    %{state | window_weight: 0, probation_weight: 0, protected_weight: 0, sketch_size: 0}
+
+    %{
+      state
+      | window_weight: 0,
+        probation_weight: 0,
+        protected_weight: 0,
+        sketch_size: 0,
+        candidates: 0,
+        cursor: nil,
+        candidate_floor: nil
+    }
   end
 
   @doc "The policy row of `key`, for tests and `info/1`."

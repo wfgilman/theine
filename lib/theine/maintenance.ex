@@ -152,7 +152,28 @@ defmodule Theine.Maintenance do
     config = Config.get(cache)
     :atomics.put(config.pending, 1, 0)
     :atomics.put(config.flags, Theine.Owner.drain_flag(), 0)
+    seed_rand(cache)
     {:ok, %__MODULE__{cache: cache, config: config, policy: Policy.new(config)}}
+  end
+
+  @doc """
+  The `:rand` seed of the maintenance process of `cache`, derived from the
+  cache name so that admission's random guard (specs/05 §Events `evict`)
+  makes the same decisions every time a trace is replayed through
+  `mix bench hitrate`.
+
+      iex> Theine.Maintenance.rand_seed(:sessions) == Theine.Maintenance.rand_seed(:sessions)
+      true
+  """
+  @spec rand_seed(Config.cache()) :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
+  def rand_seed(cache) when is_atom(cache) do
+    hash = :erlang.phash2(cache)
+    {hash, hash, hash}
+  end
+
+  defp seed_rand(cache) do
+    _ = :rand.seed(:exsss, rand_seed(cache))
+    :ok
   end
 
   @impl true

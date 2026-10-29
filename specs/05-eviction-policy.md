@@ -58,6 +58,11 @@ is the main structural concession to the BEAM.
   update, or a queued event replayed after a restart rebuild): update
   `expires_at` and weight only. No sketch increment, no MRU move. Changing
   an entry's expiry is not an access.
+- In both known-key cases, a protected key that grew heavier must still
+  fit: if its new weight exceeds `protected_max` it moves to probation MRU
+  (as `on_access` would refuse to promote it), else protected LRU entries
+  are demoted to probation MRU until `protected_weight <= protected_max`
+  (§Decisions M2.6).
 - Admission of oversized entries never happens here; `put/4` rejected them
   (specs/01).
 
@@ -84,8 +89,9 @@ Look up `ids`; if `id` is not the key's current id in `policy`, skip. Else
 
 ### `evict()`
 
-Called in the maintenance pass while `window_weight + probation_weight +
-protected_weight > max_size`, at most `evict_batch` removals per pass:
+Called once in every maintenance pass; step 1 always runs, step 2 while
+`window_weight + probation_weight + protected_weight > max_size`, at most
+`evict_batch` removals per pass (§Decisions M2.6):
 
 1. While `window_weight > window_max`: take the window LRU entry, move it
    to probation MRU (`window_weight -= w`, `probation_weight += w`) and
@@ -144,7 +150,7 @@ default false, and must not change any non-adaptive test result.
 - Invariant (property test over random put/access/remove sequences,
   checked after every operation): every key in `policy` has exactly one row
   in `order` and one in `ids`; segment weights equal the sums over `policy`;
-  `protected_weight <= protected_max` after `on_access`; no `order` row has
+  `protected_weight <= protected_max` after every event; no `order` row has
   a key absent from `policy`.
 - Bounded: after `evict/0` returns `:done`, total weight ≤ `max_size`.
 - Admission: with a victim of frequency 3 and a candidate of frequency 5, the
@@ -218,3 +224,47 @@ default false, and must not change any non-adaptive test result.
   policies return the state unchanged (no order, no sketch, no read buffer
   to drain), and an access whose fresh `seq` would be the sentinel raises
   as a write does.
+- 2026-10-28 (M2.6): `Policy.evict(state)` returns `{:done | :more,
+  evicted, state}`, with `evicted` the number of entries removed from the
+  entries table in this call, so that the pass (specs/04 step 8) reports it
+  without reading the counter back. Step 1 runs on every call, not only
+  when the cache is over `max_size`: Caffeine's `evictFromWindow` runs on
+  every maintenance, and an under-capacity cache whose window never
+  overflowed would hold everything in the window until it filled, so that
+  no read could promote anything to protected before the first eviction;
+  the pass therefore calls `evict/1` unconditionally (it costs two
+  comparisons when there is nothing to do). The removal count that
+  `evict_batch` caps includes the rows dropped on a stale re-lookup; the
+  returned `evicted` and the `evictions` counter count table deletions
+  only. The re-lookup drops the policy rows of a key the table holds under
+  another id or not at all, without touching the table: the `:put` or
+  `:removed` event already in flight re-adds or settles the key, and
+  keeping the row would leave the victim at the LRU forever. The
+  carried-over cursor is the `seq` of the next candidate, resolved on use
+  to the probation entry at that `seq` or the nearest below it, since
+  events applied between passes may have moved or removed it; a follow-up
+  pass whose step 1 appended new overflows restarts the cursor at the
+  probation MRU (they are the freshest candidates, and the paragraph
+  above's "starts at probation MRU" stays true whenever step 1 moved
+  anything). The walk stops at the `seq` of the batch's first overflow
+  (kept as `candidate_floor` while a batch is open): a probation entry
+  below it was there before the batch and has been tested, so reaching
+  one, or the LRU end, sets `candidates` to 0. Without the floor a count
+  left over after a carried candidate was promoted or removed between
+  passes would retest, and on a tie evict, the probation MRU. A window
+  overflow heavier than `protected_max` is not special here; it is tested
+  like any candidate. The `:rand` seed is `{h, h, h}` with
+  `h = :erlang.phash2(name)`, exposed as `Theine.Maintenance.rand_seed/1`
+  and applied in `init/1`. The policy struct carries `evict_batch` and the
+  stats counters (for `evictions`) from the config, and `candidates`,
+  `cursor` and `candidate_floor` between calls; `reset/1` clears them.
+  The eviction property (random puts, accesses, removals and evictions
+  with `evict_batch` 2 against `max_size` 20) also found that `on_write`
+  of a protected key with a larger weight left `protected_weight` above
+  `protected_max`, since only `on_access` demoted: a rewrite of a 7-weight
+  protected key to 9 at `protected_max` 15 with another protected key
+  present. Caffeine keeps the segment within its limit with
+  `demoteFromMainProtected` at the end of every maintenance; here, where
+  demotion is immediate (M2.5), `on_write` now applies the `on_access`
+  rule after a weight increase, so the §Acceptance invariant holds after
+  every event, not only after `on_access`.

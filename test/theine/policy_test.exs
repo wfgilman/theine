@@ -2,7 +2,7 @@ defmodule Theine.PolicyTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
-  alias Theine.{Config, Policy, Sketch}
+  alias Theine.{Config, Policy, Sketch, Stats}
 
   doctest Policy
 
@@ -16,13 +16,15 @@ defmodule Theine.PolicyTest do
   end
 
   # A config as Theine.Owner would complete it, without starting a cache:
-  # the sizes atomics always, the sketch only under a bound.
+  # the sizes atomics and the stats counters always, the sketch only under
+  # a bound.
   defp config(max_size, opts \\ []) do
     config = Config.new!([name: :policy_test, max_size: max_size] ++ opts)
 
     %{
       config
       | sizes: :atomics.new(2, signed: true),
+        counters: :counters.new(Stats.field_count(), [:write_concurrency]),
         sketch: if(is_integer(max_size), do: Sketch.new(max_size), else: nil)
     }
   end
@@ -33,6 +35,25 @@ defmodule Theine.PolicyTest do
 
   defp keys_in_order(policy, segment) do
     for {{^segment, _seq}, key} <- Policy.order_rows(policy), do: key
+  end
+
+  defp evictions(policy), do: :counters.get(policy.counters, Stats.evictions())
+
+  defp total(policy), do: policy |> Policy.weights() |> Map.values() |> Enum.sum()
+
+  # A put as the maintenance process sees it: the entry is in the table
+  # before its event arrives.
+  defp put(policy, table, key, id, weight \\ 1) do
+    :ets.insert(table, entry(key, id, weight))
+    Policy.on_write(policy, key, id, weight, :infinity)
+  end
+
+  # Raises the sketch frequency of `key` to `freq` (on_write counted it once).
+  defp bump(policy, key, freq) do
+    Enum.reduce(1..(freq - Sketch.frequency(policy.sketch, key))//1, policy, fn _, policy ->
+      Sketch.increment(policy.sketch, key)
+      policy
+    end)
   end
 
   test "new/1 publishes zero sizes", %{sizes: sizes} do
@@ -166,6 +187,62 @@ defmodule Theine.PolicyTest do
       assert keys_in_order(policy, :window) == [:w]
       assert Policy.weights(policy) == %{window: 1, probation: 5, protected: 0}
       assert Policy.weighted_size(policy.sizes) == 6
+    end
+
+    test "a heavier rewrite of a protected key demotes the protected LRU until it fits", %{
+      table: table
+    } do
+      # protected_max is 79 at max_size 100.
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 30, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 30, :infinity)
+      policy = Policy.on_write(policy, :c, 3, 1, :infinity)
+      policy = Enum.reduce([:a, :b], policy, &place(&2, &1, :protected))
+
+      # 40 + 30 fits: no demotion, a moves to the protected MRU.
+      :ets.insert(table, entry(:a, 4, 40))
+      policy = Policy.on_write(policy, :a, 4, 40, :infinity)
+      assert keys_in_order(policy, :protected) == [:b, :a]
+      assert Policy.weights(policy) == %{window: 1, probation: 0, protected: 70}
+
+      # 40 + 50 does not: the LRU, a, is demoted to the probation MRU.
+      :ets.insert(table, entry(:b, 5, 50))
+      policy = Policy.on_write(policy, :b, 5, 50, :infinity)
+      assert keys_in_order(policy, :protected) == [:b]
+      assert keys_in_order(policy, :probation) == [:a]
+      assert Policy.weights(policy) == %{window: 1, probation: 40, protected: 50}
+      assert policy.protected_weight <= policy.protected_max
+
+      # A same-id weight update (an expire/3-style event) is held to the
+      # same limit, without an MRU move of its own.
+      policy = place(policy, :a, :protected)
+      assert keys_in_order(policy, :protected) == [:b, :a]
+      policy = Policy.on_write(policy, :b, 5, 60, :infinity)
+      assert keys_in_order(policy, :protected) == [:a]
+      assert keys_in_order(policy, :probation) == [:b]
+      assert Policy.weights(policy) == %{window: 1, probation: 60, protected: 40}
+      assert Policy.weighted_size(policy.sizes) == 101
+    end
+
+    test "a rewrite heavier than protected_max moves the key to the probation MRU", %{
+      table: table
+    } do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 30, :infinity)
+      policy = Policy.on_write(policy, :b, 2, 30, :infinity)
+      policy = Policy.on_write(policy, :p, 3, 1, :infinity)
+      policy = Enum.reduce([:a, :b], policy, &place(&2, &1, :protected))
+      policy = place(policy, :p, :probation)
+
+      :ets.insert(table, entry(:b, 4, 80))
+      policy = Policy.on_write(policy, :b, 4, 80, :infinity)
+
+      assert keys_in_order(policy, :protected) == [:a]
+      assert keys_in_order(policy, :probation) == [:p, :b]
+      assert {:ok, {:b, 4, :probation, _, 80, :infinity}} = Policy.lookup(policy, :b)
+      assert Policy.weights(policy) == %{window: 0, probation: 81, protected: 30}
+      assert Policy.weighted_size(policy.sizes) == 111
+      assert length(Policy.order_rows(policy)) == 3
     end
 
     test "a same-id write updates weight and expires_at without a move or a sketch count" do
@@ -462,8 +539,429 @@ defmodule Theine.PolicyTest do
     end
   end
 
+  describe "evict/1" do
+    # max_size 10: window_max 1, main_max 9, protected_max 7. Nine keys
+    # placed in probation fill the main region, so the next window overflow
+    # forces one admission decision against the probation LRU, p1.
+    defp main_full(policy, table) do
+      Enum.reduce(1..9, policy, fn i, policy ->
+        policy |> put(table, :"p#{i}", i) |> place(:"p#{i}", :probation)
+      end)
+    end
+
+    defp probation_keys(n), do: for(i <- 1..n, do: :"p#{i}")
+
+    test "overflows the window LRU entries to the probation MRU on every call", %{table: table} do
+      policy = bounded(100) |> put(table, :a, 1) |> put(table, :b, 2) |> put(table, :c, 3)
+      assert Policy.weights(policy) == %{window: 3, probation: 0, protected: 0}
+
+      assert {:done, 0, policy} = Policy.evict(policy)
+
+      assert keys_in_order(policy, :window) == [:c]
+      assert keys_in_order(policy, :probation) == [:a, :b]
+      assert Policy.mru(policy, :probation) == {:ok, :b}
+      assert Policy.weights(policy) == %{window: 1, probation: 2, protected: 0}
+      assert {:ok, {:a, 1, :probation, _, 1, :infinity}} = Policy.lookup(policy, :a)
+      assert policy.candidates == 0
+      assert policy.cursor == nil
+      assert evictions(policy) == 0
+      assert :ets.info(table, :size) == 3
+      assert Policy.size(policy.sizes) == 3
+
+      # Nothing to do is nothing done.
+      assert {:done, 0, ^policy} = Policy.evict(policy)
+    end
+
+    test "victim freq 3 vs candidate freq 5 evicts the victim", %{table: table} do
+      policy = bounded(10) |> main_full(table) |> put(table, :c, 10) |> put(table, :w, 11)
+      policy = policy |> bump(:p1, 3) |> bump(:c, 5)
+      assert total(policy) == 11
+
+      assert {:done, 1, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :p1) == []
+      assert Policy.lookup(policy, :p1) == :error
+      assert keys_in_order(policy, :probation) == (probation_keys(9) -- [:p1]) |> Kernel.++([:c])
+      assert keys_in_order(policy, :window) == [:w]
+      assert total(policy) == 10
+      assert Policy.weights(policy) == %{window: 1, probation: 9, protected: 0}
+      assert Policy.size(policy.sizes) == 10
+      assert Policy.weighted_size(policy.sizes) == 10
+      assert Policy.id_count(policy) == 10
+      assert :ets.info(table, :size) == 10
+      assert evictions(policy) == 1
+      assert policy.candidates == 0
+      assert policy.cursor == nil
+    end
+
+    test "victim freq 5 vs candidate freq 3 evicts the candidate", %{table: table} do
+      policy = bounded(10) |> main_full(table) |> put(table, :c, 10) |> put(table, :w, 11)
+      policy = policy |> bump(:p1, 5) |> bump(:c, 3)
+
+      assert {:done, 1, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :c) == []
+      assert Policy.lookup(policy, :c) == :error
+      assert [{:p1, nil, 1, 1, 0, :infinity}] = :ets.lookup(table, :p1)
+      assert keys_in_order(policy, :probation) == probation_keys(9)
+      assert keys_in_order(policy, :window) == [:w]
+      assert total(policy) == 10
+      assert evictions(policy) == 1
+      assert Policy.id_count(policy) == 10
+    end
+
+    test "victim freq 2 vs candidate freq 2 evicts the candidate", %{table: table} do
+      policy = bounded(10) |> main_full(table) |> put(table, :c, 10) |> put(table, :w, 11)
+      policy = policy |> bump(:p1, 2) |> bump(:c, 2)
+
+      assert {:done, 1, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :c) == []
+      assert keys_in_order(policy, :probation) == probation_keys(9)
+      assert evictions(policy) == 1
+    end
+
+    test "a tied candidate of frequency 6 or more is admitted about one time in 128", %{
+      table: table
+    } do
+      :rand.seed(:exsss, {2026, 10, 28})
+      # max_size 2: window_max 1, main_max 1. One probation victim, one
+      # window overflow, one decision per trial.
+      policy = bounded(2)
+
+      admitted = fn policy, freq, trials ->
+        Enum.reduce(1..trials, {policy, 0}, fn _, {policy, admitted} ->
+          :ets.delete_all_objects(table)
+
+          policy =
+            policy
+            |> Policy.reset()
+            |> put(table, :v, 1)
+            |> place(:v, :probation)
+            |> put(table, :c, 2)
+            |> put(table, :w, 3)
+            |> bump(:v, freq)
+            |> bump(:c, freq)
+
+          assert {:done, 1, policy} = Policy.evict(policy)
+          assert total(policy) == 2
+          {policy, admitted + if(:ets.member(table, :v), do: 0, else: 1)}
+        end)
+      end
+
+      # 2_000 draws at 1/128: 15.6 expected, P(none) is about 2e-7 and
+      # P(more than 60) smaller still.
+      {policy, admitted_at_6} = admitted.(policy, 6, 2_000)
+      assert admitted_at_6 in 1..60
+
+      {_policy, admitted_at_5} = admitted.(policy, 5, 500)
+      assert admitted_at_5 == 0
+    end
+
+    test "with no candidate the probation LRU is removed without an admission test", %{
+      table: table
+    } do
+      policy =
+        bounded(10)
+        |> main_full(table)
+        |> put(table, :x, 10)
+        |> place(:x, :probation)
+        |> put(table, :y, 11)
+        |> place(:y, :probation)
+        |> bump(:p1, 10)
+
+      assert policy.window_weight == 0
+      assert total(policy) == 11
+
+      assert {:done, 1, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :p1) == []
+      assert Policy.lookup(policy, :p1) == :error
+      assert keys_in_order(policy, :probation) == (probation_keys(9) -- [:p1]) ++ [:x, :y]
+      assert total(policy) == 10
+      assert evictions(policy) == 1
+    end
+
+    test "an empty probation falls back to the protected LRU, then to the window LRU", %{
+      table: table
+    } do
+      policy =
+        bounded(10)
+        |> put(table, :a, 1, 5)
+        |> place(:a, :protected)
+        |> put(table, :b, 2, 5)
+        |> place(:b, :protected)
+        |> put(table, :w, 3)
+
+      assert Policy.weights(policy) == %{window: 1, probation: 0, protected: 10}
+
+      assert {:done, 1, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :a) == []
+      assert keys_in_order(policy, :protected) == [:b]
+      assert keys_in_order(policy, :window) == [:w]
+      assert Policy.weights(policy) == %{window: 1, probation: 0, protected: 5}
+      assert evictions(policy) == 1
+
+      # Step 1 empties any window over max_size before step 2 runs, so the
+      # window fallback needs a window limit above the bound to be reached.
+      policy = %{bounded(10) | window_max: 100}
+      policy = Enum.reduce(1..12, policy, &put(&2, table, :"k#{&1}", &1))
+      assert Policy.weights(policy) == %{window: 12, probation: 0, protected: 0}
+
+      assert {:done, 2, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :k1) == []
+      assert :ets.lookup(table, :k2) == []
+      assert keys_in_order(policy, :window) == for(i <- 3..12, do: :"k#{i}")
+      assert Policy.weights(policy) == %{window: 10, probation: 0, protected: 0}
+    end
+
+    test "evict_batch caps a call and :more carries the untested candidates to the next", %{
+      table: table
+    } do
+      policy = bounded(10, evict_batch: 2) |> main_full(table)
+      policy = Enum.reduce(probation_keys(9), policy, &bump(&2, &1, 3))
+
+      policy =
+        policy
+        |> put(table, :c1, 10)
+        |> put(table, :c2, 11)
+        |> put(table, :c3, 12)
+        |> put(table, :c4, 13)
+        |> put(table, :w, 14)
+
+      assert total(policy) == 14
+
+      # Four overflows; the two freshest are tested (and rejected, 1 < 3)
+      # before the cap. The other two are still candidates.
+      assert {:more, 2, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :c4) == []
+      assert :ets.lookup(table, :c3) == []
+      assert keys_in_order(policy, :probation) == probation_keys(9) ++ [:c1, :c2]
+      assert keys_in_order(policy, :window) == [:w]
+      assert total(policy) == 12
+      assert policy.candidates == 2
+      assert {:ok, {:c2, 11, :probation, seq, 1, :infinity}} = Policy.lookup(policy, :c2)
+      assert policy.cursor == seq
+      assert evictions(policy) == 2
+
+      # The follow-up continues with c2 and c1 rather than evicting p1 and
+      # p2 outright as it would with the count reset.
+      assert {:done, 2, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :c2) == []
+      assert :ets.lookup(table, :c1) == []
+      assert [_] = :ets.lookup(table, :p1)
+      assert keys_in_order(policy, :probation) == probation_keys(9)
+      assert total(policy) == 10
+      assert policy.candidates == 0
+      assert policy.cursor == nil
+      assert evictions(policy) == 4
+      assert Policy.size(policy.sizes) == 10
+      assert :ets.info(table, :size) == 10
+    end
+
+    test "a follow-up whose window overflowed again restarts the cursor at the probation MRU",
+         %{table: table} do
+      policy = bounded(10, evict_batch: 1)
+      policy = Enum.reduce(1..8, policy, &(&2 |> put(table, :"p#{&1}", &1) |> bump(:"p#{&1}", 3)))
+      policy = Enum.reduce(1..8, policy, &place(&2, :"p#{&1}", :probation))
+
+      policy =
+        policy
+        |> put(table, :c1, 9)
+        |> put(table, :c2, 10)
+        |> put(table, :c3, 11)
+        |> put(table, :w, 12)
+
+      assert {:more, 1, policy} = Policy.evict(policy)
+      assert :ets.lookup(table, :c3) == []
+      assert policy.candidates == 2
+      assert {:ok, {:c2, 10, :probation, c2_seq, 1, :infinity}} = Policy.lookup(policy, :c2)
+      assert policy.cursor == c2_seq
+
+      # A write between passes: the next call overflows w, the window LRU,
+      # and tests it first, before the carried c2 and c1.
+      policy = put(policy, table, :c4, 13)
+      assert keys_in_order(policy, :window) == [:w, :c4]
+
+      assert {:more, 1, policy} = Policy.evict(policy)
+
+      assert :ets.lookup(table, :w) == []
+      assert [_] = :ets.lookup(table, :c2)
+      assert [_] = :ets.lookup(table, :c1)
+      assert keys_in_order(policy, :window) == [:c4]
+      assert policy.candidates == 2
+      assert policy.cursor == c2_seq
+
+      # The carried c2 is next; with it gone the weight fits and c1, never
+      # tested, stays as a settled probation entry.
+      assert {:done, 1, policy} = Policy.evict(policy)
+      assert :ets.lookup(table, :c2) == []
+      assert [_] = :ets.lookup(table, :c1)
+      assert keys_in_order(policy, :probation) == probation_keys(8) ++ [:c1]
+      assert total(policy) == 10
+      assert evictions(policy) == 3
+      assert policy.candidates == 0
+    end
+
+    test "a walk that reaches the batch's floor with candidates left settles them", %{
+      table: table
+    } do
+      # Two carried candidates, but one of them is promoted between passes:
+      # the count outlives its entries. The walk stops at the first
+      # overflow's seq instead of retesting p9, and the victim goes.
+      policy = bounded(10, evict_batch: 1) |> main_full(table)
+      policy = Enum.reduce(probation_keys(9), policy, &bump(&2, &1, 3))
+      policy = policy |> put(table, :c1, 10) |> put(table, :c2, 11) |> put(table, :c3, 12)
+      policy = policy |> put(table, :w, 13)
+
+      assert {:more, 1, policy} = Policy.evict(policy)
+      assert :ets.lookup(table, :c3) == []
+      assert policy.candidates == 2
+      assert {:ok, {:c1, 10, :probation, c1_seq, 1, :infinity}} = Policy.lookup(policy, :c1)
+      assert policy.candidate_floor == c1_seq
+
+      policy = Policy.on_access(policy, 11)
+      assert keys_in_order(policy, :protected) == [:c2]
+      assert keys_in_order(policy, :probation) == probation_keys(9) ++ [:c1]
+
+      assert {:more, 1, policy} = Policy.evict(policy)
+      assert :ets.lookup(table, :c1) == []
+      assert policy.candidates == 1
+      assert {:ok, {:p9, 9, :probation, p9_seq, 1, :infinity}} = Policy.lookup(policy, :p9)
+      assert policy.cursor == p9_seq
+      assert policy.candidate_floor == c1_seq
+
+      assert {:done, 1, policy} = Policy.evict(policy)
+      assert :ets.lookup(table, :p1) == []
+      assert [_] = :ets.lookup(table, :p9)
+      assert policy.candidates == 0
+      assert policy.cursor == nil
+      assert policy.candidate_floor == nil
+      assert total(policy) == 10
+    end
+
+    test "removal by stale id leaves a concurrently rewritten entry in place", %{table: table} do
+      policy =
+        bounded(10)
+        |> main_full(table)
+        |> put(table, :x, 10)
+        |> place(:x, :probation)
+        |> put(table, :y, 11)
+        |> place(:y, :probation)
+
+      assert total(policy) == 11
+
+      # A put of p1 whose {:put, :p1, 99, ...} event is still in flight.
+      :ets.insert(table, entry(:p1, 99))
+
+      assert {:done, 0, policy} = Policy.evict(policy)
+
+      assert Policy.lookup(policy, :p1) == :error
+      assert [{:p1, nil, 99, 1, 0, :infinity}] = :ets.lookup(table, :p1)
+      assert evictions(policy) == 0
+      assert total(policy) == 10
+      assert Policy.size(policy.sizes) == 10
+
+      # The in-flight event re-admits the fresh version as a new key.
+      policy = Policy.on_write(policy, :p1, 99, 1, :infinity)
+      assert {:ok, {:p1, 99, :window, _, 1, :infinity}} = Policy.lookup(policy, :p1)
+      assert Policy.id_count(policy) == 11
+      assert total(policy) == 11
+
+      # And a key the table no longer holds (its {:removed, ...} in flight)
+      # only loses its rows.
+      :ets.delete(table, :p2)
+      policy = put(policy, table, :z, 12) |> place(:z, :probation)
+      assert {:done, 1, policy} = Policy.evict(policy)
+      assert Policy.lookup(policy, :p2) == :error
+      assert evictions(policy) == 1
+      assert total(policy) == 10
+      policy = Policy.on_remove(policy, :p2, 2)
+      assert total(policy) == 10
+    end
+
+    test "is a no-op without a bound", %{policy: policy, table: table} do
+      policy = policy |> put(table, :a, 1) |> put(table, :b, 2)
+      assert {:done, 0, ^policy} = Policy.evict(policy)
+      assert :ets.info(table, :size) == 2
+    end
+
+    test "reset/1 clears the carried candidates and cursor", %{table: table} do
+      policy = bounded(10, evict_batch: 1) |> main_full(table)
+      policy = policy |> put(table, :c1, 10) |> put(table, :c2, 11) |> put(table, :w, 12)
+      assert {:more, 1, policy} = Policy.evict(policy)
+      assert policy.candidates == 1
+      assert is_integer(policy.cursor)
+
+      policy = Policy.reset(policy)
+
+      assert policy.candidates == 0
+      assert policy.cursor == nil
+    end
+
+    @tag timeout: 120_000
+    test "scan resistance: an 800-key working set retains at least 90% after a 100_000-key scan",
+         %{table: table} do
+      policy = bounded(1_000)
+      working = for i <- 1..800, do: {:hot, i}
+
+      policy =
+        Enum.reduce(
+          Enum.with_index(working, 1),
+          policy,
+          &write(&2, table, elem(&1, 0), elem(&1, 1))
+        )
+
+      policy =
+        Enum.reduce(1..9, policy, fn _, policy ->
+          Enum.reduce(1..800, policy, fn id, policy -> policy |> Policy.on_access(id) |> age() end)
+        end)
+
+      # The ten most recent hot keys sit in the window (window_max 10); the
+      # other 790 were promoted, under protected_max 792.
+      assert length(keys_in_order(policy, :protected)) == 790
+      assert length(keys_in_order(policy, :window)) == 10
+
+      policy =
+        Enum.reduce(1..100_000, policy, fn i, policy ->
+          write(policy, table, {:scan, i}, 800 + i)
+        end)
+
+      # The 790 in protected are never victims while probation has an
+      # entry; the 10 that were still in the window overflow alone into an
+      # empty probation and are their own victim.
+      retained = Enum.count(working, &:ets.member(table, &1))
+      assert retained >= 720
+      assert retained == 790
+      assert total(policy) <= 1_000
+      assert Policy.size(policy.sizes) == :ets.info(table, :size)
+      assert Policy.count(policy) == :ets.info(table, :size)
+    end
+  end
+
+  # A write followed by the eviction step and the sketch aging the
+  # maintenance pass would run (specs/04 §The pass steps 5 and 6).
+  defp write(policy, table, key, id) do
+    {_status, _evicted, policy} = policy |> put(table, key, id) |> Policy.evict()
+    age(policy)
+  end
+
+  defp age(%{sketch: sketch, sketch_size: size, max_size: max_size} = policy) do
+    if size >= Sketch.sample_size(max_size) do
+      odd = Sketch.reset(sketch)
+      %{policy | sketch_size: Sketch.size_after_reset(size, odd)}
+    else
+      policy
+    end
+  end
+
   # Moves a row into `segment` at its MRU end by hand, standing in for the
-  # window overflow of evict/1 (M2.6), the only way a key leaves the window.
+  # window overflow and the promotions that would otherwise take a longer
+  # event sequence to arrange.
   defp place(policy, key, segment) do
     {:ok, {^key, _id, from, seq, weight, _}} = Policy.lookup(policy, key)
     new_seq = policy.next_seq
@@ -602,6 +1100,7 @@ defmodule Theine.PolicyTest do
   # window key to the probation MRU as evict/1's step 1 will (M2.6).
   @write_kinds [{3, :put}, {1, :racy_put}, {2, :removed}]
   @access_kinds [{3, :put}, {1, :racy_put}, {2, :removed}, {4, :access}, {2, :overflow}]
+  @evict_kinds [{3, :put}, {1, :racy_put}, {2, :removed}, {4, :access}, {3, :evict}]
 
   defp events(kinds \\ @write_kinds) do
     gen all keys <- list_of(member_of(1..6), min_length: 1, max_length: 40),
@@ -615,6 +1114,7 @@ defmodule Theine.PolicyTest do
         {{key, _id}, :removed, _, stale} -> {:removed, key, stale}
         {{_key, _id}, :access, _, pick} -> {:access, pick}
         {{key, _id}, :overflow, _, _} -> {:overflow, key}
+        {{_key, _id}, :evict, _, _} -> :evict
       end)
     end
   end
@@ -634,6 +1134,26 @@ defmodule Theine.PolicyTest do
         {policy, model} = apply_event(policy, table, event, model)
         assert_invariant(policy, model)
         assert_access(policy, expected)
+        {policy, model}
+      end)
+    end
+  end
+
+  property "bounded: evict/1 keeps the invariant, bounds the weight and removes what it evicts",
+           %{table: table} do
+    # max_size 20 with weights up to 9 and evict_batch 2: most evict calls
+    # stop at the cap and carry candidates into the next, and writes,
+    # accesses and removals land between them (specs/05 §Acceptance
+    # Bounded, §Decisions M2.6).
+    policy = bounded(20, evict_batch: 2)
+
+    check all events <- events(@evict_kinds), max_runs: 1000 do
+      policy = Policy.reset(policy)
+      :ets.delete_all_objects(table)
+
+      Enum.reduce(events, {policy, %{}}, fn event, {policy, model} ->
+        {policy, model} = apply_event(policy, table, event, model)
+        assert_invariant(policy, model)
         {policy, model}
       end)
     end
@@ -788,6 +1308,29 @@ defmodule Theine.PolicyTest do
       {:ok, {^key, _, :window, _, _, _}} -> {place(policy, key, :probation), model}
       _ -> {policy, model}
     end
+  end
+
+  # One eviction step: the entries it reports evicted left the table, a
+  # key it dropped never keeps the policy's version in the table, the
+  # window fits after it, and the weight fits once it says :done.
+  defp apply_event(policy, table, :evict, model) do
+    before = evictions(policy)
+    {status, evicted, policy} = Policy.evict(policy)
+
+    assert evicted == evictions(policy) - before
+    assert evicted <= policy.evict_batch
+    assert policy.window_weight <= policy.window_max
+    if status == :done, do: assert(total(policy) <= policy.max_size)
+    if status == :more, do: assert(total(policy) > policy.max_size)
+
+    gone = for {key, {id, _weight}} <- model, Policy.lookup(policy, key) == :error, do: {key, id}
+    assert evicted <= length(gone)
+
+    for {key, id} <- gone do
+      refute match?([{^key, _, ^id, _, _, _}], :ets.lookup(table, key))
+    end
+
+    {policy, Map.drop(model, Enum.map(gone, &elem(&1, 0)))}
   end
 
   defp assert_model(policy, model, segment) do

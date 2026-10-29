@@ -40,8 +40,9 @@ Order, matching Caffeine:
    version, or unknown) are skipped.
 4. **Expire** (`Expiry.sweep/2`): remove entries whose `expires_at <= now`,
    up to `expire_batch` (default 1024) per pass.
-5. **Evict** (`Policy.evict/1`): while the weighted size exceeds `max_size`,
-   run W-TinyLFU admission between the window candidate and the probation
+5. **Evict** (`Policy.evict/1`, called every pass): overflow the window
+   into probation, then while the weighted size exceeds `max_size`, run
+   W-TinyLFU admission between the window candidate and the probation
    victim, removing the loser from the entries table and the policy.
 6. **Sketch aging**: if a reset is in progress, advance it by one chunk.
 7. **Adaptive step** (M6 only): `Policy.climb/1` if enabled.

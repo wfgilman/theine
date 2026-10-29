@@ -30,6 +30,16 @@ defmodule Theine.MaintenanceTest do
     assert Maintenance.info(cache).pending == 3
   end
 
+  test "init/1 seeds :rand from the cache name", %{cache: cache} do
+    # :rand.seed/2 stores what seed_s/2 returns in the process dictionary,
+    # so the admission guard's random draws are a function of the name
+    # alone (specs/05 §Events `evict`).
+    pid = Process.whereis(Maintenance.name(cache))
+    {:dictionary, dictionary} = Process.info(pid, :dictionary)
+    assert dictionary[:rand_seed] == :rand.seed_s(:exsss, Maintenance.rand_seed(cache))
+    assert Maintenance.rand_seed(cache) != Maintenance.rand_seed(:another_name)
+  end
+
   test "info/1 of a bounded cache reports segments, read buffer and sketch" do
     cache = unique_cache()
 

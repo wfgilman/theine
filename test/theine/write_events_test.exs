@@ -44,6 +44,58 @@ defmodule Theine.WriteEventsTest do
     assert_received {:removed, :a, 1}
   end
 
+  describe "deliver/2 never crashes the writer (specs/03 §Delivery with backpressure)" do
+    # A config whose maintenance name nobody holds, as during a restart.
+    defp unregistered_config(write_hwm) do
+      name = :"write_events_absent_#{System.unique_integer([:positive])}"
+
+      %{
+        Config.new!(name: :write_events_test, max_size: :infinity, write_hwm: write_hwm)
+        | pending: :atomics.new(1, signed: true),
+          maintenance: name
+      }
+    end
+
+    test "returns :ok on the send path when the maintenance name is not registered" do
+      config = unregistered_config(1024)
+      assert WriteEvents.deliver(config, {:put, :a, 1, 1, :infinity}) == :ok
+      assert WriteEvents.deliver(config, {:removed, :a, 1}) == :ok
+      assert :atomics.get(config.pending, 1) == 2
+    end
+
+    test "returns :ok on the call path when the maintenance name is not registered" do
+      config = unregistered_config(1)
+      :atomics.put(config.pending, 1, 1)
+      assert WriteEvents.deliver(config, {:put, :a, 1, 1, :infinity}) == :ok
+      assert :atomics.get(config.pending, 1) == 2
+    end
+
+    test "returns :ok when the maintenance process dies during the call" do
+      config = unregistered_config(1)
+      :atomics.put(config.pending, 1, 1)
+      test = self()
+
+      # Stands in for a maintenance process that crashes with the call in
+      # its mailbox: it reports the call and exits without replying.
+      server =
+        spawn(fn ->
+          Process.register(self(), config.maintenance)
+          send(test, :registered)
+
+          receive do
+            {:"$gen_call", _from, {:event, event}} ->
+              send(test, {:received, event})
+              exit(:boom)
+          end
+        end)
+
+      assert_receive :registered
+      assert WriteEvents.deliver(config, {:put, :a, 1, 1, :infinity}) == :ok
+      assert_received {:received, {:put, :a, 1, 1, :infinity}}
+      refute Process.alive?(server)
+    end
+  end
+
   test "events from many writers all reach the maintenance process in put order per key" do
     cache = unique_cache()
     start_supervised!({Theine, name: cache, max_size: :infinity})

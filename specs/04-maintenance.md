@@ -108,9 +108,15 @@ the cache unbounded for long. On `init/1`:
    candidate for eviction, which is the safe default.
 4. If the rebuilt weighted size exceeds `max_size`, schedule `:drain`.
 
-The scan yields between chunks (`handle_continue` with the continuation), so
-readers and writers are not blocked and write events arriving during the
-rebuild are applied after it completes (they are queued in the mailbox).
+The scan runs after `init/1` returns (`handle_continue` with the
+continuation, one per chunk), so the supervisor's restart completes and the
+registered name is reachable while the table is scanned: readers and writers
+are not blocked, and write events arriving during the rebuild queue in the
+mailbox and are applied after it completes. The table is fixed
+(`:ets.safe_fixtable/2`) for the scan, so a chunked traversal of the `set`
+neither skips nor repeats an entry under concurrent writes (§Decisions
+M2.9). One `[:theine, :maintenance, :rebuild]` event per maintenance start
+reports the scan's `duration`, `entries` and `chunks`.
 
 ## Acceptance
 
@@ -222,3 +228,54 @@ rebuild are applied after it completes (they are queued in the mailbox).
   A2 and tests can make the gap wide enough to observe. `drain_backoff: 0`
   restores back-to-back passes. `reset/1` leaves a pending deferral alone;
   it runs a pass on the emptied policy, which is harmless.
+- 2026-10-29 (M2.9): the restart rebuild as built, where §Restart semantics
+  left room.
+  - The scan is `:ets.select/3` with a limit of 10_000
+    (`Theine.Maintenance.rebuild_chunk/0`) over a match spec that returns
+    `{key, id, weight, expires_at}`, one `handle_continue/2` per chunk,
+    with the entries table fixed by `:ets.safe_fixtable/2` from the first
+    chunk to the end. The ETS docs guarantee a `select/3` continuation
+    traversal of a `set` only while the table is fixed; without the fix a
+    concurrent insert that moves a hash bucket could hide an entry from
+    the scan, and the policy would never learn it. The fix costs nothing
+    on the write path (deleted objects are kept until the release, a few
+    milliseconds) and the runtime releases it if the process dies
+    mid-scan. The chain of continues handles no message in between, so
+    the rebuild is one uninterrupted scan from the mailbox's point of
+    view; what the chunking buys is that `init/1` returns at once, the
+    supervisor's restart completes and the name is registered before the
+    scan starts, so every writer's `send/2` from then on lands in the
+    mailbox rather than raising, and `pause/1`-style calls queue rather
+    than time out. Writers above `write_hwm` wait in their call for the
+    scan to finish, as they would behind a slow pass.
+  - Entries are restored through `Theine.Policy.restore/5` (specs/05
+    §Events `restore`): probation MRU in scan order, no sketch increment.
+    The policy row keeps the stored `expires_at`, so the expiry index of
+    specs/06 can be rebuilt from the same call when it lands (M3.1).
+  - The scan also runs on a fresh start, over an empty table, so there is
+    one code path and one `[:theine, :maintenance, :rebuild]` event per
+    maintenance start (measurements `%{duration: native, entries: n,
+    chunks: n}`, metadata `%{cache: name}`; specs/08 §Telemetry). The
+    event is how a test, or an operator, sees that a restart happened and
+    what it cost.
+  - Step 4 goes through `ReadBuffer.schedule_drain/1`: the flag was
+    cleared in `init/1`, so this queues one `:drain` unless a reader
+    already did during the scan, in which case that reader's serves, and
+    the "at most one `:drain` in flight" rule of specs/03 holds.
+    `drain_after` is nil after a restart, so that pass runs at once.
+  - Step 2's reset of `pending` cannot be exact: a writer that counted its
+    event before the reset and sent it after (the name is registered
+    before `init/1` runs) leaves `pending` one below the true queue depth
+    once that event is consumed. The drift is at most one per writer per
+    restart, never positive (a send can fail only before the registration,
+    hence before the reset that wipes its count), and only delays the
+    backpressure threshold by that much; `info/1` may show a small
+    negative `pending` after a restart under load. Making it exact would
+    need the writer to count after sending, which would cost the hot
+    write path a second atomics op, so it is accepted and tested as a
+    band.
+  - `Theine.Test.Policy` (specs/10) forwards `restore/5` like the other
+    calls and gained `gate/2` and `release/2`, which hold the maintenance
+    process inside its next call of a given name until the test lets it
+    go; that is how "a put during the rebuild is not lost" is tested
+    deterministically rather than by racing a 20_000-entry scan.

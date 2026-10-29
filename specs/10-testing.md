@@ -82,6 +82,13 @@ correctness is in the branches (claim races, admission ties, stale ids).
   true` (specs/08 §Decisions M2.7). It records by sending each call's name
   to the process that called `listen(cache)`; `calls(cache)` drains them
   from the caller's mailbox in order.
+- 2026-10-29 (M2.9): `Theine.Test.Policy` also forwards `restore/5` and
+  offers `gate(cache, call)` / `release(cache, pid)`: the maintenance
+  process stops inside its next call of that name, tells the gate process
+  `{Theine.Test.Policy, cache, :gated, call, pid}`, and waits for the
+  release. The gate is removed before the process is told, so exactly one
+  call is held. This is what makes "a put during the rebuild is not lost"
+  (specs/04 §Restart semantics) deterministic.
 - 2026-10-27: `Theine.Test.Trace` uses an OTP 27 `:trace` session instead
   of global `:erlang.trace/3` + `trace_pattern/3`, so concurrent async
   tracing tests cannot see or reset each other's patterns. The call

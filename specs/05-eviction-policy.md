@@ -87,6 +87,17 @@ Look up `ids`; if `id` is not the key's current id in `policy`, skip. Else
   `w > protected_max` moves to probation MRU instead (§Decisions M2.5).
 - `:protected` → move to protected MRU.
 
+### `restore(key, id, weight, expires_at)`
+
+The maintenance restart rebuild (specs/04 §Restart semantics step 3) feeds
+every entry it finds in the entries table through this instead of
+`on_write`: insert into `policy` and `ids` under the table's id, place at
+the **probation** MRU, `probation_weight += weight`, and no
+`Sketch.increment`, so the rebuilt policy is cold and every restored entry
+is a candidate for direct eviction (`candidates` is 0) until reads promote
+it. A key the policy already holds is left alone. Without a bound it is a
+plain row, as `on_write` of an unknown key would make (§Decisions M2.9).
+
 ### `evict()`
 
 Called once in every maintenance pass; step 1 always runs, step 2 while
@@ -268,3 +279,18 @@ default false, and must not change any non-adaptive test result.
   demotion is immediate (M2.5), `on_write` now applies the `on_access`
   rule after a weight increase, so the §Acceptance invariant holds after
   every event, not only after `on_access`.
+- 2026-10-29 (M2.9): `Policy.restore(state, key, id, weight, expires_at)`
+  is the rebuild's entry point (§Events `restore`), separate from
+  `on_write` because the two differ in every bounded branch: probation
+  instead of the window, no sketch count, and a known key skipped rather
+  than updated. The skip is an `:ets.insert_new/2` on the `policy` table,
+  so a key restored twice costs one failed insert and changes nothing;
+  the maintenance process scans a fixed table (specs/04 §Decisions M2.9)
+  and handles no event between chunks, so it never happens there. The
+  events that arrive after the rebuild settle the rows as §Events say: the
+  entry's own `:put`, replayed from a writer that straddled the restart,
+  is a same-id update (no move, no count); a newer version's `:put` moves
+  the key to the probation MRU; a `:removed` with the table's id drops it.
+  A rebuilt probation may exceed `main_max`, which `evict` handles like
+  any over-capacity state: with `candidates` 0 the probation LRU goes
+  first, oldest in scan order.

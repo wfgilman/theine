@@ -125,6 +125,9 @@ test asserts the counters-free multiset for the unbounded hit.
 Emitted off the hot path only:
 
 - `[:theine, :maintenance, :pass]` per pass (specs/04).
+- `[:theine, :maintenance, :rebuild]` once per maintenance start, with the
+  restart rebuild's `duration`, `entries` and `chunks` (specs/04 §Restart
+  semantics, §Decisions M2.9).
 - `[:theine, :load, :start | :stop | :exception]` around a loader call made
   by a claimant or a refresh task, with `%{cache: name}` metadata and the
   key omitted.
@@ -226,3 +229,12 @@ specs/09.
   on the 31-key config flatmap and the full `mix bench get` showed the
   unbounded hit about 30 ns slower than in M2.3. Tuple element access is
   a few ns, so the bounded branch destructures the tuple instead.
+- 2026-10-29 (M2.9): the `[:theine, :maintenance, :rebuild]` event is
+  added to §Telemetry. A maintenance restart is the one lifecycle event
+  the cache survives without telling anyone (the supervisor logs the
+  crash, nothing reports the recovery), and its cost scales with the
+  table, so the rebuild emits one event with its scan duration, entry
+  count and chunk count. It is emitted on every maintenance start,
+  including the first, so a handler sees one event per start rather than
+  having to tell a restart from a start. Off the hot path, as §Telemetry
+  requires.

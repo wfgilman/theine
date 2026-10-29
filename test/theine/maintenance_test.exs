@@ -657,4 +657,282 @@ defmodule Theine.MaintenanceTest do
       assert flag(cache) == 0
     end
   end
+
+  describe "restart (specs/04 §Restart semantics)" do
+    defp children(sup) do
+      for {id, pid, _type, _modules} <- Supervisor.which_children(sup), into: %{}, do: {id, pid}
+    end
+
+    # Kills the maintenance process of `cache` and returns the pid that
+    # replaced it.
+    defp restart(cache) do
+      old = Process.whereis(Maintenance.name(cache))
+      Process.exit(old, :kill)
+      assert_eventually(fn -> Process.whereis(Maintenance.name(cache)) not in [nil, old] end)
+      Process.whereis(Maintenance.name(cache))
+    end
+
+    # Forwards every rebuild event of `cache` as `{:rebuild, measurements,
+    # metadata}`; attached before the cache starts when the first start's
+    # event is wanted too.
+    defp attach_rebuild_handler(cache) do
+      handler = {__MODULE__, :rebuild, cache}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:theine, :maintenance, :rebuild],
+          &__MODULE__.handle_rebuild/4,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+    end
+
+    def handle_rebuild(_event, measurements, metadata, test),
+      do: send(test, {:rebuild, measurements, metadata})
+
+    test "killing Maintenance restarts only Maintenance and every readable entry stays readable" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, max_size: 1_000, test_hooks: true] ++ @quiet})
+      sup = Process.whereis(Theine.Supervisor.name(cache))
+      config = Config.get(cache)
+      before = children(sup)
+
+      for i <- 1..50, do: Theine.put(cache, i, i)
+      Theine.put(cache, :ttl, 1, ttl: 60_000)
+      for _ <- 1..3, do: {:ok, 1} = Theine.get(cache, 1)
+      Maintenance.run(cache)
+      assert %{passes: 1, size: 51, sketch: %{increments: 54}} = Maintenance.info(cache)
+      assert {:ok, {1, _, :window, _, 1, :infinity}} = Maintenance.policy_row(cache, 1)
+
+      # Paused: ten more writes queue as events in the mailbox, and five
+      # reads sit in the ring, when the process is killed. The events die
+      # with it; the writes are in the table.
+      :ok = Maintenance.pause(cache)
+      for i <- 51..60, do: Theine.put(cache, i, i)
+      for _ <- 1..5, do: :ok = ReadBuffer.record(config, id_of(cache, 1))
+      assert :atomics.get(config.pending, 1) == 10
+      :atomics.put(config.flags, @drain_flag, 1)
+
+      maintenance = restart(cache)
+      assert children(sup) == %{before | Theine.Maintenance => maintenance}
+      assert :ets.info(cache, :owner) == before[Theine.Owner]
+
+      # Rebuilt cold: every entry in probation under the table's id, with
+      # its stored weight and expiry; nothing pending, no lag, no pass, an
+      # empty sketch, the flag clear and the scan's fix released.
+      assert %{
+               passes: 0,
+               pending: 0,
+               size: 61,
+               weighted_size: 61,
+               segments: %{window: 0, probation: 61, protected: 0},
+               read_buffer: %{lag: 0},
+               sketch: %{increments: 0, reset: nil}
+             } = Maintenance.info(cache)
+
+      for i <- 1..60 do
+        id = id_of(cache, i)
+        assert {:ok, {^i, ^id, :probation, _, 1, :infinity}} = Maintenance.policy_row(cache, i)
+      end
+
+      assert {:ok, {:ttl, _, :probation, _, 1, expires_at}} = Maintenance.policy_row(cache, :ttl)
+      assert is_integer(expires_at)
+      assert Sketch.frequency(config.sketch, 1) == 0
+      assert flag(cache) == 0
+      assert :ets.info(cache, :safe_fixed_monotonic_time) == false
+
+      for i <- 1..60, do: assert(Theine.get(cache, i) == {:ok, i})
+      assert Theine.get(cache, :ttl) == {:ok, 1}
+      assert :ets.info(cache, :size) == 61
+    end
+
+    test "after a restart with 20_000 entries the policy count equals the table size once idle" do
+      cache = unique_cache()
+      attach_rebuild_handler(cache)
+
+      start_supervised!(
+        {Theine, [name: cache, max_size: 50_000, write_batch: 1_000_000] ++ @quiet}
+      )
+
+      # A fresh start scans the empty table: one event, nothing restored.
+      assert_receive {:rebuild, %{entries: 0, chunks: 0, duration: d0}, %{cache: ^cache}}, 1_000
+      assert is_integer(d0) and d0 >= 0
+
+      for i <- 1..20_000, do: Theine.put(cache, i, i)
+      Maintenance.run(cache)
+      assert %{size: 20_000, pending: 0} = Maintenance.info(cache)
+
+      restart(cache)
+
+      # Two chunks of rebuild_chunk at least (specs/04 step 3).
+      assert_receive {:rebuild, %{entries: 20_000, chunks: chunks}, %{cache: ^cache}}, 5_000
+      assert chunks >= div(20_000, Maintenance.rebuild_chunk())
+
+      assert_eventually(fn -> Maintenance.info(cache).pending == 0 end, 5_000)
+      assert %{size: 20_000, weighted_size: 20_000, passes: 0} = Maintenance.info(cache)
+      assert :ets.info(cache, :size) == 20_000
+
+      for i <- 1..20_000//997 do
+        id = id_of(cache, i)
+        assert {:ok, {^i, ^id, :probation, _, 1, :infinity}} = Maintenance.policy_row(cache, i)
+      end
+    end
+
+    test "a put during the rebuild is not lost" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine,
+         [name: cache, max_size: 1_000, test_hooks: true, policy_module: Theine.Test.Policy] ++
+           @quiet}
+      )
+
+      config = Config.get(cache)
+      for i <- 1..50, do: Theine.put(cache, i, i)
+      Maintenance.run(cache)
+
+      # The restarted process stops inside its first restore, with the
+      # scan under way and its name registered.
+      :ok = Theine.Test.Policy.gate(cache, :restore)
+      old = Process.whereis(Maintenance.name(cache))
+      Process.exit(old, :kill)
+      assert_receive {Theine.Test.Policy, ^cache, :gated, :restore, pid}, 5_000
+      assert pid != old
+      assert Process.whereis(Maintenance.name(cache)) == pid
+      assert Theine.size(cache) == 0
+
+      # Writes land in the table at once; their events wait behind the scan.
+      :ok = Theine.put(cache, :new, 1)
+      :ok = Theine.put(cache, 1, :rewritten)
+      :ok = Theine.delete(cache, 2)
+      assert :atomics.get(config.pending, 1) == 3
+      assert Process.info(pid, :message_queue_len) == {:message_queue_len, 3}
+      assert Theine.size(cache) == 0
+
+      :ok = Theine.Test.Policy.release(cache, pid)
+
+      # 50 restored or rewritten, minus the deleted key, plus the new one;
+      # every row carries the id the table holds.
+      assert %{pending: 0, size: 50, weighted_size: 50} = Maintenance.info(cache)
+      new_id = id_of(cache, :new)
+
+      assert {:ok, {:new, ^new_id, :window, _, 1, :infinity}} =
+               Maintenance.policy_row(cache, :new)
+
+      id1 = id_of(cache, 1)
+      assert {:ok, {1, ^id1, :probation, _, 1, :infinity}} = Maintenance.policy_row(cache, 1)
+      assert Maintenance.policy_row(cache, 2) == :error
+      assert Theine.get(cache, 1) == {:ok, :rewritten}
+      assert Theine.get(cache, :new) == {:ok, 1}
+      assert Theine.get(cache, 2) == :error
+      assert :ets.info(cache, :size) == 50
+    end
+
+    test "writers do not crash when Maintenance is restarting" do
+      cache = unique_cache()
+      # A low write_hwm keeps writers on the call path too.
+      start_supervised!({Theine, [name: cache, max_size: 10_000, write_hwm: 4] ++ @quiet})
+      test = self()
+      writers = 4
+
+      for w <- 1..writers do
+        spawn_link(fn ->
+          for i <- 1..2_000 do
+            key = {w, rem(i, 100)}
+            :ok = Theine.put(cache, key, i)
+            if rem(i, 7) == 0, do: :ok = Theine.delete(cache, key)
+          end
+
+          send(test, {:writer_done, w})
+        end)
+      end
+
+      # Three kills, the supervisor's default restart intensity, spread
+      # over the writers' run.
+      for _ <- 1..3 do
+        Process.sleep(5)
+        if pid = Process.whereis(Maintenance.name(cache)), do: Process.exit(pid, :kill)
+      end
+
+      for w <- 1..writers, do: assert_receive({:writer_done, ^w}, 10_000)
+      assert_eventually(fn -> is_pid(Process.whereis(Maintenance.name(cache))) end)
+      assert Process.alive?(Process.whereis(Theine.Supervisor.name(cache)))
+
+      # Once idle the policy and the table agree on every key.
+      assert_eventually(
+        fn ->
+          info = Maintenance.info(cache)
+          assert info.size == :ets.info(cache, :size)
+          assert info.weighted_size == info.size
+        end,
+        5_000
+      )
+
+      for {key, _value, id, _weight, _written_at, _expires_at} <- :ets.tab2list(cache) do
+        assert {:ok, {^key, ^id, _, _, 1, :infinity}} = Maintenance.policy_row(cache, key)
+      end
+
+      # `pending` can sit below zero by one per writer per restart: an
+      # event counted before a restart's reset and consumed after it
+      # (specs/04 §Decisions M2.9).
+      assert Maintenance.info(cache).pending in -(3 * writers)..0//1
+    end
+
+    test "an unbounded cache rebuilds its rows too" do
+      cache = unique_cache()
+      start_supervised!({Theine, [name: cache, max_size: :infinity, test_hooks: true] ++ @quiet})
+      config = Config.get(cache)
+
+      for i <- 1..100, do: Theine.put(cache, i, i, weight: 2)
+      :ok = Maintenance.pause(cache)
+      for i <- 101..110, do: Theine.put(cache, i, i, weight: 2)
+      assert :atomics.get(config.pending, 1) == 10
+      restart(cache)
+
+      assert %{
+               passes: 0,
+               pending: 0,
+               size: 110,
+               weighted_size: 220,
+               segments: nil,
+               read_buffer: nil,
+               sketch: nil
+             } = Maintenance.info(cache)
+
+      for i <- 1..110//13 do
+        id = id_of(cache, i)
+        assert {:ok, {^i, ^id, nil, _, 2, :infinity}} = Maintenance.policy_row(cache, i)
+        assert Theine.get(cache, i) == {:ok, i}
+      end
+
+      Theine.delete(cache, 1)
+      assert %{size: 109, weighted_size: 218} = Maintenance.info(cache)
+      assert :ets.info(cache, :safe_fixed_monotonic_time) == false
+    end
+
+    test "a rebuilt cache over max_size schedules a :drain and the pass evicts down to it" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache, max_size: 100, write_batch: 1_000, test_hooks: true] ++ @quiet}
+      )
+
+      # Paused, so the 150 events are in the mailbox when the process dies
+      # and the rebuild alone must learn the entries.
+      :ok = Maintenance.pause(cache)
+      for i <- 1..150, do: Theine.put(cache, i, i)
+      restart(cache)
+
+      assert_eventually(fn -> Theine.size(cache) == 100 end)
+      assert :ets.info(cache, :size) == 100
+      assert Theine.weighted_size(cache) == 100
+      assert Theine.stats(cache).evictions == 50
+      info = Maintenance.info(cache)
+      assert info.passes >= 1
+      assert info.segments == %{window: 0, probation: 100, protected: 0}
+      assert flag(cache) == 0
+    end
+  end
 end

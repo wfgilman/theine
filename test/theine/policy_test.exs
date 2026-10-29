@@ -362,6 +362,97 @@ defmodule Theine.PolicyTest do
     end
   end
 
+  describe "restore/5 (specs/04 §Restart semantics step 3)" do
+    test "places a bounded entry at the probation MRU with its weight and expires_at, cold" do
+      policy = bounded(100)
+      policy = Policy.restore(policy, :a, 7, 3, 1_000)
+      policy = Policy.restore(policy, :b, 8, 4, :infinity)
+
+      assert {:ok, {:a, 7, :probation, seq_a, 3, 1_000}} = Policy.lookup(policy, :a)
+      assert {:ok, {:b, 8, :probation, seq_b, 4, :infinity}} = Policy.lookup(policy, :b)
+      assert seq_a < seq_b
+      assert Policy.order_rows(policy) == [{{:probation, seq_a}, :a}, {{:probation, seq_b}, :b}]
+      assert Policy.lru(policy, :probation) == {:ok, :a}
+      assert Policy.mru(policy, :probation) == {:ok, :b}
+      assert Policy.weights(policy) == %{window: 0, probation: 7, protected: 0}
+      assert Policy.size(policy.sizes) == 2
+      assert Policy.weighted_size(policy.sizes) == 7
+      assert Policy.id_count(policy) == 2
+
+      # No sketch increment: the rebuilt policy has no access history.
+      assert policy.sketch_size == 0
+      assert Sketch.frequency(policy.sketch, :a) == 0
+      assert Sketch.frequency(policy.sketch, :b) == 0
+
+      # A restored id is a current id: a read of it promotes as any would.
+      policy = Policy.on_access(policy, 7)
+      assert {:ok, {:a, 7, :protected, _, 3, 1_000}} = Policy.lookup(policy, :a)
+    end
+
+    test "restores an unbounded entry as a plain row", %{policy: policy, sizes: sizes} do
+      policy = Policy.restore(policy, :a, 7, 3, 1_000)
+      assert {:ok, {:a, 7, nil, _, 3, 1_000}} = Policy.lookup(policy, :a)
+      assert Policy.order_rows(policy) == []
+      assert Policy.weights(policy) == %{window: 0, probation: 0, protected: 0}
+      assert Policy.size(sizes) == 1
+      assert Policy.weighted_size(sizes) == 3
+      assert Policy.id_count(policy) == 1
+    end
+
+    test "leaves a key the policy already holds alone" do
+      policy = bounded(100)
+      policy = Policy.on_write(policy, :a, 1, 2, :infinity)
+      policy = Policy.restore(policy, :a, 1, 2, :infinity)
+      policy = Policy.restore(policy, :a, 9, 5, :infinity)
+
+      assert {:ok, {:a, 1, :window, _, 2, :infinity}} = Policy.lookup(policy, :a)
+      assert Policy.count(policy) == 1
+      assert Policy.id_count(policy) == 1
+      assert length(Policy.order_rows(policy)) == 1
+      assert Policy.weights(policy) == %{window: 2, probation: 0, protected: 0}
+      assert Policy.size(policy.sizes) == 1
+      assert Policy.weighted_size(policy.sizes) == 2
+    end
+
+    test "the later events settle a restored row: a newer put moves it, a removal drops it" do
+      policy = bounded(100)
+      policy = Policy.restore(policy, :a, 7, 1, :infinity)
+      policy = Policy.restore(policy, :b, 8, 1, :infinity)
+
+      # The entry's own event replayed after the rebuild is a same-id put:
+      # weight and expiry only, no move, no count (specs/05 §Events).
+      policy = Policy.on_write(policy, :a, 7, 2, 5_000)
+      assert {:ok, {:a, 7, :probation, _, 2, 5_000}} = Policy.lookup(policy, :a)
+      assert Policy.lru(policy, :probation) == {:ok, :a}
+      assert policy.sketch_size == 0
+
+      policy = Policy.on_write(policy, :a, 9, 2, :infinity)
+      assert {:ok, {:a, 9, :probation, _, 2, :infinity}} = Policy.lookup(policy, :a)
+      assert Policy.mru(policy, :probation) == {:ok, :a}
+      assert policy.sketch_size == 1
+
+      policy = Policy.on_remove(policy, :b, 8)
+      assert Policy.lookup(policy, :b) == :error
+      assert Policy.weights(policy) == %{window: 0, probation: 2, protected: 0}
+      assert Policy.id_count(policy) == 1
+    end
+
+    test "the rebuilt weight can exceed max_size and evict/1 brings it back without candidates" do
+      policy = bounded(10)
+
+      policy =
+        Enum.reduce(1..15, policy, fn i, policy -> Policy.restore(policy, i, i, 1, :infinity) end)
+
+      assert Policy.weights(policy) == %{window: 0, probation: 15, protected: 0}
+      assert {:done, 0, policy} = Policy.evict(policy)
+      assert total(policy) == 10
+      assert Policy.count(policy) == 10
+      # The probation LRU end went first: the five restored earliest.
+      for i <- 1..5, do: assert(Policy.lookup(policy, i) == :error)
+      for i <- 6..15, do: assert({:ok, _} = Policy.lookup(policy, i))
+    end
+  end
+
   describe "on_access/2" do
     test "moves a window key to the window MRU and counts it" do
       policy = bounded(100)

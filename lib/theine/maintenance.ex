@@ -6,8 +6,18 @@ defmodule Theine.Maintenance do
   with `send/2` and a restart needs no `:persistent_term` write: the config
   holds the name, not the pid.
 
-  `init/1` reads the config the Owner stored, resets the `pending` counter
-  and the drain flag, and creates the `Theine.Policy` tables. Write events
+  `init/1` reads the config the Owner stored, resets the `pending` counter,
+  the drain flag and the read buffer's heads, creates the `Theine.Policy`
+  tables with a cleared sketch, and then rebuilds the policy from the
+  entries table (specs/04 §Restart semantics): the table is scanned in
+  `:ets.select/3` chunks of 10_000 entries, one `handle_continue/2` per
+  chunk, with the table fixed for the scan, and every entry is restored
+  into probation with its stored weight and `expires_at`. Write events
+  that arrive meanwhile wait in the mailbox and are applied once the scan
+  is done; a rebuilt cache over `max_size` schedules a `:drain` so the next
+  pass evicts. One `[:theine, :maintenance, :rebuild]` event reports the
+  scan's `duration`, `entries` and `chunks`. A fresh start scans an empty
+  table. Write events
   (`{:put, key, id, weight, expires_at}` and `{:removed, key, id}`,
   specs/03) are applied to the policy as they arrive and decrement `pending`
   per event; nothing waits for a pass (specs/04 §The pass). A writer above
@@ -54,6 +64,12 @@ defmodule Theine.Maintenance do
   # Index of the drain flag inside `config.flags` (specs/03).
   @drain_flag Theine.Owner.drain_flag()
 
+  # Entries per `:ets.select/3` chunk of the restart rebuild (specs/04
+  # §Restart semantics step 3), and what each chunk carries of an entry
+  # `{key, value, id, weight, written_at, expires_at}`.
+  @rebuild_chunk 10_000
+  @rebuild_spec [{{:"$1", :_, :"$2", :"$3", :_, :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}]
+
   @typedoc """
   The process's view of the cache. `segments`, `read_buffer` and `sketch`
   are `nil` in an unbounded cache, which allocates neither buffer nor
@@ -86,6 +102,17 @@ defmodule Theine.Maintenance do
           writes: non_neg_integer(),
           expired: non_neg_integer(),
           evicted: non_neg_integer()
+        }
+
+  @typedoc """
+  The measurements of the one `[:theine, :maintenance, :rebuild]` event a
+  maintenance start emits: the scan's wall time in native units, the
+  entries restored and the `:ets.select/3` chunks they came in.
+  """
+  @type rebuild_measurements :: %{
+          duration: non_neg_integer(),
+          entries: non_neg_integer(),
+          chunks: non_neg_integer()
         }
 
   defstruct [
@@ -205,18 +232,83 @@ defmodule Theine.Maintenance do
   @spec policy_row(Config.cache(), term()) :: {:ok, Policy.row()} | :error
   def policy_row(cache, key) when is_atom(cache), do: GenServer.call(name(cache), {:row, key})
 
+  @doc "Entries per `:ets.select/3` chunk of the restart rebuild."
+  @spec rebuild_chunk() :: 10_000
+  def rebuild_chunk, do: @rebuild_chunk
+
   @impl true
-  @spec init(Config.cache()) :: {:ok, state()}
+  @spec init(Config.cache()) :: {:ok, state(), {:continue, :rebuild}}
   def init(cache) do
     config = Config.get(cache)
+
+    # specs/04 §Restart semantics step 2: events the previous process never
+    # consumed are gone with it, readers' triggers start over, and reads
+    # recorded before now are not worth draining into a cold policy. The
+    # sketch is cleared by `Policy.new/1`.
     :atomics.put(config.pending, 1, 0)
     :atomics.put(config.flags, @drain_flag, 0)
+    if config.read_buffer, do: :ok = ReadBuffer.reset_heads(config)
+
     seed_rand(cache)
     schedule_interval(config)
     module = config.policy_module
+    state = %__MODULE__{cache: cache, config: config, module: module, policy: module.new(config)}
 
-    {:ok, %__MODULE__{cache: cache, config: config, module: module, policy: module.new(config)}}
+    # Step 3 runs after init/1 returns, so the supervisor's start completes
+    # and the registered name is reachable while the table is scanned.
+    {:ok, state, {:continue, :rebuild}}
   end
+
+  # The restart rebuild (specs/04 §Restart semantics steps 3 and 4), one
+  # chunk per continue. The table is fixed for the scan so that a chunked
+  # `:ets.select/3` traversal of a `set` neither skips nor repeats an entry
+  # while writers keep inserting and deleting; the fix is released when the
+  # scan ends, or by the runtime if this process dies first. No message is
+  # handled between chunks: a continue chains straight into the next, so
+  # the write events arriving meanwhile queue up and are applied, in
+  # order, once the policy holds every entry the scan found.
+  @impl true
+  def handle_continue(:rebuild, %__MODULE__{config: config} = state) do
+    true = :ets.safe_fixtable(config.table, true)
+    started = System.monotonic_time()
+    rebuild(state, :ets.select(config.table, @rebuild_spec, @rebuild_chunk), {started, 0, 0})
+  end
+
+  def handle_continue({:rebuild, continuation, progress}, state) do
+    rebuild(state, :ets.select(continuation), progress)
+  end
+
+  defp rebuild(%__MODULE__{module: module} = state, {rows, continuation}, {started, n, chunks}) do
+    policy =
+      Enum.reduce(rows, state.policy, fn {key, id, weight, expires_at}, policy ->
+        module.restore(policy, key, id, weight, expires_at)
+      end)
+
+    progress = {started, n + length(rows), chunks + 1}
+    {:noreply, %{state | policy: policy}, {:continue, {:rebuild, continuation, progress}}}
+  end
+
+  defp rebuild(%__MODULE__{config: config} = state, :"$end_of_table", {started, n, chunks}) do
+    true = :ets.safe_fixtable(config.table, false)
+    duration = System.monotonic_time() - started
+
+    :telemetry.execute(
+      [:theine, :maintenance, :rebuild],
+      %{duration: duration, entries: n, chunks: chunks},
+      %{cache: state.cache}
+    )
+
+    # Step 4: over capacity, the next pass must evict. The flag was cleared
+    # in init/1, so this queues one `:drain` unless a reader already did.
+    if over_capacity?(config), do: ReadBuffer.schedule_drain(config)
+
+    {:noreply, state}
+  end
+
+  defp over_capacity?(%Config{max_size: :infinity}), do: false
+
+  defp over_capacity?(%Config{max_size: max_size, sizes: sizes}),
+    do: Policy.weighted_size(sizes) > max_size
 
   @doc """
   The `:rand` seed of the maintenance process of `cache`, derived from the

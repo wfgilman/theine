@@ -336,6 +336,42 @@ defmodule Theine.Policy do
   end
 
   @doc """
+  Re-admits an entry found in the entries table by a maintenance restart
+  (specs/04 §Restart semantics step 3; specs/05 §Events `restore`): a row
+  under the table's `id`, `weight` and `expires_at`, placed at the
+  **probation** MRU in a bounded cache with no sketch increment, so the
+  rebuilt policy is cold and every entry is a candidate for eviction. A key
+  the policy already holds is left alone, whatever its id; the rebuild
+  scans a fixed table, so that only happens if the caller restores a key
+  twice.
+  """
+  @spec restore(t(), Entry.key(), Entry.id(), Entry.weight(), Entry.expires_at()) :: t()
+  def restore(%__MODULE__{order: nil} = state, key, id, weight, expires_at) do
+    seq = next_seq(state)
+
+    if :ets.insert_new(state.policy, {key, id, nil, seq, weight, expires_at}) do
+      true = :ets.insert(state.ids, {id, key})
+      add(state, 1, weight)
+      %{state | next_seq: seq + 1}
+    else
+      state
+    end
+  end
+
+  def restore(%__MODULE__{} = state, key, id, weight, expires_at) do
+    seq = next_seq(state)
+
+    if :ets.insert_new(state.policy, {key, id, :probation, seq, weight, expires_at}) do
+      true = :ets.insert(state.ids, {id, key})
+      true = :ets.insert(state.order, {{:probation, seq}, key})
+      add(state, 1, weight)
+      %{state | next_seq: seq + 1, probation_weight: state.probation_weight + weight}
+    else
+      state
+    end
+  end
+
+  @doc """
   Applies one read of the version `id`, as drained from the read buffer
   (specs/05 §Events `on_access`). Without a bound there is no order to keep
   and no read buffer to drain, so the state is returned unchanged.

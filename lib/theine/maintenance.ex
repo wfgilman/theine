@@ -74,13 +74,17 @@ defmodule Theine.Maintenance do
   The process's view of the cache. `segments`, `read_buffer` and `sketch`
   are `nil` in an unbounded cache, which allocates neither buffer nor
   sketch (specs/08 §Acceptance). `sketch.reset` is the cursor of a reset in
-  progress (specs/02 §Operations), or `nil`.
+  progress (specs/02 §Operations), or `nil`. `call_writes` counts the
+  write events consumed from the backpressure call path (specs/03
+  §Delivery with backpressure) since the process started or was last
+  `reset/1`.
   """
   @type info :: %{
           cache: Config.cache(),
           passes: non_neg_integer(),
           last_pass_duration: non_neg_integer() | nil,
           pending: integer(),
+          call_writes: non_neg_integer(),
           size: non_neg_integer(),
           weighted_size: non_neg_integer(),
           segments: Policy.weights() | nil,
@@ -123,6 +127,7 @@ defmodule Theine.Maintenance do
     passes: 0,
     last_pass_duration: nil,
     writes: 0,
+    call_writes: 0,
     sketch_reset: nil,
     drain_after: nil,
     deferred: nil
@@ -130,7 +135,8 @@ defmodule Theine.Maintenance do
 
   # `drain_after` is the monotonic time (native units) before which no
   # drain-triggered pass may start, set at the end of every pass; `deferred`
-  # is the timer of the one `:drain` waiting for it, or nil.
+  # is the timer of the one `:drain` waiting for it, or nil. `call_writes`
+  # counts the `{:event, _}` calls consumed, for `info/1`.
   @typep state :: %__MODULE__{
            cache: Config.cache(),
            config: Config.t(),
@@ -139,6 +145,7 @@ defmodule Theine.Maintenance do
            passes: non_neg_integer(),
            last_pass_duration: non_neg_integer() | nil,
            writes: non_neg_integer(),
+           call_writes: non_neg_integer(),
            sketch_reset: Sketch.reset_cursor() | nil,
            drain_after: integer() | nil,
            deferred: reference() | nil
@@ -215,15 +222,18 @@ defmodule Theine.Maintenance do
 
   @doc """
   Returns the process's view of the cache: pass count, last pass duration in
-  native time units, the `pending` write-event count, the entry count and
-  weighted size as last seen by the policy, and for a bounded cache the
-  segment weights, the read buffer's shape and lag (specs/03) and the
-  sketch's size, increments since its last reset and the cursor of a reset
-  in progress; those three are `nil` for `max_size: :infinity`.
+  native time units, the `pending` write-event count, the number of write
+  events consumed from the backpressure call path (`call_writes`, specs/03
+  §Delivery with backpressure; what `mix bench maintenance` reports as the
+  backpressure fraction), the entry count and weighted size as last seen by
+  the policy, and for a bounded cache the segment weights, the read
+  buffer's shape and lag (specs/03) and the sketch's size, increments since
+  its last reset and the cursor of a reset in progress; those three are
+  `nil` for `max_size: :infinity`.
 
       Theine.Maintenance.info(:sessions)
-      #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, size: 0,
-      #=>   weighted_size: 0, segments: nil, read_buffer: nil, sketch: nil}
+      #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, call_writes: 0,
+      #=>   size: 0, weighted_size: 0, segments: nil, read_buffer: nil, sketch: nil}
   """
   @spec info(Config.cache()) :: info()
   def info(cache) when is_atom(cache), do: GenServer.call(name(cache), :info)
@@ -348,6 +358,7 @@ defmodule Theine.Maintenance do
          passes: 0,
          last_pass_duration: nil,
          writes: 0,
+         call_writes: 0,
          sketch_reset: nil
      }}
   end
@@ -364,6 +375,7 @@ defmodule Theine.Maintenance do
       passes: state.passes,
       last_pass_duration: state.last_pass_duration,
       pending: :atomics.get(config.pending, 1),
+      call_writes: state.call_writes,
       size: Policy.size(config.sizes),
       weighted_size: Policy.weighted_size(config.sizes),
       segments: if(bounded?, do: Policy.weights(policy), else: nil),
@@ -398,7 +410,7 @@ defmodule Theine.Maintenance do
   # consumed, so the reply is the consumption, and it goes out before a pass
   # the event may trigger.
   def handle_call({:event, event}, from, state) do
-    state = apply_event(state, event)
+    state = apply_call_event(state, event)
     GenServer.reply(from, :ok)
     {:noreply, batch(state)}
   end
@@ -472,6 +484,13 @@ defmodule Theine.Maintenance do
   defp consumed(state, policy) do
     :atomics.sub(state.config.pending, 1, 1)
     %{state | policy: policy, writes: state.writes + 1}
+  end
+
+  # An event that arrived as a backpressure call (specs/03 §Delivery with
+  # backpressure): applied like any other, and counted for `info/1`.
+  defp apply_call_event(state, event) do
+    state = apply_event(state, event)
+    %{state | call_writes: state.call_writes + 1}
   end
 
   # The write-count trigger: a pass once `write_batch` events have been
@@ -554,7 +573,7 @@ defmodule Theine.Maintenance do
         flush(apply_event(state, event), limit - 1)
 
       {:"$gen_call", from, {:event, event}} ->
-        state = apply_event(state, event)
+        state = apply_call_event(state, event)
         GenServer.reply(from, :ok)
         flush(state, limit - 1)
     after

@@ -196,8 +196,12 @@ checked against a plain ETS table. Each subject is started fresh with
   writes keep evicting. Every `[:theine, :maintenance, :pass]` event during
   the run is collected.
 
-`--max-size` defaults to 1 000 000. M2.11 adds the `theine` subject. Until
-then every section says "no theine subject yet" and the bench exits 0.
+`--max-size` defaults to 1 000 000. The one subject is `theine`: a real
+cache started with `max_size`, `write_hwm` and otherwise the specs/08
+defaults, whose `size` is the entries table's count and whose
+`call_writes` is `Theine.Maintenance.info/1`'s field of that name (the
+backpressure calls the maintenance process consumed; specs/03 §Decisions
+M2.11), read before and after the mixed run.
 
 Extra `system` fields: `max_size`, `duration_s`, `sample_ms`, `settle_ms`,
 `write_hwm`, `pass_budget_ms`, `read_fraction`, `ttl_ms`, `zipf_s`,

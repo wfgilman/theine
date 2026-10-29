@@ -65,8 +65,34 @@ defmodule Theine.Bench.Maintenance do
     thresholds |> Enum.reject(& &1.passed) |> Enum.map(& &1.description)
   end
 
-  # Each subject is a Theine.Bench.Load subject map. M2.11 adds `theine`.
-  defp subjects, do: []
+  # Each subject is a Theine.Bench.Load subject map. `theine` is a real
+  # bounded cache started with the specs/08 defaults plus the run's
+  # `max_size` and `write_hwm`; its state is the cache name. The size is
+  # the entries table's own count (the table is named after the cache),
+  # and the call-path write count is the maintenance process's
+  # `call_writes` (specs/03 §Decisions M2.11).
+  defp subjects do
+    [
+      %{
+        name: "theine",
+        start: fn opts ->
+          name = :theine_bench_maintenance
+          {:ok, _sup} = Theine.start_link([name: name] ++ opts)
+          name
+        end,
+        put: fn name, key, value, ttl_ms ->
+          case ttl_ms do
+            nil -> Theine.put(name, key, value)
+            ttl -> Theine.put(name, key, value, ttl: ttl)
+          end
+        end,
+        get: fn name, key -> Theine.get(name, key) end,
+        size: fn name -> :ets.info(name, :size) end,
+        call_writes: fn name -> Theine.Maintenance.info(name).call_writes end,
+        stop: fn name -> Supervisor.stop(Theine.Supervisor.name(name)) end
+      }
+    ]
+  end
 
   # A fresh cache for each run, so the mixed run does not start from the
   # write run's leftovers.

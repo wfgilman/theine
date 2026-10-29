@@ -111,6 +111,12 @@ test/                         mirrors lib/; test/support for shared helpers
   full run replays DS1 at 8 M entries (about 3 GB of ETS) and takes about
   46 min (LRU-only was 8); run it in the background. Two runs must agree
   to the hit (the harness raises if a pass it did not request ran).
+- `mix bench maintenance` takes about 2 min at the default 1 M entries
+  (two 30 s runs plus 1 M puts); `--max-size 10000 --duration 1` smokes it
+  in seconds and shows the same overshoot structure. To attribute an
+  overshoot, `bench/results/overshoot-m211.exs` (gitignored) samples the
+  table size, the policy's `sizes` atomics and `pending` together: table =
+  policy + pending + in flight tells which side the excess is on.
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

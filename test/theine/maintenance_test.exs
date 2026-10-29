@@ -78,6 +78,7 @@ defmodule Theine.MaintenanceTest do
              passes: 0,
              last_pass_duration: nil,
              pending: 0,
+             call_writes: 0,
              size: 0,
              weighted_size: 0,
              segments: nil,
@@ -87,6 +88,77 @@ defmodule Theine.MaintenanceTest do
 
     :atomics.add(Config.get(cache).pending, 1, 3)
     assert Maintenance.info(cache).pending == 3
+  end
+
+  describe "info/1 call_writes (specs/03 §Decisions M2.11)" do
+    @hwm 4
+
+    setup do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache, max_size: :infinity, write_hwm: @hwm, test_hooks: true] ++ @quiet}
+      )
+
+      %{cache: cache, config: Config.get(cache)}
+    end
+
+    test "counts the events consumed as backpressure calls and not the sent ones", %{
+      cache: cache,
+      config: config
+    } do
+      for i <- 1..@hwm, do: :ok = Theine.put(cache, i, i)
+      :ok = Maintenance.run(cache)
+      assert %{call_writes: 0, pending: 0} = Maintenance.info(cache)
+
+      # With `pending` held at the high-water mark every put takes the call
+      # path: add_get gives hwm + 1, the process consumes it back to hwm.
+      :atomics.add(config.pending, 1, @hwm)
+      for i <- 1..3, do: :ok = Theine.put(cache, i, i)
+      assert %{call_writes: 3, pending: @hwm} = Maintenance.info(cache)
+
+      :atomics.sub(config.pending, 1, @hwm)
+      :ok = Theine.put(cache, 1, 1)
+      :ok = Maintenance.run(cache)
+      assert %{call_writes: 3, pending: 0} = Maintenance.info(cache)
+    end
+
+    test "counts the calls a pass flushes from the mailbox", %{cache: cache, config: config} do
+      maintenance = Process.whereis(Maintenance.name(cache))
+      :ok = Maintenance.pause(cache)
+
+      # Queue a run/1 call ahead of the writers' calls, so that the pass it
+      # triggers consumes them in its step-1 flush rather than handle_call.
+      runner = Task.async(fn -> Maintenance.run(cache) end)
+
+      assert_eventually(fn ->
+        Process.info(maintenance, :message_queue_len) == {:message_queue_len, 1}
+      end)
+
+      :atomics.add(config.pending, 1, @hwm)
+      writers = for i <- 1..2, do: Task.async(fn -> Theine.put(cache, i, i) end)
+
+      assert_eventually(fn ->
+        Process.info(maintenance, :message_queue_len) == {:message_queue_len, 3}
+      end)
+
+      :ok = Maintenance.resume(cache)
+      assert Task.await(runner) == :ok
+      assert Enum.map(writers, &Task.await/1) == [:ok, :ok]
+
+      assert %{call_writes: 2, passes: 1, pending: @hwm} = Maintenance.info(cache)
+      :atomics.sub(config.pending, 1, @hwm)
+    end
+
+    test "reset/1 zeroes it", %{cache: cache, config: config} do
+      :atomics.add(config.pending, 1, @hwm)
+      :ok = Theine.put(cache, 1, 1)
+      :atomics.sub(config.pending, 1, @hwm)
+      assert %{call_writes: 1} = Maintenance.info(cache)
+
+      :ok = Maintenance.reset(cache)
+      assert %{call_writes: 0} = Maintenance.info(cache)
+    end
   end
 
   test "init/1 seeds :rand from the cache name", %{cache: cache} do

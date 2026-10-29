@@ -249,3 +249,14 @@ new process registers, and the mutation preceded the send.
   with the previous stripe's last slots either way; a slots-first order would.
   Worth revisiting only on a machine with more cores, where cross-stripe
   sharing and the per-op cost under SMT both change.
+- 2026-10-29 (M2.11): where the count of call-path writes lives, which
+  §Delivery with backpressure left open and `mix bench maintenance` needs
+  for its backpressure fraction (specs/09 §Decisions M0.6). The maintenance
+  process counts every `{:event, _}` call it consumes, on both of its
+  consumption paths (`handle_call/3` and a pass's step-1 flush), and
+  `Theine.Maintenance.info/1` reports it as `call_writes`; `reset/1` zeroes
+  it with the pass count. The writer side is not touched: a counter there
+  would add an op to the write path for a figure only the bench and
+  operators read, while the maintenance process already sees each call one
+  at a time, so the count is exact and free. The bench takes the difference
+  of two `info/1` reads around the mixed run.

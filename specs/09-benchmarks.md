@@ -353,3 +353,17 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   under a concurrent `mix test --repeat-until-failure` load, and the
   replay test passed 300 full-suite repeats. The full run's rows and cost
   are in IMPLEMENTATION_PLAN.md §Benchmark log M2.11e.
+- 2026-10-29 (M2.11b): a correction to the M2.8d entry above. Its "running,
+  2 schedulers on separate cores" column did not measure separate cores.
+  In probes of this kind, which pin the reader and leave the maintenance
+  process unpinned, every pass with four schedulers and 73–100% of them
+  with two ran on the reader's own scheduler. M2.11b counted that with a
+  telemetry handler. So the growth with n that M2.8d attributed to L3
+  traffic is the pass's CPU time on the reader's scheduler. It grows with
+  n because each drained read costs more in larger tables (specs/04
+  §Decisions M2.11b). The rest of the M2.8d entry stands: the paused rows,
+  the ring levers, the SMT cost of the atomics ops, and the bounded
+  subject's floor. A probe that means to put the two on separate schedulers
+  must check where the passes ran, with `:erlang.system_info(:scheduler_id)`
+  in a `[:theine, :maintenance, :pass]` handler; `+S` alone does not place
+  them.

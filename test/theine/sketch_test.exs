@@ -70,6 +70,24 @@ defmodule Theine.SketchTest do
     one_of([integer(), binary(), atom(:alphanumeric), tuple({atom(:alphanumeric), integer()})])
   end
 
+  defp reference_positions(%Sketch{block_mask: block_mask}, key) do
+    mask32 = 0xFFFFFFFF
+    h = :erlang.phash2(key, 4_294_967_296)
+    h = bxor(h, h >>> 17)
+    h = h * 0xED5AD4BB &&& mask32
+    h = bxor(h, h >>> 11)
+    h = h * 0xAC4C1B51 &&& mask32
+    h = bxor(h, h >>> 15)
+    c = h * 0x31848BAB &&& mask32
+    c = bxor(c, c >>> 14)
+    block = (h &&& block_mask) * 8
+
+    for i <- 0..3 do
+      ci = c >>> (i * 8)
+      {block + 2 * i + (ci &&& 1), (ci >>> 1 &&& 15) * 4}
+    end
+  end
+
   describe "layout" do
     test "words/1 is max(8, next_power_of_two(max_size)) capped at 2^30" do
       assert Sketch.words(1) == 8
@@ -116,6 +134,17 @@ defmodule Theine.SketchTest do
           assert (index - block) in [2 * i, 2 * i + 1]
           assert offset in 0..60//4
         end
+      end
+    end
+
+    property "positions follow specs/02 §Hashing computed with full-width products" do
+      # The module multiplies in 16-bit halves to stay below the bignum limit
+      # (specs/02 §Decisions M2.11b); this reference takes the full products
+      # and masks them, as the spec writes the mixers.
+      check all key <- one_of([key_gen(), integer(0..0xFFFFFFFF)]),
+                max_size <- integer(1..100_000) do
+        sketch = Sketch.new(max_size)
+        assert Sketch.positions(sketch, key) == reference_positions(sketch, key)
       end
     end
 

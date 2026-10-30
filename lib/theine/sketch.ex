@@ -47,6 +47,7 @@ defmodule Theine.Sketch do
   @min_words 8
   @max_words 1 <<< 30
   @mask32 0xFFFFFFFF
+  @mask16 0xFFFF
   @nibble 0xF
   @reset_chunk 16_384
   # Clears the top bit of every nibble of a 32-bit half after the shift, so
@@ -283,18 +284,28 @@ defmodule Theine.Sketch do
   # by 15 is their count; a half has 8 nibbles, so the count never wraps.
   defp odd_nibbles(half), do: rem(half &&& @one_mask32, 15)
 
-  # Caffeine's 32-bit mixers, with the multiplications masked to 32 bits.
+  # Caffeine's 32-bit mixers, with the multiplications taken modulo 2^32.
   defp spread(h) do
     h = bxor(h, h >>> 17)
-    h = h * 0xED5AD4BB &&& @mask32
+    h = mul32(h, 0xED5AD4BB)
     h = bxor(h, h >>> 11)
-    h = h * 0xAC4C1B51 &&& @mask32
+    h = mul32(h, 0xAC4C1B51)
     bxor(h, h >>> 15)
   end
 
   defp rehash(h) do
-    h = h * 0x31848BAB &&& @mask32
+    h = mul32(h, 0x31848BAB)
     bxor(h, h >>> 14)
+  end
+
+  # `h * c` modulo 2^32 for 32-bit `h` and `c` without a bignum: the full
+  # product reaches 2^64, past the BEAM's 2^59 small-integer limit, and the
+  # bignum arithmetic cost about 95 ns per hash (specs/02 §Decisions
+  # M2.11b). With `h = hi * 2^16 + lo`, `h * c = lo * c + hi * c * 2^16`, and
+  # modulo 2^32 only the low 16 bits of `hi * c` survive the shift, which are
+  # those of `hi * (c &&& 0xFFFF)`; every intermediate stays below 2^49.
+  defp mul32(h, c) do
+    (h &&& @mask16) * c + (((h >>> 16) * (c &&& @mask16)) <<< 16) &&& @mask32
   end
 
   defp ceil_pow2(n, acc) when acc >= n, do: acc

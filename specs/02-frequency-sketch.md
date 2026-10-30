@@ -36,7 +36,9 @@ h ^= h >>> 11; h *= 0xac4c1b51; h ^= h >>> 15`, masked to 32 bits; use that).
 `blocks = words / 8`. A second mixer picks the counters, so that the bits
 that chose the block do not also choose a counter:
 `c = rehash(h)` with `c = h * 0x31848bab; c ^= c >>> 14`, masked to 32 bits
-(Caffeine's `rehash`). Then for `i in 0..3`:
+(Caffeine's `rehash`). The products are taken modulo 2^32 without forming
+the full 64-bit product, which would be a bignum on the BEAM (§Decisions
+M2.11b); the result is the same. Then for `i in 0..3`:
 
 ```
 ci      = c >>> (i * 8)
@@ -149,3 +151,23 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
   passes instead of 16; the sketch is lossy and specs/04 says to size caps
   from measurements. M2.11 measures the whole pass and may change the
   figure again.
+- 2026-10-29 (M2.11b): the three 32-bit multiplications of the hash are
+  done in 16-bit halves: `(h * c) mod 2^32` is `(lo * c + ((hi * (c &&&
+  0xFFFF)) <<< 16)) &&& 0xFFFFFFFF` for `h = hi * 2^16 + lo`, whose
+  intermediates stay below 2^49. The full product of two 32-bit numbers
+  reaches 2^64, past the 2^59 small-integer limit, so each multiplication
+  allocated a bignum, and the hash of one key took 174 ns against 79 ns in
+  halves (probe `bench/results/sketch-m211b.exs`, gitignored); the sketch
+  is hashed on every drained read and every new key (specs/04 §Decisions
+  M2.11b), so `increment/2` went from about 450 to about 360 ns at n =
+  100_000. The layout vectors are unchanged, and a property test checks
+  `positions/2` against the full-width formula on random keys. One other
+  idea was weighed and not taken: replacing the read and the add of each
+  counter with one `add_get`, undone by a `sub` when the nibble wrapped,
+  saves an op on a counter below 15 but costs one on a saturated counter,
+  and by the Zipf(1.0) arithmetic about three quarters of the bench's
+  reads at n = 100_000 go to keys seen at least 15 times per sample
+  period. Reading the four words is about 160 ns of what remains: the
+  atomics ops themselves (18–25 ns each, AGENTS.md) and likely a miss on a
+  block that spans two cache lines, since the array's alignment is not
+  known.

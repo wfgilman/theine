@@ -23,20 +23,25 @@ window (§Adaptive window), which is on by default and moves it from there.
 
 ```
 policy  :set          {key, id, segment, seq, weight, expires_at}
-order   :ordered_set  {{segment, seq}, key}
+order   :ordered_set  {base(segment) + seq, key}
 ids     :set          {id, key}
 ```
 
 - `segment` ∈ `:window | :probation | :protected`.
 - `seq` is from a monotonically increasing integer in the maintenance state,
-  starting at 1. Larger `seq` means more recently used. The LRU end of a
-  segment is `:ets.next(order, {segment, 0})` when the returned key's
-  segment matches (`{segment, 0}` sorts before every `{segment, positive}`).
-  The MRU end is `:ets.prev(order, {segment, @max_seq})` with
-  `@max_seq = 1 <<< 62`; `seq` must never reach it (it would take centuries
-  at a billion writes per second, but assert it in a test anyway). Atoms
-  sort after integers in Erlang term order, so `:infinity` would not work as
-  an upper sentinel; that is why the integer sentinel exists.
+  starting at 1. Larger `seq` means more recently used.
+- An `order` key is one integer, `base(segment) + seq`, with
+  `@max_seq = 1 <<< 56` and `base` = 1, 2 and 3 times `@max_seq` for
+  probation, protected and window: the segment sits in the bits above
+  `seq`, so the keys sort by segment, then seq, and stay below 2^59, the
+  BEAM's small-integer limit (§Decisions M2.11b). `seq` must stay below
+  `@max_seq` (about 2.3 years at a billion moves per second, centuries at
+  any rate the pass can reach; assert it in a test anyway), so `base` and
+  `base + @max_seq` bound a segment and are never keys themselves. The LRU
+  end of a segment is `:ets.next(order, base(segment))` when the returned
+  key is below `base(segment) + @max_seq`; the MRU end is
+  `:ets.prev(order, base(segment) + @max_seq)` when the returned key is
+  above `base(segment)`.
 - `window_weight`, `probation_weight`, `protected_weight` are integers in
   the maintenance state.
 
@@ -333,6 +338,28 @@ the window moves, and records the answer in §Decisions. Unbounded
   1`) the two are identical, and the full `mix bench hitrate` run after
   the change (IMPLEMENTATION_PLAN.md §Benchmark log M2.11c) is the record
   of what the default 32-access batches lose or gain.
+- 2026-10-29 (M2.11b): `order` keys are one integer, `base(segment) +
+  seq`, not the tuple `{segment, seq}` (§State). The maintenance pass's
+  cost per drained read is what a co-scheduled reader pays (specs/04
+  §Decisions M2.11b), and the order move was its largest part: at n =
+  100_000 a lookup, an `order` delete and insert and an `update_element`
+  took 1_124–1_218 ns with tuple keys and 689–725 ns with integer keys
+  (probe `bench/results/onaccess-m211b.exs`, gitignored). The AVL walk
+  compares keys at every level, and an integer comparison is a machine
+  compare where a tuple's goes through the generic term order, element by
+  element; the row is also three words smaller (no boxed key tuple). `@max_seq` drops from 2^62
+  to 2^56 so that every key stays a small integer (window's
+  `3 * 2^56 + seq` is below 2^59), which only shortens the time to the
+  sentinel from millennia to years at a billion moves per second. The
+  tables, the segment order of `order_rows/1` (probation, protected,
+  window, as the atoms sorted before) and every decision of the policy are
+  unchanged, so the replays of `mix bench hitrate` give the same hits
+  (IMPLEMENTATION_PLAN.md §Benchmark log M2.11b). `Policy.order_key/2`
+  exposes the encoding to tests. In the same task the drain's common case
+  (a hit in window or protected) does one struct update instead of two,
+  and a promotion and each demotion step one instead of three. A struct
+  update cost 55–145 ns in the probes, as much as an ETS `update_element`,
+  because `%{s | k: v}` copies the whole 20-field map.
 - 2026-10-29 (after M2.10, human decision): the adaptive window moved from M6
   into M2 and is on by default (`adaptive: true`), so that `theine ≥ lru`
   holds on recency-driven traces such as OLTP (specs/00 §Decisions). Its

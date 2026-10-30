@@ -364,6 +364,21 @@ defmodule Theine.PolicyTest do
       assert Policy.weighted_size(policy.sizes) == 1
     end
 
+    test "order keys are small integers that keep the segments apart up to the sentinel" do
+      # specs/05 §State: `base(segment) + seq` sorts by segment, then seq, and
+      # never becomes a bignum, whose comparisons would cost the tree walk.
+      last = Policy.max_seq() - 1
+
+      for segment <- [:probation, :protected, :window] do
+        assert :erts_debug.flat_size(Policy.order_key(segment, last)) == 0
+      end
+
+      assert Policy.order_key(:probation, last) < Policy.order_key(:protected, 1)
+      assert Policy.order_key(:protected, last) < Policy.order_key(:window, 1)
+      assert Policy.order_key(:window, last) < Bitwise.bsl(1, 59)
+      assert_raise FunctionClauseError, fn -> Policy.order_key(:window, Policy.max_seq()) end
+    end
+
     test "the sentinel sorts after every live order key" do
       policy = %{bounded(100) | next_seq: Policy.max_seq() - 2}
       policy = Policy.on_write(policy, :a, 1, 1, :infinity)
@@ -1067,8 +1082,8 @@ defmodule Theine.PolicyTest do
   defp place(policy, key, segment) do
     {:ok, {^key, _id, from, seq, weight, _}} = Policy.lookup(policy, key)
     new_seq = policy.next_seq
-    true = :ets.delete(policy.order, {from, seq})
-    true = :ets.insert(policy.order, {{segment, new_seq}, key})
+    true = :ets.delete(policy.order, Policy.order_key(from, seq))
+    true = :ets.insert(policy.order, {Policy.order_key(segment, new_seq), key})
     true = :ets.update_element(policy.policy, key, [{3, segment}, {4, new_seq}])
 
     policy
@@ -1307,7 +1322,8 @@ defmodule Theine.PolicyTest do
 
     for {key, _id, segment, seq, _weight, _} <- rows do
       assert segment in [:window, :probation, :protected]
-      assert :ets.lookup(policy.order, {segment, seq}) == [{{segment, seq}, key}]
+      order_key = Policy.order_key(segment, seq)
+      assert :ets.lookup(policy.order, order_key) == [{order_key, key}]
     end
 
     sums =

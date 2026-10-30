@@ -363,3 +363,65 @@ reports the scan's `duration`, `entries` and `chunks`.
   this load, so a pass that ages while it flushes a full cap reaches about
   6 ms. That is at most 64 passes per reset at 1_000_000, under 1% of
   passes, so the p99 still holds there.
+- 2026-10-29 (M2.11b): what a running maintenance process costs a reader,
+  and the floor of that cost on the reference machine. M2.8d measured that
+  one pinned reader's hit is 20–50 ns slower with the process running than
+  paused at n ≥ 100_000. It read that as the pass's memory traffic through
+  the policy tables sharing the L3 with the reader, because the gap
+  survived `+S 2`, which was taken to put the two processes on separate
+  physical cores. They were not on separate cores. A telemetry handler
+  that records `:erlang.system_info(:scheduler_id)` for each pass shows
+  that the unpinned maintenance process ran on the reader's own scheduler
+  for every pass with `+S 4` and for 73–100% of them with `+S 2`. A wakeup
+  lands on the run queue the process last ran on, and evidently nothing
+  moves it from there while the only other process on that queue is bound.
+  So the gap is the pass's CPU time taken from the reader's scheduler,
+  plus the reader's lines the pass evicts from the core they share. It is
+  not cross-core traffic: a replica of the pass on a worker pinned to the
+  other scheduler did the same work (`Policy.on_access/2` on a copy of the
+  policy, one drain of the real ring per millisecond) and cost the reader
+  between −6 and +16 ns. The gap therefore scales with the pass's cost per
+  drained read. The pass drains about 63 reads every 2 ms, at a duty
+  cycle of 8.3–10% before this task, and the gap is that fraction of a
+  ~400 ns hit plus the cache misses.
+  Where the cost per read went, at n = 100_000 in compiled loops (probes
+  `bench/results/{footprint,onaccess,sketch,policy}-m211b.exs`, gitignored):
+  the `ids` lookup 154–163 ns, the `policy` lookup about the same, the
+  `order` delete, insert and `update_element` about 950 ns with tuple keys,
+  the sketch increment 450–550 ns, and each struct update 55–145 ns. Three
+  changes, none of which changes a policy decision: integer `order` keys
+  (specs/05 §Decisions M2.11b), the sketch hash without bignums (specs/02
+  §Decisions M2.11b), and one struct update per hit instead of two (and per
+  promotion or demotion step instead of three). Measured before and after in one VM: the gap probe
+  (`bench/results/gap-m211b.exs`, five paused/running pairs per n, one
+  reader pinned to scheduler 1, `+sbt db +sbwt very_long`) compiles the
+  previous revision's `Policy` and `Sketch` from `git show` and runs them
+  through the `policy_module` hook.
+
+  | n | tree | `on_access` alone | pass, per drained read | pass duty | gap, median (range) |
+  | --- | --- | --- | --- | --- | --- |
+  | 100_000 | before | 2_412 ns | 2_580–2_690 ns | 8.3–8.6% | 42 ns (35–51) |
+  | 100_000 | after | 1_755 ns | 1_875–1_950 ns | 6.0–6.3% | 38 ns (30–47) |
+  | 1_000_000 | before | 2_869 ns | 2_751–3_187 ns | 8.8–10.0% | 54 ns (39–57) |
+  | 1_000_000 | after | 2_070 ns | 2_139–2_288 ns | 6.8–7.3% | 37 ns (32–43, one outlier at 127) |
+
+  The write side gained as much: `on_write/5` plus `evict/1` of a new key in
+  a full cache went from 9.3 to 6.9 µs at 100_000 and from 11.1 to 8.7 µs
+  at 1_000_000. `mix bench maintenance` passes faster: p50 1.50–1.57 ms
+  and p99 2.81–2.90 ms, against 1.81–1.83 and 3.34 for M2.11d. That is the
+  floor M2.11b records. The gap is 37–38 ns at n = 100_000 and
+  1_000_000, against the 20 ns the task asked for. Reaching 20 ns would
+  need the cost per read roughly halved again, to about 1 µs. The levers
+  left, none taken here:
+  - Folding `ids` into the `policy` table saves one lookup per read (about
+    155 ns, 8%), but it adds one to every write and removal.
+  - Skipping the sketch increment for a protected key saves about 360 ns.
+    But it departs from Caffeine, which counts every access, and it lowers
+    a demoted key's frequency at admission, so it needs a specs/02 and 05
+    decision and a `mix bench hitrate` run.
+  - Raising `drain_backoff` changes nothing at this pass length. 3 × and
+    7 × a 120 µs pass both round up to the same 1 ms timer (not measured).
+  Outside a probe, readers are not pinned and the scheduler places the
+  maintenance process wherever it likes. The gap then shows up as
+  maintenance CPU spread over every reader's hits rather than as one
+  reader's loss, and its size per hit is the same.

@@ -5,15 +5,16 @@ defmodule Theine.Policy do
   private to it.
 
       policy  :set          {key, id, segment, seq, weight, expires_at}
-      order   :ordered_set  {{segment, seq}, key}
+      order   :ordered_set  {base(segment) + seq, key}
       ids     :set          {id, key}
 
   In a bounded cache (`max_size` an integer) every key sits in one of three
   LRU segments, `:window`, `:probation` or `:protected`, ordered by `seq`:
   a monotonically increasing integer assigned on every placement, so a
-  larger `seq` means more recently used. The LRU end of a segment is the
-  first `order` key after `{segment, 0}` and the MRU end the last key
-  before `{segment, max_seq()}` (specs/05 §State). New keys enter at the
+  larger `seq` means more recently used. An `order` key is the segment's
+  base, a multiple of `max_seq()`, plus the seq. The LRU end of a segment is
+  the first `order` key after `base(segment)` and the MRU end the last key
+  before `base(segment) + max_seq()` (specs/05 §State). New keys enter at the
   window MRU and an overwrite is an access that moves the key to the MRU of
   its current segment; both count the key in the frequency sketch
   (specs/02). A read drained from the read buffer (`on_access/2`) moves the
@@ -124,10 +125,19 @@ defmodule Theine.Policy do
   @size 1
   @weighted_size 2
 
-  # Upper sentinel of the `order` table (specs/05 §State): `{segment,
-  # @max_seq}` sorts after every live `{segment, seq}`, and `seq` must never
-  # reach it. Atoms sort after integers, so `:infinity` could not serve.
-  @max_seq 1 <<< 62
+  # Keys of the `order` table (specs/05 §State): the segment's rank in the
+  # bits above `@seq_bits` and `seq` below, so `base(segment) + seq` sorts
+  # by segment, then seq, and stays a small integer (under 2^59) whatever
+  # the segment. An integer key costs the tree walk about 40% less than a
+  # `{segment, seq}` tuple (specs/05 §Decisions M2.11b). `seq` must stay
+  # below `@max_seq`, so `base(segment)` and `base(segment) + @max_seq`
+  # bound a segment and are never keys themselves (`seq` starts at 1).
+  @seq_bits 56
+  @max_seq 1 <<< @seq_bits
+  @seq_mask @max_seq - 1
+  @probation_base 1 <<< @seq_bits
+  @protected_base 2 <<< @seq_bits
+  @window_base 3 <<< @seq_bits
 
   @doc "Index of the entry count in `config.sizes`."
   @spec size_index() :: 1
@@ -138,13 +148,13 @@ defmodule Theine.Policy do
   def weighted_size_index, do: @weighted_size
 
   @doc """
-  The `seq` sentinel: `{segment, max_seq()}` is the upper bound of a segment
-  in the `order` table, and no row is ever given it.
+  The `seq` sentinel: every `seq` is below it, so that a segment's `order`
+  keys stay within its range, and no row is ever given it.
 
       iex> Theine.Policy.max_seq()
-      4_611_686_018_427_387_904
+      72_057_594_037_927_936
   """
-  @spec max_seq() :: 4_611_686_018_427_387_904
+  @spec max_seq() :: 72_057_594_037_927_936
   def max_seq, do: @max_seq
 
   @doc """
@@ -302,7 +312,7 @@ defmodule Theine.Policy do
     seq = next_seq(state)
     true = :ets.insert(state.policy, {key, id, :window, seq, weight, expires_at})
     true = :ets.insert(state.ids, {id, key})
-    true = :ets.insert(state.order, {{:window, seq}, key})
+    true = :ets.insert(state.order, {@window_base + seq, key})
     add(state, 1, weight)
 
     %{state | next_seq: seq + 1, window_weight: state.window_weight + weight}
@@ -313,18 +323,34 @@ defmodule Theine.Policy do
   # sketch. Nothing to do without a bound.
   defp touch(%__MODULE__{order: nil} = state, _key, nil, _old_seq), do: state
 
-  defp touch(%__MODULE__{} = state, key, segment, old_seq) do
-    state |> move(key, segment, old_seq, segment) |> sample(key)
+  defp touch(%__MODULE__{} = state, key, segment, old_seq),
+    do: reorder_and_sample(state, key, segment, old_seq)
+
+  # A move to the MRU of the key's own segment and its sketch count, with
+  # one struct update: a struct update costs about as much as an ETS
+  # update_element here, and this is the drain's common case (specs/05
+  # §Decisions M2.11b).
+  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq) do
+    seq = next_seq(state)
+    reorder(state, key, segment, old_seq, segment, seq)
+    :ok = Sketch.increment(state.sketch, key)
+    %{state | next_seq: seq + 1, sketch_size: size + 1}
   end
 
   # Moves `key` from `{from, old_seq}` to the MRU end of `to` with a fresh
-  # seq (one delete and one insert on `order`, one update on `policy`).
+  # seq.
   defp move(%__MODULE__{} = state, key, from, old_seq, to) do
     seq = next_seq(state)
-    true = :ets.delete(state.order, {from, old_seq})
-    true = :ets.insert(state.order, {{to, seq}, key})
-    true = :ets.update_element(state.policy, key, [{@row_segment, to}, {@row_seq, seq}])
+    reorder(state, key, from, old_seq, to, seq)
     %{state | next_seq: seq + 1}
+  end
+
+  # The table side of a move: one delete and one insert on `order`, one
+  # update on `policy`.
+  defp reorder(%__MODULE__{order: order, policy: policy}, key, from, old_seq, to, seq) do
+    true = :ets.delete(order, base(from) + old_seq)
+    true = :ets.insert(order, {base(to) + seq, key})
+    true = :ets.update_element(policy, key, [{@row_segment, to}, {@row_seq, seq}])
   end
 
   # Counts one access to `key` in the sketch; `sketch_size` is what the
@@ -363,7 +389,7 @@ defmodule Theine.Policy do
 
     if :ets.insert_new(state.policy, {key, id, :probation, seq, weight, expires_at}) do
       true = :ets.insert(state.ids, {id, key})
-      true = :ets.insert(state.order, {{:probation, seq}, key})
+      true = :ets.insert(state.order, {@probation_base + seq, key})
       add(state, 1, weight)
       %{state | next_seq: seq + 1, probation_weight: state.probation_weight + weight}
     else
@@ -395,28 +421,32 @@ defmodule Theine.Policy do
   def on_access(%__MODULE__{} = state, id) do
     with [{^id, key}] <- :ets.lookup(state.ids, id),
          [{^key, ^id, segment, seq, weight, _expires_at}] <- :ets.lookup(state.policy, key) do
-      state |> access(key, segment, seq, weight) |> sample(key)
+      access(state, key, segment, seq, weight)
     else
       _ -> state
     end
   end
 
-  defp access(state, key, :window, seq, _weight), do: move(state, key, :window, seq, :window)
-
-  defp access(state, key, :protected, seq, _weight),
-    do: move(state, key, :protected, seq, :protected)
-
+  # A promotion: probation → protected MRU, then demote until it fits.
   defp access(%__MODULE__{protected_max: max} = state, key, :probation, seq, weight)
-       when weight > max,
-       do: move(state, key, :probation, seq, :probation)
+       when weight <= max do
+    new_seq = next_seq(state)
+    reorder(state, key, :probation, seq, :protected, new_seq)
+    :ok = Sketch.increment(state.sketch, key)
 
-  defp access(state, key, :probation, seq, weight) do
-    state
-    |> move(key, :probation, seq, :protected)
-    |> add_segment(:probation, -weight)
-    |> add_segment(:protected, weight)
-    |> demote()
+    demote(%{
+      state
+      | next_seq: new_seq + 1,
+        sketch_size: state.sketch_size + 1,
+        probation_weight: state.probation_weight - weight,
+        protected_weight: state.protected_weight + weight
+    })
   end
+
+  # Window → window MRU, protected → protected MRU, and a probation entry
+  # too heavy for protected → probation MRU.
+  defp access(state, key, segment, seq, _weight),
+    do: reorder_and_sample(state, key, segment, seq)
 
   # Demotes protected LRU entries to probation MRU until the protected
   # segment fits. Every step removes a positive weight, and the segment is
@@ -425,15 +455,17 @@ defmodule Theine.Policy do
     do: state
 
   defp demote(%__MODULE__{order: order, policy: policy} = state) do
-    {:protected, seq} = order_key = :ets.next(order, {:protected, 0})
-    key = :ets.lookup_element(order, order_key, 2)
+    {seq, key} = lru_entry(order, :protected)
     weight = :ets.lookup_element(policy, key, @row_weight)
+    new_seq = next_seq(state)
+    reorder(state, key, :protected, seq, :probation, new_seq)
 
-    state
-    |> move(key, :protected, seq, :probation)
-    |> add_segment(:protected, -weight)
-    |> add_segment(:probation, weight)
-    |> demote()
+    demote(%{
+      state
+      | next_seq: new_seq + 1,
+        protected_weight: state.protected_weight - weight,
+        probation_weight: state.probation_weight + weight
+    })
   end
 
   defp next_seq(%__MODULE__{next_seq: seq}) when seq < @max_seq, do: seq
@@ -506,8 +538,7 @@ defmodule Theine.Policy do
     do: {state, n}
 
   defp overflow(%__MODULE__{order: order, policy: policy} = state, n) do
-    {:window, seq} = order_key = :ets.next(order, {:window, 0})
-    key = :ets.lookup_element(order, order_key, 2)
+    {seq, key} = lru_entry(order, :window)
     weight = :ets.lookup_element(policy, key, @row_weight)
 
     state
@@ -536,13 +567,11 @@ defmodule Theine.Policy do
     do: w + p + m
 
   defp decide(%__MODULE__{order: order, candidates: candidates} = state) do
-    case :ets.next(order, {:probation, 0}) do
-      {:probation, _victim_seq} = victim_key when candidates == 0 ->
-        remove(state, :ets.lookup_element(order, victim_key, 2))
+    case lru_entry(order, :probation) do
+      {_victim_seq, victim} when candidates == 0 ->
+        remove(state, victim)
 
-      {:probation, victim_seq} = victim_key ->
-        victim = :ets.lookup_element(order, victim_key, 2)
-
+      {victim_seq, victim} ->
         case candidate(state) do
           nil ->
             # The cursor walked past the batch's overflows: every remaining
@@ -562,14 +591,14 @@ defmodule Theine.Policy do
               else: remove(state, candidate)
         end
 
-      _probation_empty ->
-        case :ets.next(order, {:protected, 0}) do
-          {:protected, _seq} = order_key ->
-            remove(state, :ets.lookup_element(order, order_key, 2))
+      nil ->
+        case lru_entry(order, :protected) do
+          {_seq, key} ->
+            remove(state, key)
 
-          _protected_empty ->
-            {:window, _seq} = order_key = :ets.next(order, {:window, 0})
-            remove(state, :ets.lookup_element(order, order_key, 2))
+          nil ->
+            {_seq, key} = lru_entry(order, :window)
+            remove(state, key)
         end
     end
   end
@@ -584,14 +613,17 @@ defmodule Theine.Policy do
     bound = cursor || @max_seq
 
     found =
-      case :ets.lookup(order, {:probation, bound}) do
-        [{{:probation, ^bound}, key}] ->
+      case :ets.lookup(order, @probation_base + bound) do
+        [{_order_key, key}] ->
           {bound, key}
 
         [] ->
-          case :ets.prev(order, {:probation, bound}) do
-            {:probation, seq} = order_key -> {seq, :ets.lookup_element(order, order_key, 2)}
-            _ -> nil
+          case :ets.prev(order, @probation_base + bound) do
+            order_key when is_integer(order_key) and order_key > @probation_base ->
+              {order_key - @probation_base, :ets.lookup_element(order, order_key, 2)}
+
+            _ ->
+              nil
           end
       end
 
@@ -602,9 +634,12 @@ defmodule Theine.Policy do
   end
 
   defp previous(order, seq) do
-    case :ets.prev(order, {:probation, seq}) do
-      {:probation, prev} -> prev
-      _ -> 0
+    case :ets.prev(order, @probation_base + seq) do
+      order_key when is_integer(order_key) and order_key > @probation_base ->
+        order_key - @probation_base
+
+      _ ->
+        0
     end
   end
 
@@ -666,7 +701,7 @@ defmodule Theine.Policy do
   defp drop(state, {key, id, segment, seq, weight, _expires_at}) do
     true = :ets.delete(state.policy, key)
     true = :ets.delete(state.ids, id)
-    if state.order, do: true = :ets.delete(state.order, {segment, seq})
+    if state.order, do: true = :ets.delete(state.order, base(segment) + seq)
     add(state, -1, -weight)
     add_segment(state, segment, -weight)
   end
@@ -710,7 +745,7 @@ defmodule Theine.Policy do
   """
   @spec lru(t(), :window | :probation | :protected) :: {:ok, Entry.key()} | :error
   def lru(%__MODULE__{order: order}, segment) when not is_nil(order) do
-    end_of(order, segment, :ets.next(order, {segment, 0}))
+    end_of(lru_entry(order, segment))
   end
 
   @doc """
@@ -719,13 +754,56 @@ defmodule Theine.Policy do
   """
   @spec mru(t(), :window | :probation | :protected) :: {:ok, Entry.key()} | :error
   def mru(%__MODULE__{order: order}, segment) when not is_nil(order) do
-    end_of(order, segment, :ets.prev(order, {segment, @max_seq}))
+    base = base(segment)
+
+    case :ets.prev(order, base + @max_seq) do
+      order_key when is_integer(order_key) and order_key > base ->
+        {:ok, :ets.lookup_element(order, order_key, 2)}
+
+      _ ->
+        :error
+    end
   end
 
-  defp end_of(order, segment, {segment, _seq} = order_key),
-    do: {:ok, :ets.lookup_element(order, order_key, 2)}
+  defp end_of({_seq, key}), do: {:ok, key}
+  defp end_of(nil), do: :error
 
-  defp end_of(_order, _segment, _other), do: :error
+  # The `{seq, key}` at the LRU end of `segment`, or nil when it is empty.
+  defp lru_entry(order, segment) do
+    base = base(segment)
+
+    case :ets.next(order, base) do
+      order_key when is_integer(order_key) and order_key < base + @max_seq ->
+        {order_key - base, :ets.lookup_element(order, order_key, 2)}
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
+  The `order` key of `seq` in `segment`, for tests that check or arrange
+  the table directly.
+
+      iex> Theine.Policy.order_key(:probation, 1) == Theine.Policy.max_seq() + 1
+      true
+  """
+  @spec order_key(:window | :probation | :protected, pos_integer()) :: pos_integer()
+  def order_key(segment, seq) when is_integer(seq) and seq > 0 and seq < @max_seq,
+    do: base(segment) + seq
+
+  @compile {:inline, base: 1}
+  defp base(:probation), do: @probation_base
+  defp base(:protected), do: @protected_base
+  defp base(:window), do: @window_base
+
+  defp segment_of(order_key) do
+    case order_key >>> @seq_bits do
+      1 -> :probation
+      2 -> :protected
+      3 -> :window
+    end
+  end
 
   @doc "The weight held by each segment (zero everywhere without a bound)."
   @spec weights(t()) :: weights()
@@ -737,10 +815,17 @@ defmodule Theine.Policy do
     }
   end
 
-  @doc "The `order` rows, LRU first within each segment (tests only)."
+  @doc """
+  The `order` rows as `{{segment, seq}, key}`, the segments in the order
+  probation, protected, window and LRU first within each (tests only).
+  """
   @spec order_rows(t()) :: [{{segment(), pos_integer()}, Entry.key()}]
   def order_rows(%__MODULE__{order: nil}), do: []
-  def order_rows(%__MODULE__{order: order}), do: :ets.tab2list(order)
+
+  def order_rows(%__MODULE__{order: order}) do
+    for {order_key, key} <- :ets.tab2list(order),
+        do: {{segment_of(order_key), order_key &&& @seq_mask}, key}
+  end
 
   @doc "Number of keys in the policy table (an `:ets.info/2` call; tests only)."
   @spec count(t()) :: non_neg_integer()

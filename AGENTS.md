@@ -119,6 +119,17 @@ test/                         mirrors lib/; test/support for shared helpers
   overshoot, `bench/results/overshoot-m211.exs` (gitignored) samples the
   table size, the policy's `sizes` atomics and `pending` together: table =
   policy + pending + in flight tells which side the excess is on.
+- A probe that pins a reader does not separate it from the maintenance
+  process. The unpinned process ran every pass on the reader's scheduler at
+  `+S 4` and 73–100% at `+S 2` (M2.11b). Count
+  `:erlang.system_info(:scheduler_id)` in a pass telemetry handler before
+  reading a "maintenance running" row. To A/B a `Policy` change in one VM,
+  `bench/results/gap-m211b.exs` compiles a revision's modules from
+  `git show` and runs them through `policy_module` (`GAP_BASE=HEAD`).
+- Off the hit path, two costs measured in M2.11b: `%{struct | k: v}` on the
+  20-field `%Theine.Policy{}` costs 55–145 ns, so fold updates into one;
+  and integer arithmetic past 2^59 allocates bignums (a 32×32-bit product
+  does).
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

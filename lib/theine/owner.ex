@@ -3,8 +3,8 @@ defmodule Theine.Owner do
   Holds the entries table, the atomics and the counters of one cache
   (specs/08 §Supervision tree, specs/01 §Tables and handles).
 
-  `init/1` creates the public entries table and the loader's `inflight` and
-  `waiters` tables (specs/07 §Single-flight), allocates the `ids`, `pending`,
+  `init/1` creates the public entries table and the loader's `inflight`,
+  `waiters` and `refreshing` tables (specs/07), allocates the `ids`, `pending`,
   `flags` and `sizes` atomics and the stats counters, plus the read buffer
   (specs/03) and the frequency sketch (specs/02) when the cache is bounded,
   and writes the completed `%Theine.Config{}` to `:persistent_term`. An
@@ -34,9 +34,10 @@ defmodule Theine.Owner do
     decentralized_counters: true
   ]
 
-  # The single-flight tables of Theine.Loader (specs/07 §Single-flight):
-  # `inflight` a set of claims, `waiters` a duplicate bag of waiter rows.
-  # Both are empty whenever no load is in progress.
+  # The tables of Theine.Loader (specs/07 §Single-flight, §Refresh-after-
+  # write): `inflight` a set of claims, `waiters` a duplicate bag of waiter
+  # rows, `refreshing` a set of running refreshes. All three are empty
+  # whenever no load is in progress.
   @loader_table_options [:public, :named_table, write_concurrency: :auto]
 
   # Index of the drain flag inside the `flags` atomics (specs/03).
@@ -70,6 +71,7 @@ defmodule Theine.Owner do
     _ = :ets.new(config.table, @table_options)
     _ = :ets.new(config.inflight, [:set | @loader_table_options])
     _ = :ets.new(config.waiters, [:duplicate_bag | @loader_table_options])
+    _ = :ets.new(config.refreshing, [:set | @loader_table_options])
 
     config =
       case :persistent_term.get(Config.key(config.name), nil) do
@@ -106,6 +108,14 @@ defmodule Theine.Owner do
     read_buffer =
       if(bounded?, do: ReadBuffer.new(config.stripes, config.read_buffer_slots), else: nil)
 
+    hit =
+      if(bounded?,
+        do:
+          {read_buffer, config.stripes - 1, 2 + config.read_buffer_slots,
+           config.read_buffer_slots - 1, config.drain_threshold - 1},
+        else: request_counters
+      )
+
     %{
       config
       | ids: :atomics.new(1, signed: false),
@@ -117,18 +127,22 @@ defmodule Theine.Owner do
         # bounded, else the request counters (specs/08 §Decisions M2.8).
         # The sizes are precomputed as the stripe mask, the stripe width,
         # the slot mask and the trigger mask (specs/03 §Decisions M2.8b).
-        hit:
-          if(bounded?,
-            do:
-              {read_buffer, config.stripes - 1, 2 + config.read_buffer_slots,
-               config.read_buffer_slots - 1, config.drain_threshold - 1},
-            else: request_counters
-          ),
+        # A hit that may start a refresh is tagged, so that no other cache
+        # pays for the check (specs/07 §Decisions M4.4).
+        hit: refresh_hit(config, hit),
         sizes: :atomics.new(@size_fields, signed: true),
         read_buffer: read_buffer,
         sketch: if(bounded?, do: Sketch.new(config.max_size), else: nil)
     }
   end
+
+  # `get/2` can refresh only with the cache's loader, so a cache without one
+  # keeps the plain hit; `fetch/4` checks the age itself (Theine.Loader).
+  defp refresh_hit(%Config{refresh_after_write: ms, loader: loader}, hit)
+       when is_integer(ms) and is_function(loader, 1),
+       do: {:refresh, ms, hit}
+
+  defp refresh_hit(%Config{}, hit), do: hit
 
   defp store(%Config{name: name} = config) do
     :persistent_term.put(Config.key(name), config)

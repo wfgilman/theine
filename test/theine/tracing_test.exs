@@ -294,6 +294,73 @@ defmodule Theine.TracingTest do
     end
   end
 
+  describe "refresh_after_write" do
+    # The clock is outside the traced modules (an Agent call or the BIF), so
+    # these are the production multisets.
+    @hit %{
+      {:persistent_term, :get, 1} => 1,
+      {:ets, :lookup, 2} => 1,
+      {:counters, :add, 3} => 1
+    }
+
+    defp refresh_cache(opts) do
+      cache = unique_cache()
+      start_supervised!({Theine.Test.Clock, cache: cache})
+      start_supervised!({Theine, [name: cache, max_size: :infinity] ++ opts})
+      Theine.put(cache, :present, 1)
+      cache
+    end
+
+    test "hit on a cache without refresh_after_write is unchanged" do
+      cache = refresh_cache(loader: fn _ -> {:commit, 2} end)
+      Theine.Test.Clock.advance(cache, 1_000_000)
+
+      assert Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end) == @hit
+    end
+
+    test "hit on a cache with refresh_after_write and no loader is unchanged" do
+      cache = refresh_cache(refresh_after_write: 20)
+      Theine.Test.Clock.advance(cache, 25)
+
+      assert Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end) == @hit
+    end
+
+    test "a fresh hit with refresh_after_write adds no traced call" do
+      cache = refresh_cache(refresh_after_write: 20, loader: fn _ -> {:commit, 2} end)
+      Theine.Test.Clock.advance(cache, 19)
+
+      assert Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end) == @hit
+    end
+
+    test "a stale hit adds one ets.insert_new and the refreshes counter op" do
+      test = self()
+
+      loader = fn _ ->
+        send(test, :loading)
+        {:commit, 2}
+      end
+
+      cache = refresh_cache(refresh_after_write: 20, loader: loader)
+      Theine.put(cache, :warm, 1)
+      Theine.Test.Clock.advance(cache, 20)
+      # The first refresh in the VM loads modules lazily, and code loading
+      # reads :persistent_term; refresh another key once so that only the
+      # refresh path itself is counted.
+      {:ok, 1} = Theine.get(cache, :warm)
+      assert_receive :loading
+
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+      assert_receive :loading
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:ets, :insert_new, 2} => 1,
+               {:counters, :add, 3} => 2
+             }
+    end
+  end
+
   test "an oversized put touches nothing", %{cache: cache} do
     config = %{Theine.Config.get(cache) | max_size: 1}
     calls = Trace.calls(@modules, fn -> :ok = Theine.Entry.put(config, :big, 1, weight: 2) end)

@@ -14,7 +14,8 @@ defmodule Theine.Config do
   Registered names are atoms derived from the cache name
   (`Theine.Maintenance.my_cache`), because write events are delivered with
   `send/2`, which needs a local atom name (specs/08 §Decisions). The
-  loader's `inflight` and `waiters` tables are named the same way.
+  loader's `inflight`, `waiters` and `refreshing` tables are named the
+  same way.
   """
 
   @type cache :: atom()
@@ -27,9 +28,13 @@ defmodule Theine.Config do
   drain_threshold - 1}` that `record/2` needs, the sizes precomputed as the
   bit masks and the stripe width the ring arithmetic uses (specs/03
   §Decisions M2.8b); in an unbounded cache the request counters, or nil
-  with `stats: false`.
+  with `stats: false`. A cache with both `refresh_after_write` and a
+  `loader:` wraps that value as `{:refresh, ms, hit}`, so only such a
+  cache pays for the refresh check (specs/07 §Decisions M4.4).
   """
-  @type hit ::
+  @type hit :: plain_hit() | {:refresh, pos_integer(), plain_hit()}
+
+  @type plain_hit ::
           {:atomics.atomics_ref(), non_neg_integer(), pos_integer(), non_neg_integer(),
            non_neg_integer()}
           | :counters.counters_ref()
@@ -61,6 +66,7 @@ defmodule Theine.Config do
           task_supervisor: atom(),
           inflight: atom(),
           waiters: atom(),
+          refreshing: atom(),
           ids: :atomics.atomics_ref() | nil,
           pending: :atomics.atomics_ref() | nil,
           flags: :atomics.atomics_ref() | nil,
@@ -72,7 +78,16 @@ defmodule Theine.Config do
           sketch: Theine.Sketch.t() | nil
         }
 
-  @enforce_keys [:name, :max_size, :table, :maintenance, :task_supervisor, :inflight, :waiters]
+  @enforce_keys [
+    :name,
+    :max_size,
+    :table,
+    :maintenance,
+    :task_supervisor,
+    :inflight,
+    :waiters,
+    :refreshing
+  ]
   defstruct name: nil,
             max_size: :infinity,
             weigher: nil,
@@ -98,6 +113,7 @@ defmodule Theine.Config do
             task_supervisor: nil,
             inflight: nil,
             waiters: nil,
+            refreshing: nil,
             ids: nil,
             pending: nil,
             flags: nil,
@@ -191,6 +207,8 @@ defmodule Theine.Config do
       # named so that a restarted Owner recreates them under the same atom.
       inflight: Module.concat(Theine.Loader.Inflight, name),
       waiters: Module.concat(Theine.Loader.Waiters, name),
+      # The running refreshes (specs/07 §Refresh-after-write), the same way.
+      refreshing: Module.concat(Theine.Loader.Refreshing, name),
       stripes: default_stripes()
     }
 

@@ -162,10 +162,11 @@ available (per-call or cache-level), the reader:
    `[:theine, :refresh, :exception]` telemetry.
 3. Return the stale value immediately. The reader never waits.
 
-`get/2` performs the refresh check only when `refresh_after_write` is set,
-so the hot-path budget in specs/01 is unchanged for caches without it; with
-it, the cost is one integer comparison on a hit and the `insert_new` only
-once per refresh window per key.
+`get/2` performs the refresh check only when `refresh_after_write` is set
+and the cache has a `loader:`, so the hot-path budget in specs/01 is
+unchanged for every other cache; with both, the cost is a clock read and
+one integer comparison on a hit, and an `insert_new` on a stale hit (it
+fails while the key's refresh runs). See §Decisions M4.4.
 
 `refresh(cache, key)` forces the same background refresh regardless of age,
 returning `:ok` if started or `{:error, :refreshing}` if one is running.
@@ -285,3 +286,45 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
   caller's miss and the task's claim is found by the claimant's recheck
   (M4.2) or by waiting on the live claim. The hit shortcut is taken:
   `Task.completed/1`, nothing spawned.
+- 2026-10-29 (M4.4): how the refresh check stays off every other cache's
+  hit. `Theine.Owner` wraps the config's `hit` field (specs/08 §Decisions
+  M2.8) as `{:refresh, ms, hit}` only when both `refresh_after_write` and
+  a cache `loader:` are set; `get/2` matches that 3-tuple as one more
+  clause of the case it already runs on `hit`, which neither the counters
+  ref (a 2-tuple) nor the read-buffer tuple (a 5-tuple) can match. Every
+  other cache runs the same code as before and the tracing tests assert
+  the unchanged multisets. `get/2` can only refresh with the cache's
+  loader, so a cache with `refresh_after_write` and no `loader:` does not
+  refresh on `get/2`; `fetch/4` and `fetch_async/4` in a cache with
+  `refresh_after_write` look the key up through `Theine.refreshing_get/3`
+  (not public API), the same hit with this call's loader for the refresh,
+  so a per-call loader wins here as it does on a miss.
+- 2026-10-29 (M4.4): the refresh clause reads the clock itself, so an
+  entry with a TTL in a refreshing cache reads it twice on a hit (the
+  expiry check, then the age check). Sharing the read would mean
+  restructuring `get/2`'s expiry branch for every cache, which the
+  section above rules out; one more `monotonic_time` BIF on this cache
+  kind only is the cheaper side. The claim row's `started_at` is a third
+  read, once per refresh.
+- 2026-10-29 (M4.4): details the section left open. `refresh/2` does not
+  depend on `refresh_after_write`, and on an absent key it loads and
+  stores like any refresh. `refreshes` counts refreshes started (by a
+  stale hit or `refresh/2`); the refresh's loader call is a load like a
+  claimant's, so it counts in `loads` and `load_failures` and is wrapped
+  in `[:theine, :load, :start | :stop | :exception]`. A failure is
+  logged with `Exception.format_banner/3` only: the stacktrace's top
+  frame can carry the loader's arguments, the key among them (a
+  `FunctionClauseError`), and keys may be sensitive. The
+  `[:theine, :refresh, :exception]` event has measurements
+  `%{system_time: _}` and metadata `%{cache:, kind:, reason:,
+  stacktrace:}`, as a `:telemetry.span/3` exception does, without the
+  key. If `Task.Supervisor.start_child/2` fails (the supervisor is
+  restarting), the starter deletes its claim row; `refresh/2` then exits
+  with the supervisor's reason and a stale hit returns its value as if
+  no refresh were due.
+- 2026-10-29 (M4.4, open): a refresh task killed from outside (an
+  explicit `Process.exit(pid, :kill)`, or the task supervisor restarting
+  under `rest_for_one` while Owner lives) never runs its `after`, so its
+  `refreshing` row stays and the key is never refreshed again until the
+  Owner restarts. IMPLEMENTATION_PLAN.md M4.4b fixes it, as M4.1 did for
+  a killed claimant.

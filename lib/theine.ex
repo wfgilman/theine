@@ -59,6 +59,11 @@ defmodule Theine do
   hill climber, growing it while recency pays and shrinking it while
   frequency does, and `adaptive: false` keeps it fixed.
 
+  `refresh_after_write: ms` serves an entry older than `ms` as it is and
+  reloads it behind the reader, at most once per key at a time (see
+  `refresh/2`); `get/2` does so only when the cache has a `loader:`, and
+  `fetch/4` with its own loader too.
+
   The `weigher` is called on every write without a `weight:` option and
   must return a positive integer; an entry heavier than `max_size` is never
   stored (see `put/4`).
@@ -132,6 +137,11 @@ defmodule Theine do
   writes to the table. An expired entry is deleted by the reader and
   reported as a miss (specs/01 §Read path).
 
+  In a cache started with both `refresh_after_write` and `loader:`, a hit
+  also reads the clock and, on an entry at least that old, starts a
+  background refresh (see `refresh/2`) and returns the stale value without
+  waiting. Every other cache skips the check.
+
       iex> {:ok, _} = Theine.start_link(name: :get_doc, max_size: :infinity)
       iex> Theine.put(:get_doc, :a, 1)
       :ok
@@ -168,6 +178,12 @@ defmodule Theine do
             %{hit: nil} ->
               :ok
 
+            # Only a cache with refresh_after_write and a loader: a
+            # 3-tuple, which neither the counters ref nor the buffer
+            # tuple is (specs/07 §Decisions M4.4).
+            %{hit: {:refresh, ms, hit}, loader: loader} = config ->
+              refreshing_hit(config, hit, ms, entry, loader)
+
             %{hit: counters} ->
               :counters.add(counters, @hits, 1)
           end
@@ -183,6 +199,59 @@ defmodule Theine do
 
         :error
     end
+  end
+
+  @doc false
+  # `fetch/4`'s lookup in a cache with `refresh_after_write`: `get/2`, with
+  # `loader` (the per-call loader, else the cache's) for the refresh of a
+  # stale hit (specs/07 §Refresh-after-write).
+  @spec refreshing_get(cache(), key(), Loader.loader()) :: {:ok, value()} | :error
+  def refreshing_get(cache, key, loader) do
+    case :ets.lookup(cache, key) do
+      [{_, value, _, _, _, expires_at} = entry] ->
+        config = :persistent_term.get(cache)
+
+        if is_integer(expires_at) and Theine.Clock.now(cache) >= expires_at do
+          Entry.expired(config, entry)
+        else
+          case config do
+            %{hit: {:refresh, ms, hit}} -> refreshing_hit(config, hit, ms, entry, loader)
+            %{hit: hit, refresh_after_write: ms} -> refreshing_hit(config, hit, ms, entry, loader)
+          end
+
+          {:ok, value}
+        end
+
+      [] ->
+        case :persistent_term.get(cache) do
+          %{request_counters: nil} -> :ok
+          %{request_counters: counters} -> :counters.add(counters, @misses, 1)
+        end
+
+        :error
+    end
+  end
+
+  # A hit in a cache with `refresh_after_write: ms`: the hit as any other,
+  # then the age check (specs/07 §Refresh-after-write). The clock is read
+  # again here even when the expiry check read it, so that `get/2` itself
+  # is unchanged for every other cache. A stale entry starts a background
+  # refresh, at most one per key at a time; the reader never waits for it.
+  defp refreshing_hit(config, hit, ms, {key, _, id, _, written_at, _}, loader) do
+    case hit do
+      {buffer, stripe_mask, width, slot_mask, trigger_mask} ->
+        record(config, buffer, stripe_mask, width, slot_mask, trigger_mask, id)
+
+      nil ->
+        :ok
+
+      counters ->
+        :counters.add(counters, @hits, 1)
+    end
+
+    if Theine.Clock.now(config.name) - written_at >= ms,
+      do: Loader.refresh_stale(config, key, loader),
+      else: :ok
   end
 
   # The bounded hit: `Theine.ReadBuffer.record/2` with the sizes taken from
@@ -318,6 +387,39 @@ defmodule Theine do
   def fetch_async(cache, key, loader \\ nil, opts \\ []) when is_list(opts) do
     Loader.fetch_async(cache, key, loader, opts)
   end
+
+  @doc """
+  Reloads `key` in the background with the cache's `loader:`, whatever the
+  age of its entry, Caffeine's `LoadingCache.refresh` (specs/07
+  §Refresh-after-write). Returns `:ok` once the refresh has started,
+  `{:error, :refreshing}` when one is already running for `key`, or
+  `{:error, :no_loader}` when the cache was started without a loader.
+
+  The refresh runs in a task under the cache's `Task.Supervisor`; the
+  caller never waits for it, and readers keep getting the current value
+  until it completes. `{:commit, v}` stores `v` even if `key` was deleted
+  or evicted meanwhile, or was absent to begin with; `{:ignore, v}` and a
+  loader that raises, throws or exits leave the cache as it was. A failure
+  is logged at `:warning` without the key and emitted as
+  `[:theine, :refresh, :exception]` telemetry.
+
+  With `refresh_after_write: ms` the same refresh starts on its own: a hit
+  through `get/2` (with the cache's loader) or `fetch/4` (with its loader)
+  on an entry written at least `ms` ago returns the stale value at once
+  and refreshes it behind the reader.
+
+      iex> {:ok, _} = Theine.start_link(name: :refresh_doc, max_size: :infinity,
+      ...>   loader: fn key -> {:commit, {key, :fresh}} end)
+      iex> Theine.put(:refresh_doc, :a, {:a, :stale})
+      :ok
+      iex> Theine.refresh(:refresh_doc, :a)
+      :ok
+      iex> {:ok, _} = Theine.start_link(name: :refresh_doc_nil, max_size: :infinity)
+      iex> Theine.refresh(:refresh_doc_nil, :a)
+      {:error, :no_loader}
+  """
+  @spec refresh(cache(), key()) :: :ok | {:error, :refreshing | :no_loader}
+  def refresh(cache, key), do: Loader.refresh(cache, key)
 
   @doc """
   Stores `value` under `key`, replacing any existing entry, and returns

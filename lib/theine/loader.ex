@@ -35,6 +35,14 @@ defmodule Theine.Loader do
   `fetch_async/4` runs the same algorithm in a task under the cache's
   `Task.Supervisor`, so the task is the claimant or a waiter.
 
+  Refreshes (specs/07 §Refresh-after-write) do not go through the claim. A
+  reader whose hit is at least `refresh_after_write` old, or a call to
+  `refresh/2`, claims the key in a third table, `refreshing` (`{key,
+  started_at}`), with `:ets.insert_new/2`, and starts a task under the same
+  supervisor that loads and stores the value and then deletes the row. The
+  reader returns the stale value at once; a reader that loses the
+  `insert_new` returns it too, so one refresh runs per key at a time.
+
   The loader is never called from the maintenance process. Each call is
   wrapped in `[:theine, :load, :start | :stop | :exception]` telemetry with
   `%{cache: name}` metadata (the key is omitted) and counted in the
@@ -42,6 +50,9 @@ defmodule Theine.Loader do
   """
 
   alias Theine.{Config, Entry, Stats}
+
+  require Logger
+  require Theine.Clock
 
   @type key :: Entry.key()
   @type value :: Entry.value()
@@ -66,6 +77,7 @@ defmodule Theine.Loader do
 
   @loads Stats.loads()
   @load_failures Stats.load_failures()
+  @refreshes Stats.refreshes()
 
   # Claims tried after the first before loading without coalescing
   # (specs/07 §Single-flight step 6).
@@ -103,7 +115,7 @@ defmodule Theine.Loader do
     loader = resolve!(config, loader)
     timeout = timeout!(opts)
 
-    case Theine.get(cache, key) do
+    case lookup(config, key, loader) do
       {:ok, _} = hit -> hit
       :error -> claim_or_wait(config, key, loader, timeout, 0)
     end
@@ -126,7 +138,7 @@ defmodule Theine.Loader do
     loader = resolve!(config, loader)
     timeout = timeout!(opts)
 
-    case Theine.get(cache, key) do
+    case lookup(config, key, loader) do
       {:ok, _} = hit ->
         Task.completed(hit)
 
@@ -136,6 +148,95 @@ defmodule Theine.Loader do
         end)
     end
   end
+
+  @doc """
+  `Theine.refresh/2`: start a background refresh of `key` with the cache's
+  `loader:`, whatever its age (specs/07 §Refresh-after-write). Returns
+  `{:error, :refreshing}` when one is running for `key` and `{:error,
+  :no_loader}` without a cache loader.
+  """
+  @spec refresh(Config.cache(), key()) :: :ok | {:error, :refreshing | :no_loader}
+  def refresh(cache, key) do
+    case :persistent_term.get(cache) do
+      %Config{loader: nil} -> {:error, :no_loader}
+      %Config{loader: loader} = config -> start_refresh(config, key, loader)
+    end
+  end
+
+  @doc false
+  # A stale hit in `Theine.get/2` or `fetch/4` (specs/07 §Refresh-after-
+  # write): start a refresh unless one is running. The reader must not fail
+  # for it: a task supervisor that is restarting (an exit from
+  # `start_child`) leaves the next stale hit to try again.
+  @spec refresh_stale(Config.t(), key(), loader()) :: :ok
+  def refresh_stale(config, key, loader) do
+    _ = start_refresh(config, key, loader)
+    :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  # Steps 1 and 2: claim the key's refresh with `insert_new`, then start the
+  # task, which deletes exactly this row when it is done. A task that could
+  # not be started gives the claim back.
+  defp start_refresh(%Config{refreshing: refreshing, counters: counters} = config, key, loader) do
+    row = {key, Theine.Clock.now(config.name)}
+
+    if :ets.insert_new(refreshing, row) do
+      try do
+        Task.Supervisor.start_child(config.task_supervisor, fn ->
+          refresh_task(config, key, loader, row)
+        end)
+      catch
+        kind, reason ->
+          true = :ets.delete_object(refreshing, row)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      else
+        {:ok, _pid} ->
+          :counters.add(counters, @refreshes, 1)
+          :ok
+      end
+    else
+      {:error, :refreshing}
+    end
+  end
+
+  # The refresh task: one load as a claimant's (telemetry, the `loads` and
+  # `load_failures` counters, the value stored on `:commit` even if the key
+  # was deleted meanwhile). On `{:ignore, v}` or a failure the old value
+  # stays. A failure is logged without the key, which may be sensitive, and
+  # without the stacktrace, whose top frame can carry the loader's
+  # arguments; the telemetry event carries both kind and stacktrace for a
+  # handler that wants them.
+  defp refresh_task(%Config{name: name} = config, key, loader, row) do
+    _ = run(config, key, loader)
+    :ok
+  catch
+    kind, reason ->
+      stack = __STACKTRACE__
+
+      Logger.warning(
+        "Theine cache #{inspect(name)} kept a stale value: its refresh failed with " <>
+          Exception.format_banner(kind, reason, stack)
+      )
+
+      :telemetry.execute(
+        [:theine, :refresh, :exception],
+        %{system_time: System.system_time()},
+        %{cache: name, kind: kind, reason: reason, stacktrace: stack}
+      )
+
+      :ok
+  after
+    true = :ets.delete_object(config.refreshing, row)
+  end
+
+  # The lookup of `fetch/4` and `fetch_async/4`: `get/2`, unless a stale
+  # hit must be refreshed with this call's loader rather than the cache's.
+  defp lookup(%Config{refresh_after_write: :infinity, name: cache}, key, _loader),
+    do: Theine.get(cache, key)
+
+  defp lookup(%Config{name: cache}, key, loader), do: Theine.refreshing_get(cache, key, loader)
 
   defp resolve!(_config, loader) when is_function(loader, 1), do: loader
   defp resolve!(%Config{loader: loader}, nil) when is_function(loader, 1), do: loader

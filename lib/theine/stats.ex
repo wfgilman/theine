@@ -21,7 +21,9 @@ defmodule Theine.Stats do
   and `load_failures` those that raised, threw or exited, as Caffeine's
   `loadCount` and `loadFailureCount`; an `{:ignore, value}` result is a
   successful load. A waiter that received another process's load counts
-  nothing here, only the miss of its `get`.
+  nothing here, only the miss of its `get`. `refreshes` counts background
+  refreshes started, by a stale hit or `Theine.refresh/2`; the refresh's
+  loader call counts in `loads` (and `load_failures`) like any other.
 
   `hits` is special. A bounded cache never increments its `hits` counter:
   every hit claims a sequence number in its read-buffer stripe, so the sum

@@ -131,7 +131,10 @@ Emitted off the hot path only:
 - `[:theine, :load, :start | :stop | :exception]` around a loader call made
   by a claimant or a refresh task, with `%{cache: name}` metadata and the
   key omitted.
-- `[:theine, :refresh, :exception]` (specs/07).
+- `[:theine, :refresh, :exception]` (specs/07) when a background refresh's
+  loader raises, throws or exits, with `%{system_time: _}` and
+  `%{cache: name, kind: _, reason: _, stacktrace: _}`, the key omitted
+  (specs/07 §Decisions M4.4).
 - `[:theine, :eviction]` is **not** emitted per entry in v1 (would be a
   per-eviction cost in the maintenance budget); M6 may add an opt-in
   listener.

@@ -135,6 +135,10 @@ test/                         mirrors lib/; test/support for shared helpers
   20-field `%Theine.Policy{}` costs 55–145 ns, so fold updates into one;
   and integer arithmetic past 2^59 allocates bignums (a 32×32-bit product
   does).
+- `Theine.Test.Trace.calls/2` counts one extra `:persistent_term.get` when
+  the traced fun is the first in the VM to call a module (lazy code loading
+  reads it), so a multiset depends on test order. Run the path once before
+  tracing, as the stale-hit tracing test does (M4.4).
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

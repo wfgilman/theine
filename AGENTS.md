@@ -151,6 +151,9 @@ test/                         mirrors lib/; test/support for shared helpers
   out of the docs, so a bare backticked `mix bench` in a doc or the README
   autolinks to a filtered module and warns; write the subcommand out
   (`mix bench get`).
+- To inspect the hex package, run `mix hex.build --unpack --output bench/results/hex-<task>`
+  (the loop cannot list `/tmp`). A plain `mix hex.build` writes
+  `theine-<version>.tar` into the repo root, and the loop cannot delete it.
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

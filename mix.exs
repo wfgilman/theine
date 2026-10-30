@@ -15,6 +15,8 @@ defmodule Theine.MixProject do
       aliases: aliases(),
       dialyzer: dialyzer(),
       name: "theine",
+      description: description(),
+      package: package(),
       source_url: @source_url,
       docs: docs()
     ]
@@ -65,6 +67,24 @@ defmodule Theine.MixProject do
         "test --cover",
         "dialyzer"
       ]
+    ]
+  end
+
+  defp description do
+    "A bounded in-memory cache in pure Elixir, modelled on Caffeine: " <>
+      "W-TinyLFU eviction, expire-after-write, single-flight loading and " <>
+      "refresh-after-write over ETS and :atomics."
+  end
+
+  # The hex package (specs/00 A6, specs/10 §Gates step 7). `files:` is a
+  # list, not Hex's default, because the default ships priv/ and so the
+  # dialyzer PLTs in priv/plts. bench/ (with the dev-only `mix bench` task),
+  # test/, specs/ and config/ stay out; package_test checks the list.
+  defp package do
+    [
+      files: ["lib", "mix.exs", "README.md", "LICENSE"],
+      licenses: ["MIT"],
+      links: %{"GitHub" => @source_url}
     ]
   end
 

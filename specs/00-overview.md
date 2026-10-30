@@ -190,3 +190,19 @@ list is the contract.
   point below the fixed window on any row (specs/09). The human gate
   compares the default policy with Caffeine's hill-climber policy and the
   fixed window with Caffeine's `WindowTinyLfu`.
+- 2026-10-29 (M5.4): the hex package lists its files: `lib`, `mix.exs`,
+  `README.md` and `LICENSE`. Hex's default list includes `priv/`, which
+  here holds the dialyzer PLTs (`priv/plts`, 8 MB), so the default would
+  ship them. `bench/` (with the dev-only `mix bench` task), `test/`,
+  `specs/` and `config/` stay out. That `config/` is left out is
+  deliberate. It only injects the test clock and loader hook, and a
+  consumer's build never reads it (specs/06 §Clock). The unpacked package
+  compiles in `:prod` as a path dependency of an empty project and serves a
+  put, get and fetch. The specs named no license, and Hex refuses to build
+  without one, so the package is MIT with a `LICENSE` file. That choice is
+  a placeholder until the owner confirms it: Caffeine itself is
+  Apache-2.0, and changing it before the first publish costs only the
+  `licenses:` entry and the file. test/theine/package_test.exs pins the
+  file list, the metadata and A6: no native file packaged, no compiler
+  beyond Mix's own, `telemetry` the only runtime dependency, and no
+  `load_nif`, `@on_load`, port or `System.cmd` in `lib/`.

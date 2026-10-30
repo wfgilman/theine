@@ -3,7 +3,7 @@ defmodule Theine.MaintenanceTest do
 
   import Theine.Test.Helpers
 
-  alias Theine.{Config, Maintenance, ReadBuffer, Sketch}
+  alias Theine.{Config, Maintenance, Policy, ReadBuffer, Sketch}
 
   @drain_flag Theine.Owner.drain_flag()
 
@@ -618,7 +618,7 @@ defmodule Theine.MaintenanceTest do
       refute_received {:pass, _, _, _}
     end
 
-    test "under saturating writers the table never exceeds max_size + pending + writers at any of 200 samples" do
+    test "under saturating writers the policy stays within one event of max_size and the table within max_size + write_hwm + writers at any of 200 samples" do
       cache = unique_cache()
       max_size = 10_000
       start_supervised!({Theine, [name: cache, max_size: max_size] ++ @quiet})
@@ -633,25 +633,27 @@ defmodule Theine.MaintenanceTest do
 
       # table = policy + pending + in flight: with every :put consumed only
       # once the cache fits (specs/04 §The pass), the policy is at most
-      # max_size and the in-flight inserts at most one per writer. The
-      # three reads are not simultaneous, so pending is read before and
-      # after the table: a sample can only break the bound if pending
-      # peaked strictly between the two reads, which the backpressure band
-      # (pending within write_hwm..write_hwm + writers) rules out.
+      # max_size between events, and one weight-1 entry over it while an
+      # event sits between its on_write and its eviction. The policy's
+      # sizes atomics are written by the maintenance process alone, so one
+      # read checks that exactly. A table bound from pending would need the
+      # table and pending read at one instant: pending read before and
+      # after the table missed a peak in between when the sampler was
+      # descheduled with pending below write_hwm (left 10992, right 10990
+      # in one run of 500).
       samples =
         for _ <- 1..200 do
-          before = :atomics.get(config.pending, 1)
+          policy = Policy.weighted_size(config.sizes)
           table = :ets.info(cache, :size)
-          after_table = :atomics.get(config.pending, 1)
           Process.sleep(5)
-          {table, max(before, after_table)}
+          {table, policy}
         end
 
       :atomics.put(stop, 1, 1)
       for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal}, 5_000)
 
-      for {table, pending} <- samples do
-        assert table <= max_size + pending + writers
+      for {table, policy} <- samples do
+        assert policy <= max_size + 1
         # The spec's own statement of the slack (specs/03 §Delivery with
         # backpressure, A5), from the table reading alone.
         assert table <= max_size + config.write_hwm + writers

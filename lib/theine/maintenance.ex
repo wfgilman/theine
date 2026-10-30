@@ -39,7 +39,9 @@ defmodule Theine.Maintenance do
   `Theine.Policy.on_access/2`, evict with `Theine.Policy.evict/1` (a no-op
   unless a rebuild or a capped per-event eviction left the cache over
   capacity), advance the sketch's reset by one chunk when one is due or
-  running, and emit `[:theine, :maintenance, :pass]`, whose `evicted` is
+  running, take the adaptive window's step with `Theine.Policy.climb/1`
+  (a no-op with `adaptive: false`), and emit
+  `[:theine, :maintenance, :pass]`, whose `evicted` is
   the number of entries evicted since the previous pass, on arrival and in
   the pass alike, as `writes` is. The expiry sweep (step 4) arrives with
   `Theine.Expiry` (M3.1); the `expired` measurement is 0 until then. When
@@ -96,6 +98,7 @@ defmodule Theine.Maintenance do
           size: non_neg_integer(),
           weighted_size: non_neg_integer(),
           segments: Policy.weights() | nil,
+          climber: map() | nil,
           read_buffer:
             %{stripes: pos_integer(), slots: pos_integer(), lag: non_neg_integer()} | nil,
           sketch:
@@ -238,14 +241,16 @@ defmodule Theine.Maintenance do
   events consumed from the backpressure call path (`call_writes`, specs/03
   §Delivery with backpressure; what `mix bench maintenance` reports as the
   backpressure fraction), the entry count and weighted size as last seen by
-  the policy, and for a bounded cache the segment weights, the read
+  the policy, and for a bounded cache the segment weights, the adaptive
+  window's limits and sample (`Theine.Policy.climber/1`), the read
   buffer's shape and lag (specs/03) and the sketch's size, increments since
-  its last reset and the cursor of a reset in progress; those three are
+  its last reset and the cursor of a reset in progress; those four are
   `nil` for `max_size: :infinity`.
 
       Theine.Maintenance.info(:sessions)
       #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, call_writes: 0,
-      #=>   size: 0, weighted_size: 0, segments: nil, read_buffer: nil, sketch: nil}
+      #=>   size: 0, weighted_size: 0, segments: nil, climber: nil, read_buffer: nil,
+      #=>   sketch: nil}
   """
   @spec info(Config.cache()) :: info()
   def info(cache) when is_atom(cache), do: GenServer.call(name(cache), :info)
@@ -392,6 +397,7 @@ defmodule Theine.Maintenance do
       size: Policy.size(config.sizes),
       weighted_size: Policy.weighted_size(config.sizes),
       segments: if(bounded?, do: Policy.weights(policy), else: nil),
+      climber: Policy.climber(policy),
       read_buffer:
         if(bounded?,
           do: %{
@@ -525,8 +531,7 @@ defmodule Theine.Maintenance do
 
   defp batch(state), do: state
 
-  # One pass (specs/04 §The pass). Step 4, the expiry sweep, is M3.1 and
-  # step 7, the adaptive climb, is M6.
+  # One pass (specs/04 §The pass). Step 4, the expiry sweep, is M3.1.
   @spec pass(state()) :: state()
   defp pass(%__MODULE__{config: config, module: module} = state) do
     started = System.monotonic_time()
@@ -553,6 +558,10 @@ defmodule Theine.Maintenance do
 
     # 6. Age the sketch by one chunk.
     {policy, sketch_reset} = age(policy, state.sketch_reset, config)
+
+    # 7. The adaptive step: a no-op unless the cache is bounded and
+    #    `adaptive` (specs/05 §Adaptive window).
+    policy = module.climb(policy)
 
     # A full stripe or a capped eviction wants the next pass now. The flag
     # was cleared in step 2, so this sends exactly one `:drain` unless a

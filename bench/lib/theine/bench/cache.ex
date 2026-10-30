@@ -82,10 +82,16 @@ defmodule Theine.Bench.Cache do
 
   @doc """
   Starts a cache bounded at `size` entries for `trace`. Options:
-  `window_percent` (default 1, the specs/05 default) and
-  `accesses_per_pass` (default `accesses_per_pass/0`, at most
-  `max_accesses_per_pass/0`; 1 replays every access synchronously, as
-  Caffeine's simulator does).
+  `window_percent` (default 1, the specs/05 default), `adaptive` (default
+  true, the specs/08 default) and `accesses_per_pass` (default
+  `accesses_per_pass/0`, at most `max_accesses_per_pass/0`; 1 replays every
+  access synchronously, as Caffeine's simulator does).
+
+  The cache name seeds admission's random guard (specs/05 §Events
+  `evict`). A fixed-window cache keeps the name every replay had before the
+  adaptive window existed, so its hits stay comparable with the earlier
+  runs in IMPLEMENTATION_PLAN.md §Benchmark log; an adaptive one adds
+  `_adaptive`.
   """
   @spec new(String.t(), pos_integer(), keyword()) :: %__MODULE__{
           name: atom(),
@@ -98,19 +104,22 @@ defmodule Theine.Bench.Cache do
         }
   def new(trace, size, opts \\ []) when is_binary(trace) and is_integer(size) and size > 0 do
     window_percent = Keyword.get(opts, :window_percent, 1)
+    adaptive = Keyword.get(opts, :adaptive, true)
     batch = Keyword.get(opts, :accesses_per_pass, @accesses_per_pass)
 
     unless is_integer(batch) and batch in 1..@max_accesses_per_pass do
       raise ArgumentError, "accesses_per_pass must be in 1..#{@max_accesses_per_pass}"
     end
 
-    name = :"theine_hitrate_#{trace}_#{size}_w#{window_percent}"
+    suffix = if adaptive, do: "_adaptive", else: ""
+    name = :"theine_hitrate_#{trace}_#{size}_w#{window_percent}#{suffix}"
 
     {:ok, sup} =
       Theine.start_link(
         name: name,
         max_size: size,
         window_percent: window_percent,
+        adaptive: adaptive,
         stripes: 1,
         drain_threshold: @drain_threshold,
         maintenance_interval: @maintenance_interval

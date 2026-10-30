@@ -97,6 +97,7 @@ defmodule Theine.MaintenanceTest do
              size: 0,
              weighted_size: 0,
              segments: nil,
+             climber: nil,
              read_buffer: nil,
              sketch: nil
            }
@@ -358,7 +359,7 @@ defmodule Theine.MaintenanceTest do
   end
 
   describe "the pass (specs/04 §The pass)" do
-    test "call order within one pass is writes, reads, evict" do
+    test "call order within one pass is writes, reads, evict, climb" do
       cache = unique_cache()
       :ok = Theine.Test.Policy.listen(cache)
 
@@ -385,7 +386,8 @@ defmodule Theine.MaintenanceTest do
       # apply the writes in step 1 before draining the reads in step 3, which
       # is observable because the reads are of ids the writes introduce.
       # Each applied :put evicts before it is consumed (specs/04 §The pass),
-      # so an evict call sits inside every write; the pass's own comes last.
+      # so an evict call sits inside every write; the pass's own comes after
+      # the reads, and the adaptive step (step 7) last.
       :ok = Maintenance.pause(cache)
       :atomics.put(config.flags, @drain_flag, 1)
       send(name, :drain)
@@ -398,7 +400,7 @@ defmodule Theine.MaintenanceTest do
 
       assert Theine.Test.Policy.calls(cache) ==
                [:on_write, :evict, :on_write, :evict, :on_write, :evict] ++
-                 [:on_access, :on_access, :evict]
+                 [:on_access, :on_access, :evict, :climb]
 
       # The reads were applied: keys 1 and 2 moved above key 3 in the window.
       assert seq_of(cache, 3) < seq_of(cache, 1)

@@ -104,6 +104,7 @@ mix bench hitrate                          # every trace in bench/traces.exs
 mix bench hitrate --traces loop,zipf       # a subset, by name
 mix bench hitrate --window-percent 1,5,20  # sweep the window size (specs/05)
 mix bench hitrate --memory-gb 2            # smaller replay passes
+mix bench hitrate --accesses-per-pass 1    # one access per pass, like Caffeine's simulator
 ```
 
 A replay harness, not Benchee. Each trace in the manifest is replayed at each
@@ -126,7 +127,8 @@ Policies:
 - `lru` (`Theine.Bench.LRU`): two private ETS tables, a baseline and not a
   product.
 - `theine` (`Theine.Bench.Cache`): a real bounded cache at `max_size: size`
-  and the specs/05 default window (`window_percent` 1), replayed
+  in its default configuration, the adaptive window (`adaptive: true`)
+  starting at the specs/05 default of `window_percent` 1, replayed
   synchronously. Every access is a `Theine.get/2`, a miss is followed by a
   `Theine.put/3`, and after every 32 accesses (the specs/08 default
   `drain_threshold`) the harness runs one pass with
@@ -140,11 +142,17 @@ Policies:
   differs from the replay's, if write events are still pending, or if the
   cache is over its bound after the last pass (specs/09 §Decisions M2.10).
   The admission guard's `:rand` is seeded from the cache name, which is
-  derived from the trace, the size and the window percentage, so a run is
-  reproducible to the hit.
-- `theine_w<p>`: the same cache at `window_percent` `p`, one per extra value
-  of `--window-percent`, reported with no threshold. The value 1 is always
-  the `theine` row; if it is left out, no threshold is evaluated.
+  derived from the trace, the size, the window percentage and, for an
+  adaptive cache, an `_adaptive` suffix, so a run is reproducible to the
+  hit. Fixed-window caches keep the names they had before the adaptive
+  window existed, so their hits compare with earlier results.
+- `theine_w<p>`: the same adaptive cache starting at `window_percent` `p`,
+  one per extra value of `--window-percent`, reported with no threshold.
+  The value 1 is always the `theine` row; if it is left out, no `theine`
+  threshold is evaluated.
+- `theine_static`: the same cache with `adaptive: false` at `window_percent`
+  1, the fixed-window W-TinyLFU, on every row whatever `--window-percent`
+  says.
 
 Extra `system` fields: `traces` (names replayed), `policies` (names),
 `window_percents` (the list replayed), `accesses_per_pass` (32),
@@ -156,7 +164,7 @@ Each `results` row:
 |---|---|---|
 | `trace` | string | manifest name |
 | `size` | integer | cache capacity in entries |
-| `policy` | string | `lru`, `theine`, `theine_w<p>` |
+| `policy` | string | `lru`, `theine`, `theine_w<p>`, `theine_static` |
 | `status` | string | `"ok"`, or `"error"` when the trace could not be replayed |
 | `error` | string or null | why the trace could not be replayed |
 | `requests` | integer or null | keys replayed (an ARC line counts once per block) |
@@ -169,9 +177,11 @@ Thresholds (specs/09):
 - A3 `trace available, <trace> at <size>`: actual `0`, limit `== 1`, for
   every row whose trace could not be replayed.
 - A3 `theine - lru hit rate (points), <trace> at <size>`: `>= 0.0` on every
-  row; also `>= 10.0` on `loop` 1 000 and `OLTP` 1 000 and 2 000. Evaluated
-  only where both `theine` and `lru` ran; otherwise the summary says "none
-  evaluated".
+  row; also `>= 10.0` on `loop` 1 000. Evaluated only where both `theine`
+  and `lru` ran; otherwise the summary says "none evaluated".
+- A3 `theine - theine_static hit rate (points), <trace> at <size>`: `>= -1.0`
+  on every row where both ran: the climber may cost at most a point
+  against the fixed window.
 
 ## `maintenance` (A5, specs/04 budget)
 

@@ -15,7 +15,7 @@ defmodule Theine.ConfigTest do
     assert config.refresh_after_write == :infinity
     assert config.loader == nil
     assert config.window_percent == 1
-    assert config.adaptive == false
+    assert config.adaptive == true
     assert config.stripes == Config.default_stripes()
     assert config.stripes >= System.schedulers_online()
     assert config.stripes < 2 * System.schedulers_online()

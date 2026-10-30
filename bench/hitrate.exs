@@ -19,9 +19,13 @@ defmodule Theine.Bench.Hitrate do
   # OLTP carries no margin (specs/09 §Decisions 2026-10-29).
   @margin_rows [{"loop", 1_000}]
 
-  # The `theine` row runs at the specs/05 default window; other percentages
-  # of a sweep are reported as `theine_w<p>` with no threshold.
+  # The `theine` row runs the default configuration: the adaptive window
+  # starting at the specs/05 default of 1%. Other starting percentages of a
+  # sweep are reported as `theine_w<p>` with no threshold. `theine_static`
+  # is the fixed 1% window (`adaptive: false`), on every row, and `theine`
+  # may trail it by at most this many points (specs/09, A3).
   @default_window_percent 1
+  @static_slack 1.0
 
   # Instances replayed together may hold this much ETS (estimated from each
   # policy's bytes per entry). DS1's theine instances alone would need about
@@ -131,7 +135,21 @@ defmodule Theine.Bench.Hitrate do
         }
       end
 
-    [lru | theine]
+    static = %{
+      name: "theine_static",
+      new: fn trace, size ->
+        Cache.new(trace, size,
+          window_percent: @default_window_percent,
+          adaptive: false,
+          accesses_per_pass: batch
+        )
+      end,
+      access: &Cache.access/2,
+      close: &Cache.close/1,
+      bytes_per_entry: Cache.bytes_per_entry()
+    }
+
+    [lru | theine] ++ [static]
   end
 
   defp theine_name(@default_window_percent), do: "theine"
@@ -241,16 +259,33 @@ defmodule Theine.Bench.Hitrate do
     end
   end
 
-  # Evaluated only for rows where both theine and lru ran.
+  # Evaluated only for rows where both subjects ran.
   defp comparisons(rows) do
     by_key = Map.new(rows, fn r -> {{r.trace, r.size, r.policy}, r} end)
 
-    for %{policy: "theine", status: "ok"} = t <- rows,
-        %{status: "ok"} = l <- [Map.get(by_key, {t.trace, t.size, "lru"})],
-        margin <- margins(t) do
-      delta = t.hit_rate - l.hit_rate
-      check("A3", "theine - lru hit rate (points), #{t.trace} at #{t.size}", delta, :>=, margin)
-    end
+    against_lru =
+      for %{policy: "theine", status: "ok"} = t <- rows,
+          %{status: "ok"} = l <- [Map.get(by_key, {t.trace, t.size, "lru"})],
+          margin <- margins(t) do
+        delta = t.hit_rate - l.hit_rate
+        check("A3", "theine - lru hit rate (points), #{t.trace} at #{t.size}", delta, :>=, margin)
+      end
+
+    against_static =
+      for %{policy: "theine", status: "ok"} = t <- rows,
+          %{status: "ok"} = s <- [Map.get(by_key, {t.trace, t.size, "theine_static"})] do
+        delta = t.hit_rate - s.hit_rate
+
+        check(
+          "A3",
+          "theine - theine_static hit rate (points), #{t.trace} at #{t.size}",
+          delta,
+          :>=,
+          -@static_slack
+        )
+      end
+
+    against_lru ++ against_static
   end
 
   defp margins(%{trace: trace, size: size}) do

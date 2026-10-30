@@ -329,6 +329,17 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   `theine_static` subject and its check arrive with the adaptive window
   (IMPLEMENTATION_PLAN.md M2.13). Until then the bench still fails
   `theine ≥ lru` on OLTP, as it should.
+- 2026-10-29 (M2.13): `theine_static` and its check are in. Every
+  `theine*` subject other than `theine_static` is now the default,
+  adaptive configuration, so a `--window-percent` sweep's `theine_w<p>`
+  rows start the climber at `p` rather than fix the window there;
+  `theine_static` is reported on every row whatever the sweep. The
+  admission guard's seed comes from the cache name, and the fixed-window
+  caches keep the names every replay had before M2.13 (adaptive ones add
+  `_adaptive`), so `theine_static` replays the earlier `theine` exactly:
+  its hits equal M2.11e's `theine` on every row (IMPLEMENTATION_PLAN.md
+  §Benchmark log M2.13), which is the bench-level proof that `adaptive:
+  false` changes nothing.
 - 2026-10-29 (M2.11e): the replay waits for each miss's put to be applied.
   Since M2.11c a `:put` evicts when the maintenance process receives it,
   so whether that eviction lands before or after the replaying process's

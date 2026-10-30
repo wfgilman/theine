@@ -162,12 +162,31 @@ Frequencies come from `Sketch.frequency/2` at the moment of comparison.
 
 ## Adaptive window
 
-Caffeine's hill climber: every `10 * max_size` reads, compare the hit rate
-of the sample with the previous sample; if it improved, keep moving the
-window size in the same direction, else reverse; step size starts at 6.25%
-of `max_size` and decays by 0.98 per step; restart with the full step when
-the hit-rate delta exceeds 5 percentage points. Resizing moves entries
-between window and probation at their LRU ends.
+Caffeine's hill climber: every `10 * max_size` requests, compare the hit
+rate of the sample with the previous sample; if it did not get worse, keep
+moving the window size in the same direction, else reverse; step size
+starts at 6.25% of `max_size`, toward a smaller window, and decays by 0.98
+per step; restart with the full step when the hit-rate delta is 5
+percentage points or more. The adjustment is the step truncated to an
+integer weight.
+
+Resizing (Caffeine's `increaseWindow` / `decreaseWindow`) moves the limit
+between `window_max` and `protected_max`, so `window_max + protected_max`
+is constant and probation's implicit share of main stays what it was:
+
+- Grow by `q = min(adjustment, protected_max)`: `protected_max -= q`,
+  `window_max += q`, demote protected LRU entries until protected fits,
+  then move entries to the window MRU, each the probation LRU when it fits
+  in what is left of `q`, else the protected LRU when that fits.
+- Shrink by `q = min(-adjustment, window_max - 1)`: `window_max -= q`,
+  `protected_max += q`, then move window LRU entries to the probation MRU
+  while they fit in what is left of `q`.
+- At most 1000 entries move per call; whatever weight was not moved goes
+  back to the limits and stays in `adjustment`, which the next pass applies
+  again. Moved entries are not admission candidates. Nothing happens with
+  `protected_max` 0 (grow) or `window_max` 1 (shrink).
+
+`clear/1` restarts the climber from `window_percent` (§Decisions M2.13).
 
 On by default: `adaptive: true` (specs/08). `adaptive: false` keeps the
 window fixed at `window_percent` and must reproduce every fixed-window test
@@ -400,3 +419,43 @@ the window moves, and records the answer in §Decisions. Unbounded
   close discovered issue 3 the same way, but that is not done here. The
   adaptive window's sample (M2.13) counts new-key `:put` events as misses,
   and an ignored event is not one.
+- 2026-10-29 (M2.13): the hill climber follows Caffeine's
+  `BoundedLocalCache` (`determineAdjustment`, `increaseWindow`,
+  `decreaseWindow`), and §Adaptive window now states it at that level of
+  detail. Five points the earlier paraphrase left open or got wrong:
+  (1) the step starts negative, as `setMaximumSize` sets it, so the first
+  sample, compared with a rate of 0, shrinks the window; a change of
+  exactly 0 counts as "not worse" and continues; the restart threshold is
+  `>= 5` points, not `> 5`. (2) Growing takes the probation LRU and,
+  when that does not fit or probation is empty, the protected LRU, and it
+  moves the limit out of `protected_max`, not out of main as a whole, so
+  the probation share stays fixed; "between window and probation" was too
+  narrow. (3) At most 1000 entries move per call (Caffeine's
+  `QUEUE_TRANSFER_THRESHOLD`) and the rest of the adjustment waits for the
+  next pass; at `max_size` 1_000_000 a full step of 62_500 takes 63
+  passes. (4) No warm-up gate: Caffeine throws samples away until its
+  lazily allocated sketch exists (weighted size at half the maximum); the
+  sketch here is allocated at start, so samples count from the first
+  request. (5) `clear/1` restarts the climber from `window_percent` with
+  the initial step and a previous rate of 0, because an empty cache keeps
+  no evidence for the window it had; a restart rebuild gets the same from
+  `Policy.new/1`. The struct keeps the two sample counts at the top level,
+  where the drain's one struct update per read absorbs the hit (§Decisions
+  M2.11b), and the cold fields (previous rate, step, pending adjustment,
+  initial limits) in one `climber` map that is `nil` with `adaptive:
+  false`, so `climb/1` is one match there. An overwrite of a known key
+  counts as neither a hit nor a miss; only drained reads and new keys do,
+  as the rule says.
+  Immediate demotion (M2.5) still matches Caffeine's deferred demotion
+  once the window moves. `protected_max` changes only in a resize: a grow
+  lowers it and demotes at once, which is what `increaseWindow` does too
+  (it calls `demoteFromMainProtected` right after lowering the limit), and
+  a shrink raises it, which demotes nothing in either design. Within a
+  pass the two designs leave the protected segment in the same order (an
+  entry demoted and then read in the same pass ends at the protected MRU
+  either way, and the same LRU entry is demoted in its place). Demoted
+  entries reach the probation MRU at the access here and at the end of the
+  pass there. That only changes their order relative to the window
+  overflows of the same pass, at the MRU end, far from the victim, and the
+  candidate floor (§Decisions M2.6) keeps both out of the candidate walk.
+  So nothing is recorded as a divergence.

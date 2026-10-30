@@ -11,7 +11,7 @@ defmodule Theine.Test.Policy do
                          policy_module: Theine.Test.Policy})
       ...
       Theine.Maintenance.info(cache)   # sync with the process
-      Theine.Test.Policy.calls(cache)  #=> [:new, :on_write, :evict, :on_access, :evict]
+      Theine.Test.Policy.calls(cache)  #=> [:new, :on_write, :evict, :on_access, :evict, :climb]
 
   Without a listener the calls are forwarded and nothing is recorded.
 
@@ -28,7 +28,7 @@ defmodule Theine.Test.Policy do
 
   alias Theine.{Config, Policy}
 
-  @type call :: :new | :on_write | :on_remove | :on_access | :evict | :reset | :restore
+  @type call :: :new | :on_write | :on_remove | :on_access | :evict | :climb | :reset | :restore
 
   @doc """
   Registers the caller as the gate for `cache`'s next `call`: the policy
@@ -105,6 +105,12 @@ defmodule Theine.Test.Policy do
   def evict(%Policy{table: cache} = state) do
     record(cache, :evict)
     Policy.evict(state)
+  end
+
+  @spec climb(Policy.t()) :: Policy.t()
+  def climb(%Policy{table: cache} = state) do
+    record(cache, :climb)
+    Policy.climb(state)
   end
 
   @spec reset(Policy.t()) :: Policy.t()

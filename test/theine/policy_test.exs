@@ -1105,6 +1105,295 @@ defmodule Theine.PolicyTest do
     end
   end
 
+  describe "adaptive window (specs/05 §Adaptive window)" do
+    test "climb/1 waits for a full sample, then steps by 6.25% of max_size, smaller first", %{
+      table: table
+    } do
+      # window_max 100, protected_max 720; the sample is 10 * 1_000 requests.
+      policy = bounded(1_000, window_percent: 10)
+      policy = Enum.reduce(1..100, policy, &put(&2, table, &1, &1))
+      assert %{window_max: 100, sample_misses: 100, sample_hits: 0} = Policy.climber(policy)
+
+      assert Policy.climb(policy) == policy
+
+      # A rate of 0.49 against the initial 0 is no worse: the step keeps its
+      # initial direction, toward a smaller window, and the 49-point change
+      # restarts it at the full 62.5.
+      policy = Policy.climb(%{policy | sample_hits: 4_900, sample_misses: 5_100})
+      assert %{window_max: 38, protected_max: 782, sample_hits: 0} = Policy.climber(policy)
+      assert policy.climber.step == -62.5
+      assert policy.climber.adjustment == 0
+      assert keys_in_order(policy, :window) == Enum.to_list(63..100)
+      assert keys_in_order(policy, :probation) == Enum.to_list(1..62)
+      assert Policy.weights(policy) == %{window: 38, probation: 62, protected: 0}
+
+      # A slightly worse rate reverses the step and decays it by 0.98.
+      policy = Policy.climb(%{policy | sample_hits: 4_800, sample_misses: 5_200})
+      assert %{window_max: 100, protected_max: 720} = Policy.climber(policy)
+      assert_in_delta policy.climber.step, 61.25, 1.0e-9
+      assert Policy.weights(policy) == %{window: 100, probation: 0, protected: 0}
+    end
+
+    test "resize/2 grows the window from the probation LRU, then the protected LRU", %{
+      table: table
+    } do
+      policy = bounded(100)
+      # window_max 1, protected_max 79.
+      policy = Enum.reduce(1..6, policy, &put(&2, table, &1, &1))
+      policy = Enum.reduce(1..3, policy, &place(&2, &1, :probation))
+      policy = Enum.reduce(4..5, policy, &place(&2, &1, :protected))
+
+      policy = Policy.resize(policy, 4)
+
+      # Probation 1..3 first, then the protected LRU 4, each to the window MRU.
+      assert keys_in_order(policy, :window) == [6, 1, 2, 3, 4]
+      assert keys_in_order(policy, :protected) == [5]
+      assert %{window_max: 5, protected_max: 75} = Policy.climber(policy)
+      assert policy.climber.adjustment == 0
+
+      # With main holding one entry, a larger step moves only that one, and
+      # the limits move by what was moved.
+      policy = Policy.resize(policy, 10)
+      assert %{window_max: 6, protected_max: 74} = Policy.climber(policy)
+      assert policy.climber.adjustment == 9
+      assert Policy.weights(policy) == %{window: 6, probation: 0, protected: 0}
+    end
+
+    test "resize/2 demotes the protected LRU when the smaller protected_max no longer fits", %{
+      table: table
+    } do
+      # max_size 10: window_max 1, protected_max 7.
+      policy = bounded(10)
+      policy = Enum.reduce(1..8, policy, &put(&2, table, &1, &1))
+      policy = Enum.reduce(1..7, policy, &place(&2, &1, :protected))
+
+      policy = Policy.resize(policy, 3)
+
+      # protected_max drops to 4: keys 1..3 are demoted to probation, then
+      # moved on to the window MRU behind key 8.
+      assert %{window_max: 4, protected_max: 4} = Policy.climber(policy)
+      assert keys_in_order(policy, :window) == [8, 1, 2, 3]
+      assert keys_in_order(policy, :protected) == [4, 5, 6, 7]
+      assert policy.protected_weight <= policy.protected_max
+    end
+
+    test "resize/2 shrinks the window from its LRU to the probation MRU, never below 1", %{
+      table: table
+    } do
+      policy = bounded(100, window_percent: 10)
+      # window_max 10, protected_max 72.
+      policy = Enum.reduce(1..10, policy, &put(&2, table, &1, &1))
+
+      policy = Policy.resize(policy, -4)
+      assert keys_in_order(policy, :window) == Enum.to_list(5..10)
+      assert keys_in_order(policy, :probation) == [1, 2, 3, 4]
+      assert %{window_max: 6, protected_max: 76} = Policy.climber(policy)
+
+      policy = Policy.resize(policy, -50)
+      assert keys_in_order(policy, :window) == [10]
+      assert %{window_max: 1, protected_max: 81} = Policy.climber(policy)
+      assert policy.climber.adjustment == 0
+
+      # At the floor the step waits in the adjustment.
+      policy = Policy.resize(policy, -3)
+      assert %{window_max: 1, protected_max: 81} = Policy.climber(policy)
+      assert policy.climber.adjustment == -3
+    end
+
+    test "resize/2 moves at most 1_000 entries per call and leaves the rest for the next", %{
+      table: table
+    } do
+      policy = bounded(10_000, window_percent: 20)
+      policy = Enum.reduce(1..2_000, policy, &put(&2, table, &1, &1))
+
+      policy = Policy.resize(policy, -1_500)
+      assert %{window_max: 1_000} = Policy.climber(policy)
+      assert policy.climber.adjustment == -500
+      assert policy.window_weight == 1_000
+
+      policy = Policy.resize(policy, policy.climber.adjustment)
+      assert %{window_max: 500} = Policy.climber(policy)
+      assert policy.climber.adjustment == 0
+    end
+
+    test "adaptive: false keeps climb/1 a no-op and the limits fixed", %{table: table} do
+      policy = bounded(1_000, adaptive: false)
+      policy = Enum.reduce(1..10, policy, &put(&2, table, &1, &1))
+      policy = %{policy | sample_hits: 9_000, sample_misses: 1_000}
+      assert Policy.climb(policy) == policy
+      assert %{adaptive: false, window_max: 10, protected_max: 792} = Policy.climber(policy)
+    end
+
+    test "reset/1 restarts the climber at the configured window", %{table: table} do
+      policy = bounded(100, window_percent: 10)
+      policy = Enum.reduce(1..10, policy, &put(&2, table, &1, &1))
+      policy = Policy.climb(%{policy | sample_hits: 600, sample_misses: 400})
+      assert %{window_max: 4} = Policy.climber(policy)
+
+      policy = Policy.reset(policy)
+
+      assert %{window_max: 10, protected_max: 72, sample_hits: 0, sample_misses: 0} =
+               Policy.climber(policy)
+
+      assert policy.climber.step == -6.25
+      assert policy.climber.hit_rate == 0.0
+    end
+
+    test "the climber samples with stats: false" do
+      # The sample is counted in the maintenance process from drained reads
+      # and new-key puts, never from the stats counters (specs/05 §Adaptive
+      # window). window_max 10, protected_max 72, a sample of 1_000.
+      cache = :policy_test_climber
+
+      start_supervised!(
+        {Theine,
+         name: cache,
+         max_size: 100,
+         window_percent: 10,
+         stats: false,
+         maintenance_interval: 3_600_000}
+      )
+
+      assert Config.get(cache).request_counters == nil
+      for key <- 1..10, do: :ok = Theine.put(cache, key, key)
+
+      # Batches of 30 reads, below the drain threshold and the ring's size,
+      # so the pass after each drains every one of them.
+      for _ <- 1..3 do
+        for key <- 1..10, do: {:ok, ^key} = Theine.get(cache, key)
+        :ok = Theine.Maintenance.run(cache)
+      end
+
+      # A miss with no put, and an overwrite, count for neither side.
+      :error = Theine.get(cache, :absent)
+      :ok = Theine.put(cache, 1, :again)
+      :ok = Theine.Maintenance.run(cache)
+
+      assert %{climber: %{sample_hits: 30, sample_misses: 10, window_max: 10}} =
+               Theine.Maintenance.info(cache)
+
+      # 960 more new keys complete the sample at a hit rate of 3%, no worse
+      # than the initial 0, so the first step shrinks the window by 6.
+      for key <- 11..970, do: :ok = Theine.put(cache, key, key)
+      :ok = Theine.Maintenance.run(cache)
+
+      assert %{
+               climber: %{
+                 adaptive: true,
+                 window_max: 4,
+                 protected_max: 78,
+                 sample_hits: 0,
+                 sample_misses: 0
+               }
+             } = Theine.Maintenance.info(cache)
+    end
+
+    test "adaptive: false leaves every existing policy test result unchanged", %{table: table} do
+      # The same traces replayed with a fixed window, once with a climb after
+      # every 32 requests and once with none, end in the same tables,
+      # weights, limits, evictions and hits; the adaptive policy does not.
+      for trace <- [recency_trace(), zipf_trace()] do
+        static = bounded(200, adaptive: false)
+        climbed = replay_trace(static, table, trace, climb: true)
+        plain = replay_trace(static, table, trace, climb: false)
+        assert climbed == plain
+
+        adaptive = replay_trace(bounded(200), table, trace, climb: true)
+        refute adaptive == plain
+      end
+    end
+
+    test "the climber grows the window on a recency trace and shrinks it on a frequency trace",
+         %{table: table} do
+      # Recency: every read is of a key written at most 300 requests ago, so
+      # a 1% window (2 entries) turns most of them away at admission.
+      trace = recency_trace()
+      static = replay_trace(bounded(200, adaptive: false), table, trace, climb: true)
+      adaptive = replay_trace(bounded(200), table, trace, climb: true)
+      assert static.window_max == 2
+      assert adaptive.window_max >= 100
+      assert adaptive.hit_rate >= static.hit_rate + 0.10
+
+      # Frequency: a fixed Zipf distribution, where a small window is best.
+      trace = zipf_trace()
+      static = replay_trace(bounded(200, adaptive: false), table, trace, climb: true)
+      wide = replay_trace(bounded(200, window_percent: 40), table, trace, climb: true)
+      assert wide.window_max <= 40
+      assert wide.hit_rate >= static.hit_rate - 0.01
+    end
+  end
+
+  # Each new key is followed by three reads of keys written within the last
+  # 300 (fixed seed): recency is everything and frequency nothing.
+  defp recency_trace do
+    :rand.seed(:exsss, {7, 7, 7})
+
+    Enum.flat_map(1..25_000, fn i ->
+      [i | for(_ <- 1..3, i > 300, do: i - :rand.uniform(300))]
+    end)
+  end
+
+  # 100_000 requests, Zipf(0.9) over 5_000 keys (fixed seed), by inverse CDF.
+  defp zipf_trace do
+    :rand.seed(:exsss, {7, 7, 8})
+    weights = for k <- 1..5_000, do: 1 / :math.pow(k, 0.9)
+    total = Enum.sum(weights)
+    cdf = weights |> Enum.scan(&(&1 + &2)) |> Enum.map(&(&1 / total)) |> List.to_tuple()
+    for _ <- 1..100_000, do: search(cdf, :rand.uniform(), 0, tuple_size(cdf) - 1) + 1
+  end
+
+  defp search(_cdf, _u, lo, hi) when lo >= hi, do: lo
+
+  defp search(cdf, u, lo, hi) do
+    mid = div(lo + hi, 2)
+    if elem(cdf, mid) < u, do: search(cdf, u, mid + 1, hi), else: search(cdf, u, lo, mid)
+  end
+
+  # Replays `trace` as a cache would see it from an empty start: a key in the
+  # entries table is a hit and its read is drained at once, any other is a
+  # put that evicts what it displaced. Every 32 requests the pass's sketch
+  # aging and, with `climb: true`, its adaptive step run. Returns what the
+  # replay left behind.
+  defp replay_trace(policy, table, trace, climb: climb?) do
+    policy = Policy.reset(policy)
+    :ets.delete_all_objects(table)
+    :rand.seed(:exsss, {1, 2, 3})
+    evictions = evictions(policy)
+
+    {policy, _id, hits, _n} =
+      Enum.reduce(trace, {policy, 0, 0, 0}, fn key, {policy, id, hits, n} ->
+        {policy, id, hits} =
+          case :ets.lookup(table, key) do
+            [{^key, _, key_id, _, _, _}] ->
+              {Policy.on_access(policy, key_id), id, hits + 1}
+
+            [] ->
+              {_status, _evicted, policy} = policy |> put(table, key, id + 1) |> Policy.evict()
+              {policy, id + 1, hits}
+          end
+
+        policy =
+          cond do
+            rem(n + 1, 32) != 0 -> policy
+            climb? -> policy |> age() |> Policy.climb()
+            true -> age(policy)
+          end
+
+        {policy, id, hits, n + 1}
+      end)
+
+    # `reset/1` does not rewind `seq`, so the order is compared as keys per
+    # segment, LRU first.
+    %{
+      order: for({{segment, _seq}, key} <- Policy.order_rows(policy), do: {segment, key}),
+      weights: Policy.weights(policy),
+      window_max: policy.window_max,
+      protected_max: policy.protected_max,
+      evictions: evictions(policy) - evictions,
+      hit_rate: hits / length(trace)
+    }
+  end
+
   # A write followed by the eviction step and the sketch aging the
   # maintenance pass would run (specs/04 §The pass steps 5 and 6).
   defp write(policy, table, key, id) do
@@ -1263,6 +1552,7 @@ defmodule Theine.PolicyTest do
   @write_kinds [{3, :put}, {1, :racy_put}, {2, :removed}]
   @access_kinds [{3, :put}, {1, :racy_put}, {2, :removed}, {4, :access}, {2, :overflow}]
   @evict_kinds [{3, :put}, {1, :racy_put}, {2, :removed}, {4, :access}, {3, :evict}]
+  @resize_kinds @evict_kinds ++ [{3, :resize}]
 
   defp events(kinds \\ @write_kinds) do
     gen all keys <- list_of(member_of(1..6), min_length: 1, max_length: 40),
@@ -1277,6 +1567,7 @@ defmodule Theine.PolicyTest do
         {{_key, _id}, :access, _, pick} -> {:access, pick}
         {{key, _id}, :overflow, _, _} -> {:overflow, key}
         {{_key, _id}, :evict, _, _} -> :evict
+        {{_key, _id}, :resize, weight, _} -> {:resize, 2 * (weight - 5)}
       end)
     end
   end
@@ -1310,6 +1601,24 @@ defmodule Theine.PolicyTest do
     policy = bounded(20, evict_batch: 2)
 
     check all events <- events(@evict_kinds), max_runs: 1000 do
+      policy = Policy.reset(policy)
+      :ets.delete_all_objects(table)
+
+      Enum.reduce(events, {policy, %{}}, fn event, {policy, model} ->
+        {policy, model} = apply_event(policy, table, event, model)
+        assert_invariant(policy, model)
+        {policy, model}
+      end)
+    end
+  end
+
+  property "window and probation weights stay consistent across a resize", %{table: table} do
+    # The evict property's events with window resizes of -8..8 between
+    # them (specs/05 §Adaptive window): every event keeps the invariant, and
+    # a resize moves the limits by exactly the weight it transferred.
+    policy = bounded(20, evict_batch: 2)
+
+    check all events <- events(@resize_kinds), max_runs: 1000 do
       policy = Policy.reset(policy)
       :ets.delete_all_objects(table)
 
@@ -1494,6 +1803,32 @@ defmodule Theine.PolicyTest do
     end
 
     {policy, Map.drop(model, Enum.map(gone, &elem(&1, 0)))}
+  end
+
+  # One resize: no key leaves or changes, the total and the region sum stay,
+  # the window's excess over its limit (puts not yet evicted) stays, the
+  # window limit stays at least 1, and the untransferred rest is kept with
+  # the requested sign.
+  defp apply_event(policy, _table, {:resize, amount}, model) do
+    before = Policy.weights(policy)
+    resized = Policy.resize(policy, amount)
+    after_ = Policy.weights(resized)
+    moved = after_.window - before.window
+
+    assert Policy.count(resized) == Policy.count(policy)
+    assert total(resized) == total(policy)
+    assert resized.window_max >= 1
+    assert resized.protected_max >= 0
+    assert resized.window_max + resized.protected_max == policy.window_max + policy.protected_max
+    assert resized.window_max - policy.window_max == moved
+    assert resized.window_weight - resized.window_max == policy.window_weight - policy.window_max
+    assert abs(moved) <= abs(amount)
+
+    left = resized.climber.adjustment
+    assert left == 0 or (left > 0 and amount > 0) or (left < 0 and amount < 0)
+    assert abs(left) <= abs(amount)
+
+    {resized, model}
   end
 
   defp assert_model(policy, model, segment) do

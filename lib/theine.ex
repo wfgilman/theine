@@ -33,7 +33,7 @@ defmodule Theine do
   | `refresh_after_write` | ms or `:infinity` | `:infinity` |
   | `loader` | `(key -> {:commit, v} \\| {:commit, v, ttl: ms} \\| {:ignore, v})` or `nil` | `nil` |
   | `window_percent` | 1..80 | 1 |
-  | `adaptive` | boolean | `false` |
+  | `adaptive` | boolean | `true` |
   | `stripes` | power of two | `System.schedulers_online()` rounded up to one |
   | `read_buffer_slots` | power of two | 64 |
   | `drain_threshold` | power of two | 32 |
@@ -54,6 +54,10 @@ defmodule Theine do
   `max_size` bounds the total entry weight and allocates both: every hit
   then records the entry's id in the read buffer, and the maintenance
   process evicts by W-TinyLFU (specs/05) once the weight exceeds the bound.
+  The admission window starts at `window_percent` of `max_size`; with
+  `adaptive: true` the maintenance process then moves it with Caffeine's
+  hill climber, growing it while recency pays and shrinking it while
+  frequency does, and `adaptive: false` keeps it fixed.
 
   The `weigher` is called on every write without a `weight:` option and
   must return a positive integer; an entry heavier than `max_size` is never

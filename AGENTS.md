@@ -111,9 +111,11 @@ test/                         mirrors lib/; test/support for shared helpers
 - `mix bench hitrate --traces OLTP` (about 3 min) is the quick policy check;
   `--traces loop` takes seconds. `--accesses-per-pass 1` replays like
   Caffeine's simulator, `--window-percent 1,5,20` sweeps the window. The
-  full run replays DS1 at 8 M entries (about 3 GB of ETS) and takes about
-  85 min (46 before M2.11e's round trip after each miss; LRU-only was 8);
-  run it in the background. Two runs must agree to the hit: compare the
+  full run replays DS1 at 8 M entries (about 3 GB of ETS) and, with
+  `theine_static` beside `theine` (M2.13), outlasts the 2-hour cap on a
+  background command: run `--traces OLTP,S3,P3,loop,zipf` (about 44 min)
+  and then `--traces DS1` (about 79 min), one after the other, since each
+  overwrites `hitrate-<sha>.json`. Compare hits before starting the second. Two runs must agree to the hit: compare the
   `hits` fields in the JSON, not the percentages (the harness raises if a
   pass it did not request ran).
 - `mix bench maintenance` takes about 2 min at the default 1 M entries

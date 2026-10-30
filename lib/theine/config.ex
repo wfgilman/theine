@@ -77,7 +77,7 @@ defmodule Theine.Config do
             refresh_after_write: :infinity,
             loader: nil,
             window_percent: 1,
-            adaptive: false,
+            adaptive: true,
             stripes: nil,
             read_buffer_slots: 64,
             drain_threshold: 32,

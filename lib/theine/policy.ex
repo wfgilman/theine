@@ -36,6 +36,11 @@ defmodule Theine.Policy do
   The three segment weights, the region limits and the number of sketch
   increments since the last completed reset (specs/04 §Responsibilities)
   live in the struct.
+
+  With `adaptive: true`, the default, `climb/1` moves the window's share of
+  `max_size` with Caffeine's hill climber (specs/05 §Adaptive window). Its
+  sample is counted here: a current-id `on_access/2` is a hit and a `:put`
+  that admits a key new to the policy a miss.
   """
 
   import Bitwise
@@ -60,6 +65,20 @@ defmodule Theine.Policy do
           protected: non_neg_integer()
         }
 
+  @typedoc """
+  The hill climber's state (specs/05 §Adaptive window): the hit rate of the
+  previous sample, the signed step the next sample moves the window by, the
+  part of the last adjustment not yet transferred (positive grows the
+  window), and the limits at the start, which `reset/1` restores.
+  """
+  @type climber :: %{
+          hit_rate: float(),
+          step: float(),
+          adjustment: integer(),
+          window_max: pos_integer(),
+          protected_max: non_neg_integer()
+        }
+
   @type t :: %__MODULE__{
           policy: :ets.table(),
           ids: :ets.table(),
@@ -80,7 +99,10 @@ defmodule Theine.Policy do
           candidates: non_neg_integer(),
           cursor: non_neg_integer() | nil,
           candidate_floor: pos_integer() | nil,
-          restored_id: non_neg_integer()
+          restored_id: non_neg_integer(),
+          sample_hits: non_neg_integer(),
+          sample_misses: non_neg_integer(),
+          climber: climber() | nil
         }
 
   @enforce_keys [:policy, :ids, :table, :sizes, :counters, :max_size]
@@ -104,8 +126,21 @@ defmodule Theine.Policy do
     candidates: 0,
     cursor: nil,
     candidate_floor: nil,
-    restored_id: 0
+    restored_id: 0,
+    sample_hits: 0,
+    sample_misses: 0,
+    climber: nil
   ]
+
+  # Caffeine's hill climber (specs/05 §Adaptive window): a sample of
+  # `Sketch.sample_size/1` requests, a first step of 6.25% of `max_size`
+  # that decays by 0.98 per sample, back to the full step when the hit rate
+  # moved by 5 points or more, and at most 1000 entries moved per call
+  # (`QUEUE_TRANSFER_THRESHOLD`), the rest carried to the next pass.
+  @step_percent 0.0625
+  @step_decay 0.98
+  @restart_threshold 0.05
+  @transfer_cap 1000
 
   # Caffeine's hash-DoS guard (specs/05 §Events `evict`): a candidate that
   # ties or loses but has at least this frequency is still admitted one
@@ -207,12 +242,25 @@ defmodule Theine.Policy do
         counters: counters,
         max_size: max_size,
         window_percent: window_percent,
+        adaptive: adaptive,
         evict_batch: evict_batch,
         sketch: %Sketch{} = sketch
       })
       when is_integer(max_size) do
     %{window_max: window_max, protected_max: protected_max} = limits(max_size, window_percent)
     Sketch.clear(sketch)
+
+    # Caffeine starts the step negative (`setMaximumSize`): the first sample,
+    # compared with a rate of 0, shrinks the window toward its minimum.
+    climber =
+      if adaptive,
+        do: %{
+          hit_rate: 0.0,
+          step: -@step_percent * max_size,
+          adjustment: 0,
+          window_max: window_max,
+          protected_max: protected_max
+        }
 
     state = %__MODULE__{
       policy: :ets.new(__MODULE__, [:set, :private]),
@@ -225,7 +273,8 @@ defmodule Theine.Policy do
       max_size: max_size,
       window_max: window_max,
       protected_max: protected_max,
-      evict_batch: evict_batch
+      evict_batch: evict_batch,
+      climber: climber
     }
 
     publish(state, 0, 0)
@@ -328,27 +377,36 @@ defmodule Theine.Policy do
     true = :ets.insert(state.ids, {id, key})
     true = :ets.insert(state.order, {@window_base + seq, key})
     add(state, 1, weight)
+    :ok = Sketch.increment(state.sketch, key)
 
-    %{state | next_seq: seq + 1, window_weight: state.window_weight + weight}
-    |> sample(key)
+    # A key new to the policy is the climber's miss (specs/05 §Adaptive
+    # window): in a cache, the insert of a new key follows a miss.
+    %{
+      state
+      | next_seq: seq + 1,
+        window_weight: state.window_weight + weight,
+        sketch_size: state.sketch_size + 1,
+        sample_misses: state.sample_misses + 1
+    }
   end
 
   # An access: move `key` to the MRU of `segment` and count it in the
-  # sketch. Nothing to do without a bound.
+  # sketch. Nothing to do without a bound. An overwrite is an access to the
+  # policy but neither a hit nor a miss to the climber.
   defp touch(%__MODULE__{order: nil} = state, _key, nil, _old_seq), do: state
 
   defp touch(%__MODULE__{} = state, key, segment, old_seq),
-    do: reorder_and_sample(state, key, segment, old_seq)
+    do: reorder_and_sample(state, key, segment, old_seq, 0)
 
   # A move to the MRU of the key's own segment and its sketch count, with
   # one struct update: a struct update costs about as much as an ETS
   # update_element here, and this is the drain's common case (specs/05
-  # §Decisions M2.11b).
-  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq) do
+  # §Decisions M2.11b). `hit` is 1 for a drained read, the climber's hit.
+  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq, hit) do
     seq = next_seq(state)
     reorder(state, key, segment, old_seq, segment, seq)
     :ok = Sketch.increment(state.sketch, key)
-    %{state | next_seq: seq + 1, sketch_size: size + 1}
+    %{state | next_seq: seq + 1, sketch_size: size + 1, sample_hits: state.sample_hits + hit}
   end
 
   # Moves `key` from `{from, old_seq}` to the MRU end of `to` with a fresh
@@ -365,14 +423,6 @@ defmodule Theine.Policy do
     true = :ets.delete(order, base(from) + old_seq)
     true = :ets.insert(order, {base(to) + seq, key})
     true = :ets.update_element(policy, key, [{@row_segment, to}, {@row_seq, seq}])
-  end
-
-  # Counts one access to `key` in the sketch; `sketch_size` is what the
-  # maintenance process compares with `Sketch.sample_size/1` to start a
-  # reset (specs/02 §Operations).
-  defp sample(%__MODULE__{sketch: sketch, sketch_size: size} = state, key) do
-    :ok = Sketch.increment(sketch, key)
-    %{state | sketch_size: size + 1}
   end
 
   @doc """
@@ -462,6 +512,7 @@ defmodule Theine.Policy do
       state
       | next_seq: new_seq + 1,
         sketch_size: state.sketch_size + 1,
+        sample_hits: state.sample_hits + 1,
         probation_weight: state.probation_weight - weight,
         protected_weight: state.protected_weight + weight
     })
@@ -470,7 +521,7 @@ defmodule Theine.Policy do
   # Window → window MRU, protected → protected MRU, and a probation entry
   # too heavy for protected → probation MRU.
   defp access(state, key, segment, seq, _weight),
-    do: reorder_and_sample(state, key, segment, seq)
+    do: reorder_and_sample(state, key, segment, seq, 1)
 
   # Demotes protected LRU entries to probation MRU until the protected
   # segment fits. Every step removes a positive weight, and the segment is
@@ -698,6 +749,194 @@ defmodule Theine.Policy do
   end
 
   @doc """
+  The adaptive step of the maintenance pass (specs/05 §Adaptive window;
+  specs/04 §The pass step 7), Caffeine's `climb`. A no-op without a bound
+  or with `adaptive: false`.
+
+  Once the sample holds `Sketch.sample_size(max_size)` requests (hits and
+  misses as `on_access/2` and `on_write/5` count them), its hit rate is
+  compared with the previous sample's: no worse keeps the window moving the
+  way the last step went, worse reverses it. The step starts at 6.25% of
+  `max_size` and decays by 0.98 per sample, and returns to 6.25% whenever
+  the rate moved by 5 points or more. Then the adjustment is applied by
+  `resize/2`; what it could not transfer is retried by the next call.
+  """
+  @spec climb(t()) :: t()
+  def climb(%__MODULE__{climber: nil} = state), do: state
+
+  def climb(%__MODULE__{} = state) do
+    state = sample_done(state)
+    resize(state, state.climber.adjustment)
+  end
+
+  # Caffeine's `determineAdjustment`: nothing until the sample is complete,
+  # then the signed adjustment, the next step and a fresh sample.
+  defp sample_done(%__MODULE__{sample_hits: hits, sample_misses: misses} = state) do
+    %__MODULE__{max_size: max_size, climber: climber} = state
+    requests = hits + misses
+
+    if requests < Sketch.sample_size(max_size) do
+      state
+    else
+      hit_rate = hits / requests
+      change = hit_rate - climber.hit_rate
+      amount = if change >= 0, do: climber.step, else: -climber.step
+
+      step =
+        cond do
+          abs(change) < @restart_threshold -> @step_decay * amount
+          amount >= 0 -> @step_percent * max_size
+          true -> -@step_percent * max_size
+        end
+
+      %{
+        state
+        | sample_hits: 0,
+          sample_misses: 0,
+          climber: %{climber | hit_rate: hit_rate, step: step, adjustment: trunc(amount)}
+      }
+    end
+  end
+
+  @doc """
+  Moves `amount` of weight from the main region's limits to the window's
+  (positive) or back (negative), Caffeine's `increaseWindow` and
+  `decreaseWindow`; `climb/1` calls it with the adjustment its samples
+  decided, and tests call it directly. Adaptive bounded policies only.
+
+  Growing takes the probation LRU entry while it fits in what is left of
+  `amount`, else the protected LRU, to the window MRU; it lowers
+  `protected_max` by the same amount and first demotes the protected LRU
+  entries that no longer fit. Shrinking moves window LRU entries to the
+  probation MRU and raises `protected_max`, never below a window limit of
+  1. Either way the limits move by exactly the weight transferred, at most
+  #{@transfer_cap} entries per call, and the rest stays in the climber's
+  `adjustment` for the next call. The moved entries are not admission
+  candidates, and the total weight is unchanged.
+  """
+  @spec resize(t(), integer()) :: t()
+  def resize(%__MODULE__{climber: %{adjustment: 0}} = state, 0), do: state
+  def resize(%__MODULE__{climber: %{}} = state, 0), do: put_adjustment(state, 0)
+
+  def resize(%__MODULE__{climber: %{}} = state, amount) when amount > 0 do
+    if state.protected_max == 0 do
+      put_adjustment(state, amount)
+    else
+      quota = min(amount, state.protected_max)
+
+      state =
+        demote(%{
+          state
+          | protected_max: state.protected_max - quota,
+            window_max: state.window_max + quota
+        })
+
+      {state, left} = transfer_in(state, quota, @transfer_cap)
+
+      %{state | protected_max: state.protected_max + left, window_max: state.window_max - left}
+      |> put_adjustment(left)
+    end
+  end
+
+  def resize(%__MODULE__{climber: %{}} = state, amount) when amount < 0 do
+    if state.window_max <= 1 do
+      put_adjustment(state, amount)
+    else
+      quota = min(-amount, state.window_max - 1)
+
+      state = %{
+        state
+        | protected_max: state.protected_max + quota,
+          window_max: state.window_max - quota
+      }
+
+      {state, left} = transfer_out(state, quota, @transfer_cap)
+
+      %{state | protected_max: state.protected_max - left, window_max: state.window_max + left}
+      |> put_adjustment(-left)
+    end
+  end
+
+  defp put_adjustment(%__MODULE__{climber: climber} = state, adjustment),
+    do: %{state | climber: %{climber | adjustment: adjustment}}
+
+  # Main → window MRU while the next main LRU entry fits in the quota.
+  defp transfer_in(state, quota, 0), do: {state, quota}
+
+  defp transfer_in(state, quota, n) do
+    case main_lru(state, quota) do
+      {segment, seq, key, weight} ->
+        state
+        |> move(key, segment, seq, :window)
+        |> add_segment(segment, -weight)
+        |> add_segment(:window, weight)
+        |> transfer_in(quota - weight, n - 1)
+
+      nil ->
+        {state, quota}
+    end
+  end
+
+  # The probation LRU when it fits in `quota`, else the protected LRU when
+  # that fits, as Caffeine's `increaseWindow` picks.
+  defp main_lru(state, quota) do
+    with nil <- fitting_lru(state, :probation, quota),
+         do: fitting_lru(state, :protected, quota)
+  end
+
+  defp fitting_lru(%__MODULE__{order: order, policy: policy}, segment, quota) do
+    with {seq, key} <- lru_entry(order, segment),
+         weight when weight <= quota <- :ets.lookup_element(policy, key, @row_weight) do
+      {segment, seq, key, weight}
+    else
+      _ -> nil
+    end
+  end
+
+  # Window LRU → probation MRU while the next one fits in the quota.
+  defp transfer_out(state, quota, 0), do: {state, quota}
+
+  defp transfer_out(state, quota, n) do
+    case fitting_lru(state, :window, quota) do
+      {:window, seq, key, weight} ->
+        state
+        |> move(key, :window, seq, :probation)
+        |> add_segment(:window, -weight)
+        |> add_segment(:probation, weight)
+        |> transfer_out(quota - weight, n - 1)
+
+      nil ->
+        {state, quota}
+    end
+  end
+
+  @doc """
+  The climber's view, for `Theine.Maintenance.info/1` and tests: whether
+  the window adapts, the current window and protected limits, and the hits
+  and misses counted toward the sample in progress. `nil` without a bound.
+  """
+  @spec climber(t()) ::
+          %{
+            adaptive: boolean(),
+            window_max: pos_integer(),
+            protected_max: non_neg_integer(),
+            sample_hits: non_neg_integer(),
+            sample_misses: non_neg_integer()
+          }
+          | nil
+  def climber(%__MODULE__{order: nil}), do: nil
+
+  def climber(%__MODULE__{} = state) do
+    %{
+      adaptive: state.climber != nil,
+      window_max: state.window_max,
+      protected_max: state.protected_max,
+      sample_hits: state.sample_hits,
+      sample_misses: state.sample_misses
+    }
+  end
+
+  @doc """
   Applies a `{:removed, key, id}` event (specs/05 §Events `on_remove`).
 
   The rows are deleted when `id` is the key's current id. A removal with
@@ -732,7 +971,8 @@ defmodule Theine.Policy do
 
   @doc """
   Empties the tables, zeroes the published sizes and the segment weights,
-  and clears the sketch (`Theine.clear/1`).
+  clears the sketch, and restarts the climber from the configured window
+  (`Theine.clear/1`).
   """
   @spec reset(t()) :: t()
   def reset(%__MODULE__{} = state) do
@@ -750,7 +990,23 @@ defmodule Theine.Policy do
         sketch_size: 0,
         candidates: 0,
         cursor: nil,
-        candidate_floor: nil
+        candidate_floor: nil,
+        sample_hits: 0,
+        sample_misses: 0
+    }
+    |> restart_climber()
+  end
+
+  # An empty cache starts the climb over from the configured window, as a
+  # new policy would.
+  defp restart_climber(%__MODULE__{climber: nil} = state), do: state
+
+  defp restart_climber(%__MODULE__{climber: climber, max_size: max_size} = state) do
+    %{
+      state
+      | window_max: climber.window_max,
+        protected_max: climber.protected_max,
+        climber: %{climber | hit_rate: 0.0, step: -@step_percent * max_size, adjustment: 0}
     }
   end
 

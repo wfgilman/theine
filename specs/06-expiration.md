@@ -92,3 +92,43 @@ test build, and the tracing test in specs/01 traces only `:ets`,
   by `config.name`, so a test clock moves both the write and the read side
   of one cache together. `config/config.exs` imports `config/test.exs` only
   for `config_env() == :test`; a consumer's build never reads either file.
+- 2026-10-29 (M3.1): the index and sweep as built, where §Index left room.
+  - The `expiry` table hangs off the `Theine.Policy` struct, not off the
+    maintenance state, and the policy keeps it in step: every insert,
+    restore, rewrite and drop of a policy row moves or deletes the key's
+    index row from the `expires_at` the row remembers. An eviction or a
+    `:removed` therefore takes the index row with it. With the index kept
+    beside the policy, an evicted entry's row would stay until its time
+    came, so a cache with a long TTL and heavy eviction would carry an
+    index far larger than itself. `Theine.Expiry` holds the table
+    primitives and the walk (`sweep/5`, a fold over the due rows that
+    steps with `:ets.next/2`, so it makes progress whatever the callback
+    does). `Theine.Policy.expire(state, now, limit)` is the `sweep(now,
+    limit)` of §Index and is what the pass calls, through `policy_module`,
+    so the specs/04 order test sees it. The restart rebuild indexes through
+    `restore/5`, and `reset/1` (`clear/1`) empties the index.
+  - The sweep re-reads the entries table for each due row (specs/04
+    §Removing an entry) and has three outcomes, not two. If the table holds
+    the policy's id and the entry is due, the exact tuple is deleted and
+    `expirations` counted. If the table holds another id, or nothing, a
+    put or delete raced the sweep and its event is in flight, so only the
+    policy rows go, as in an eviction. If the table holds the policy's id
+    with a later `expires_at` (or `:infinity`), an `expire/3` or
+    `persist/2` (M3.2) rewrote it in place and its same-id `:put` has not
+    arrived yet. The entry stays, and the row and the index follow the
+    table. Deleting it by exact object would discard an entry whose
+    `expire/3` had already returned `true`.
+  - `expire/3` returns `:more` only when it stopped at `limit` with a due
+    row still at the head of the index, so a sweep that ends exactly at the
+    cap schedules no empty follow-up.
+  - A reader and the sweep that both find the same due tuple before either
+    deletes it both count an expiration: `:ets.delete_object/2` returns
+    `true` whether or not it removed anything. `:ets.select_delete/2` could
+    tell, but a match head cannot hold an arbitrary key literally (an atom
+    such as `:_` in the key would be read as a pattern). The double count
+    needs the two lookups to fall within the same microseconds, and the
+    expired read already had the same exposure against eviction. It is
+    accepted.
+  - `Theine.Maintenance.info/1` reports `expiring`, the index's size, for
+    every cache, so a test can watch rows come and go without reading the
+    private table.

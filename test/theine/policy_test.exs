@@ -2,7 +2,7 @@ defmodule Theine.PolicyTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
-  alias Theine.{Config, Policy, Sketch, Stats}
+  alias Theine.{Config, Expiry, Policy, Sketch, Stats}
 
   doctest Policy
 
@@ -1829,6 +1829,235 @@ defmodule Theine.PolicyTest do
     assert abs(left) <= abs(amount)
 
     {resized, model}
+  end
+
+  describe "expire/3 and the expiry index (specs/06 §Index)" do
+    test "every finite expires_at is indexed under the row's id, and only those", %{
+      policy: policy,
+      table: table
+    } do
+      policy = put_timed(policy, table, :a, 1, 10)
+      policy = put_timed(policy, table, :b, 2, :infinity)
+      policy = Policy.restore(policy, :c, 3, 1, 30)
+      assert Expiry.rows(policy.expiry) == [{{10, :a}, 1}, {{30, :c}, 3}]
+
+      # A new version moves its row, a same-id rewrite moves it in place,
+      # and an :infinity rewrite or a removal deletes it.
+      policy = put_timed(policy, table, :a, 4, 20)
+      policy = Policy.on_write(policy, :c, 3, 1, 5)
+      policy = Policy.on_write(policy, :b, 2, 1, 15)
+      assert Expiry.rows(policy.expiry) == [{{5, :c}, 3}, {{15, :b}, 2}, {{20, :a}, 4}]
+
+      policy = Policy.on_write(policy, :b, 2, 1, :infinity)
+      policy = Policy.on_remove(policy, :a, 4)
+      assert Expiry.rows(policy.expiry) == [{{5, :c}, 3}]
+
+      assert Policy.reset(policy).expiry |> Expiry.rows() == []
+    end
+
+    test "deletes the due entries in expires_at order, at most limit per call", %{
+      policy: policy,
+      table: table,
+      sizes: sizes
+    } do
+      policy = Enum.reduce(1..5, policy, fn i, p -> put_timed(p, table, i, i, i * 10) end)
+      policy = put_timed(policy, table, :forever, 6, :infinity)
+
+      assert {:more, 2, policy} = Policy.expire(policy, 35, 2)
+      assert :ets.lookup(table, 1) == [] and :ets.lookup(table, 2) == []
+      assert {:done, 1, policy} = Policy.expire(policy, 35, 2)
+      assert {:done, 0, policy} = Policy.expire(policy, 35, 2)
+      assert Policy.size(sizes) == 3
+      assert Expiry.rows(policy.expiry) == [{{40, 4}, 4}, {{50, 5}, 5}]
+
+      # Stopping at the limit with nothing due behind it is :done.
+      assert {:done, 2, policy} = Policy.expire(policy, 50, 2)
+      assert Policy.size(sizes) == 1
+      assert Policy.weighted_size(sizes) == 1
+      assert Expiry.rows(policy.expiry) == []
+      assert expirations(policy) == 5
+    end
+
+    test "drops only the policy's rows when the table holds another version or none", %{
+      policy: policy,
+      table: table
+    } do
+      policy = put_timed(policy, table, :replaced, 1, 10)
+      policy = put_timed(policy, table, :gone, 2, 10)
+      # A newer put of one key, and a delete of the other, whose events are
+      # in flight.
+      :ets.insert(table, timed(:replaced, 3, 1, :infinity))
+      :ets.delete(table, :gone)
+
+      assert {:done, 0, policy} = Policy.expire(policy, 10, 10)
+      assert :ets.lookup(table, :replaced) == [timed(:replaced, 3, 1, :infinity)]
+      assert Policy.count(policy) == 0
+      assert expirations(policy) == 0
+
+      policy = Policy.on_write(policy, :replaced, 3, 1, :infinity)
+      assert {:ok, {:replaced, 3, nil, _, 1, :infinity}} = Policy.lookup(policy, :replaced)
+      assert Policy.on_remove(policy, :gone, 2) |> Policy.count() == 1
+    end
+
+    test "follows an expires_at the table rewrote in place, keeping the entry", %{
+      policy: policy,
+      table: table
+    } do
+      policy = put_timed(policy, table, :later, 1, 10)
+      policy = put_timed(policy, table, :persisted, 2, 10)
+      true = :ets.update_element(table, :later, {6, 40})
+      true = :ets.update_element(table, :persisted, {6, :infinity})
+
+      assert {:done, 0, policy} = Policy.expire(policy, 10, 10)
+      assert {:ok, {:later, 1, nil, _, 1, 40}} = Policy.lookup(policy, :later)
+      assert {:ok, {:persisted, 2, nil, _, 1, :infinity}} = Policy.lookup(policy, :persisted)
+      assert Expiry.rows(policy.expiry) == [{{40, :later}, 1}]
+      assert :ets.info(table, :size) == 2
+
+      # The same-id :put still in flight changes nothing more.
+      policy = Policy.on_write(policy, :later, 1, 1, 40)
+      assert Expiry.rows(policy.expiry) == [{{40, :later}, 1}]
+    end
+
+    test "bounded: an evicted key leaves the index and an expired one leaves its segment", %{
+      table: table
+    } do
+      policy = bounded(2)
+
+      policy =
+        Enum.reduce([a: 10, b: 20, c: 30], policy, fn {key, at}, policy ->
+          {:done, _, policy} =
+            policy |> put_timed(table, key, Policy.count(policy) + 1, at) |> Policy.evict()
+
+          policy
+        end)
+
+      assert Policy.count(policy) == 2
+      assert Expiry.rows(policy.expiry) == expected_index(policy)
+
+      assert {:done, 2, policy} = Policy.expire(policy, 30, 10)
+      assert Policy.weights(policy) == %{window: 0, probation: 0, protected: 0}
+      assert Policy.order_rows(policy) == []
+      assert Expiry.rows(policy.expiry) == []
+      assert :ets.info(table, :size) == 0
+    end
+  end
+
+  property "the expiry index matches the rows through writes, rewrites, removals, evictions and sweeps",
+           %{policy: unbounded, table: table} do
+    # Unbounded, and bounded at 20 with evict_batch 2 so evictions stop
+    # midway; expires_at among four times or :infinity, and sweeps at a time
+    # between them, so every sweep finds some rows due and some not.
+    policies = [unbounded, bounded(20, evict_batch: 2)]
+
+    check all events <- timed_events(), max_runs: 500 do
+      for policy <- policies do
+        :ets.delete_all_objects(table)
+
+        Enum.reduce(events, Policy.reset(policy), fn event, policy ->
+          policy = apply_timed(policy, table, event)
+          assert Expiry.rows(policy.expiry) == expected_index(policy)
+          policy
+        end)
+      end
+    end
+  end
+
+  defp timed_events do
+    kinds = [{4, :put}, {1, :racy_put}, {2, :retime}, {2, :removed}, {2, :evict}, {2, :sweep}]
+
+    gen all keys <- list_of(member_of(1..6), min_length: 1, max_length: 40),
+            kinds <- list_of(frequency(kinds), length: length(keys)),
+            times <- list_of(member_of([:infinity, 10, 20, 30, 40]), length: length(keys)),
+            sizes <- list_of(integer(1..9), length: length(keys)),
+            picks <- list_of(integer(0..length(keys)), length: length(keys)) do
+      Enum.zip([Enum.with_index(keys, 1), kinds, times, sizes, picks])
+      |> Enum.map(fn
+        {{key, id}, :put, at, weight, _} -> {:put, key, id, weight, at}
+        {{key, id}, :racy_put, at, weight, _} -> {:racy_put, key, id, weight, at}
+        {{key, _id}, :retime, at, _, _} -> {:retime, key, at}
+        {{key, _id}, :removed, _, _, stale} -> {:removed, key, stale}
+        {_, :evict, _, _, _} -> :evict
+        {_, :sweep, at, limit, _} -> {:sweep, if(at == :infinity, do: 45, else: at - 5), limit}
+      end)
+    end
+  end
+
+  defp apply_timed(policy, table, {:put, key, id, weight, at}),
+    do: put_timed(policy, table, key, id, at, weight)
+
+  defp apply_timed(policy, _table, {:racy_put, key, id, weight, at}),
+    do: Policy.on_write(policy, key, id, weight, at)
+
+  # What expire/3 and persist/2 will do (specs/06 §Semantics): the table's
+  # version rewritten in place, then its same-id event.
+  defp apply_timed(policy, table, {:retime, key, at}) do
+    case :ets.lookup(table, key) do
+      [{^key, _, id, weight, _, _}] ->
+        true = :ets.update_element(table, key, {6, at})
+        Policy.on_write(policy, key, id, weight, at)
+
+      [] ->
+        policy
+    end
+  end
+
+  defp apply_timed(policy, table, {:removed, key, id}) do
+    case :ets.lookup(table, key) do
+      [{^key, _, ^id, _, _, _} = version] -> :ets.delete_object(table, version)
+      _ -> :ok
+    end
+
+    Policy.on_remove(policy, key, id)
+  end
+
+  defp apply_timed(policy, _table, :evict) do
+    {_status, _evicted, policy} = Policy.evict(policy)
+    policy
+  end
+
+  # A sweep deletes what it counts, never more than `limit`; :done leaves
+  # nothing due, :more leaves something due; and a key it dropped never
+  # keeps the policy's due version in the table.
+  defp apply_timed(policy, table, {:sweep, now, limit}) do
+    before = expirations(policy)
+    due = for {key, id, _, _, _, at} <- :ets.tab2list(policy.policy), due?(at, now), do: {key, id}
+    {status, expired, policy} = Policy.expire(policy, now, limit)
+
+    assert expired == expirations(policy) - before
+    assert expired <= limit
+    left = for {_, _, _, _, _, at} <- :ets.tab2list(policy.policy), due?(at, now), do: at
+    if status == :done, do: assert(left == [])
+    if status == :more, do: assert(left != [])
+
+    for {key, id} <- due, Policy.lookup(policy, key) == :error do
+      refute match?(
+               [{^key, _, ^id, _, _, at}] when is_integer(at) and at <= now,
+               :ets.lookup(table, key)
+             )
+    end
+
+    policy
+  end
+
+  defp due?(at, now), do: is_integer(at) and at <= now
+
+  defp timed(key, id, weight, expires_at), do: {key, nil, id, weight, 0, expires_at}
+
+  defp put_timed(policy, table, key, id, expires_at, weight \\ 1) do
+    :ets.insert(table, timed(key, id, weight, expires_at))
+    Policy.on_write(policy, key, id, weight, expires_at)
+  end
+
+  defp expirations(policy), do: :counters.get(policy.counters, Stats.expirations())
+
+  # The index the policy rows call for: one row per finite expires_at.
+  defp expected_index(policy) do
+    Enum.sort(
+      for {key, id, _, _, _, at} <- :ets.tab2list(policy.policy),
+          is_integer(at),
+          do: {{at, key}, id}
+    )
   end
 
   defp assert_model(policy, model, segment) do

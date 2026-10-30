@@ -179,6 +179,9 @@ defmodule Theine.StatsTest do
 
       Theine.Maintenance.resume(cache)
       # At most `slots` reads survived in the ring; the count did not care.
+      # The reader's queued :drain may be deferred by drain_backoff behind
+      # the last pass, so drain with a pass that never is.
+      Theine.run_maintenance(cache)
       assert %{read_buffer: %{lag: 0}} = Theine.Maintenance.info(cache)
       assert %Stats{hits: 100, misses: 3} = Theine.stats(cache)
     end

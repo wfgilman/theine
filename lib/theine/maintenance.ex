@@ -36,18 +36,21 @@ defmodule Theine.Maintenance do
   once `write_batch` events have been applied since the last pass. In order
   (specs/04 §The pass): flush up to `write_batch` write events still
   queued in the mailbox, clear the drain flag, drain the read buffer into
-  `Theine.Policy.on_access/2`, evict with `Theine.Policy.evict/1` (a no-op
+  `Theine.Policy.on_access/2`, remove up to `expire_batch` expired entries
+  with `Theine.Policy.expire/3` (bounded or not; specs/06 §Index), evict
+  with `Theine.Policy.evict/1` (a no-op
   unless a rebuild or a capped per-event eviction left the cache over
   capacity), advance the sketch's reset by one chunk when one is due or
   running, take the adaptive window's step with `Theine.Policy.climb/1`
   (a no-op with `adaptive: false`), and emit
   `[:theine, :maintenance, :pass]`, whose `evicted` is
   the number of entries evicted since the previous pass, on arrival and in
-  the pass alike, as `writes` is. The expiry sweep (step 4) arrives with
-  `Theine.Expiry` (M3.1); the `expired` measurement is 0 until then. When
-  the drain found a full stripe or an eviction, in the pass or after an
-  applied `:put`, stopped at `evict_batch` removals, the next pass is
-  scheduled at once through `Theine.ReadBuffer.schedule_drain/1`.
+  the pass alike, as `writes` is, and whose `expired` is the number of
+  entries this pass's sweep deleted. When the drain found a full stripe,
+  the sweep stopped at `expire_batch` with due entries left, or an
+  eviction, in the pass or after an applied `:put`, stopped at
+  `evict_batch` removals, the next pass is scheduled at once through
+  `Theine.ReadBuffer.schedule_drain/1`.
 
   Drain-triggered passes are rate limited (specs/04 §The pass, §Decisions
   M2.8c): after a pass of duration `d`, a `:drain` that arrives within
@@ -69,7 +72,9 @@ defmodule Theine.Maintenance do
 
   use GenServer
 
-  alias Theine.{Config, Policy, ReadBuffer, Sketch}
+  require Theine.Clock
+
+  alias Theine.{Clock, Config, Expiry, Policy, ReadBuffer, Sketch}
 
   # Index of the drain flag inside `config.flags` (specs/03).
   @drain_flag Theine.Owner.drain_flag()
@@ -97,6 +102,7 @@ defmodule Theine.Maintenance do
           call_writes: non_neg_integer(),
           size: non_neg_integer(),
           weighted_size: non_neg_integer(),
+          expiring: non_neg_integer(),
           segments: Policy.weights() | nil,
           climber: map() | nil,
           read_buffer:
@@ -241,7 +247,9 @@ defmodule Theine.Maintenance do
   events consumed from the backpressure call path (`call_writes`, specs/03
   §Delivery with backpressure; what `mix bench maintenance` reports as the
   backpressure fraction), the entry count and weighted size as last seen by
-  the policy, and for a bounded cache the segment weights, the adaptive
+  the policy, the number of entries in the expiry index (`expiring`, those
+  with a finite `expires_at`), and for a bounded cache the segment
+  weights, the adaptive
   window's limits and sample (`Theine.Policy.climber/1`), the read
   buffer's shape and lag (specs/03) and the sketch's size, increments since
   its last reset and the cursor of a reset in progress; those four are
@@ -249,8 +257,8 @@ defmodule Theine.Maintenance do
 
       Theine.Maintenance.info(:sessions)
       #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, call_writes: 0,
-      #=>   size: 0, weighted_size: 0, segments: nil, climber: nil, read_buffer: nil,
-      #=>   sketch: nil}
+      #=>   size: 0, weighted_size: 0, expiring: 0, segments: nil, climber: nil,
+      #=>   read_buffer: nil, sketch: nil}
   """
   @spec info(Config.cache()) :: info()
   def info(cache) when is_atom(cache), do: GenServer.call(name(cache), :info)
@@ -396,6 +404,7 @@ defmodule Theine.Maintenance do
       call_writes: state.call_writes,
       size: Policy.size(config.sizes),
       weighted_size: Policy.weighted_size(config.sizes),
+      expiring: Expiry.size(policy.expiry),
       segments: if(bounded?, do: Policy.weights(policy), else: nil),
       climber: Policy.climber(policy),
       read_buffer:
@@ -531,7 +540,7 @@ defmodule Theine.Maintenance do
 
   defp batch(state), do: state
 
-  # One pass (specs/04 §The pass). Step 4, the expiry sweep, is M3.1.
+  # One pass (specs/04 §The pass).
   @spec pass(state()) :: state()
   defp pass(%__MODULE__{config: config, module: module} = state) do
     started = System.monotonic_time()
@@ -551,6 +560,11 @@ defmodule Theine.Maintenance do
     # 3. Drain the read buffer into the policy.
     {policy, reads, full?} = drain(config, module, state.policy)
 
+    # 4. Expire what is due, at most `expire_batch` entries (specs/06
+    #    §Index). The clock is the read path's, so a test clock moves both.
+    {expire_status, expired, policy} =
+      module.expire(policy, Clock.now(state.cache), config.expire_batch)
+
     # 5. Evict. Every applied `:put` already evicted what it displaced, so
     #    this finds work only after a restart rebuild or a capped per-event
     #    eviction, and otherwise costs two comparisons.
@@ -563,10 +577,11 @@ defmodule Theine.Maintenance do
     #    `adaptive` (specs/05 §Adaptive window).
     policy = module.climb(policy)
 
-    # A full stripe or a capped eviction wants the next pass now. The flag
-    # was cleared in step 2, so this sends exactly one `:drain` unless a
-    # reader already did, in which case that one serves.
-    if full? or status == :more, do: ReadBuffer.schedule_drain(config)
+    # A full stripe, a capped sweep or a capped eviction wants the next pass
+    # now. The flag was cleared in step 2, so this sends exactly one
+    # `:drain` unless a reader already did, in which case that one serves.
+    if full? or expire_status == :more or status == :more,
+      do: ReadBuffer.schedule_drain(config)
 
     # 8. Record and emit. `writes` and `evicted` are counts since the
     #    previous pass, on arrival and in this pass alike.
@@ -579,7 +594,7 @@ defmodule Theine.Maintenance do
         duration: duration,
         reads: reads,
         writes: state.writes,
-        expired: 0,
+        expired: expired,
         evicted: state.evicted + evicted
       },
       %{cache: state.cache}

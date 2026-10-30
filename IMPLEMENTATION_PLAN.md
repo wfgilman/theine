@@ -68,9 +68,9 @@ Done: M2.1, M2.2, M2.3, M2.4, M2.5, M2.6, M2.7, M2.8, M2.8b, M2.8c, M2.8d, M2.9,
 
 ## M3 Expiration
 
-Done: nothing yet.
+Done: M3.1.
 
-- [ ] M3.1 **(maintenance)** `Theine.Expiry` index and sweep in the pass (specs/06 §Index, §Semantics bullet 4; specs/04 §The pass step 4): `expiry` ordered_set `{{expires_at, key}, id}` maintained from write events using the previous `expires_at` kept on the policy row, `sweep/2` capped by `expire_batch` with removal by id compare, `expirations` counter, follow-up `:drain` when the cap is hit; the restart rebuild (M2.9) must index every entry it restores with a finite `expires_at`, from the same `Policy.restore/5` call or beside it in `Maintenance.rebuild/3`, and `Policy.reset/1` must empty the index for `clear/1` — tests: expiry_test "with maintenance running and no reads an expired entry leaves the table within one maintenance_interval", "100_000 entries expiring at once are removed over several passes of at most expire_batch each without waiting for the timer", "a put racing the sweep of the previous version keeps the new value", "an unbounded cache sweeps expired entries too"; `mix bench maintenance` mixed run stays under `pass_budget`.
+- [x] M3.1 **(maintenance)** `Theine.Expiry` index and sweep in the pass (specs/06 §Index, §Semantics bullet 4; specs/04 §The pass step 4): `expiry` ordered_set `{{expires_at, key}, id}` maintained from write events using the previous `expires_at` kept on the policy row, `sweep/2` capped by `expire_batch` with removal by id compare, `expirations` counter, follow-up `:drain` when the cap is hit; the restart rebuild (M2.9) must index every entry it restores with a finite `expires_at`, from the same `Policy.restore/5` call or beside it in `Maintenance.rebuild/3`, and `Policy.reset/1` must empty the index for `clear/1` — tests: expiry_test "with maintenance running and no reads an expired entry leaves the table within one maintenance_interval", "100_000 entries expiring at once are removed over several passes of at most expire_batch each without waiting for the timer", "a put racing the sweep of the previous version keeps the new value", "an unbounded cache sweeps expired entries too"; `mix bench maintenance` mixed run stays under `pass_budget`.
 - [ ] M3.2 `expire/3`, `persist/2`, `ttl/2` (specs/06 §Semantics bullets 5–7; specs/08 §Calls): `expire/3` updates element 6 in place and sends `{:put, key, id, weight, expires_at}` with the unchanged id; the policy treats a same-id `:put` as an expiry/weight update with no sketch increment and no MRU move (specs/05 §`on_write`) — tests: expiry_test "expire/3 moves the entry in the index and it is swept at the new time with the old row gone", "persist/2 removes the index row and the entry never expires", "ttl/2 returns remaining ms, :infinity, or :error", "expire/3 on an absent key returns false".
 
 ## M4 Loading
@@ -122,6 +122,8 @@ Done: nothing yet.
 
 7. **The A3 OLTP rows cannot pass as specs/09 states them** (found in M2.10; resolved 2026-10-29 by a human decision, open question 1: the margin is on `loop` only and the adaptive window, M2.13, carries `theine ≥ lru` on OLTP; met in M2.13 at +6.94, +2.97 and +1.51 points, §Benchmark log M2.13). specs/09 puts the +10-point margin on `loop` 1_000 and on `OLTP` 1_000 and 2_000, and asks `theine` ≥ `lru` on every row. specs/00 A3, which specs/09 derives from, puts the margin on "the looping and scan traces", and specs/09's own table types OLTP as "database". OLTP is the recency-biased trace that Caffeine's authors use to motivate the adaptive window (M6.1): a static 1% window W-TinyLFU sits at LRU's level there and trails it at larger sizes, which is what the harness measures with the production policy: +3.61, +0.18 and −1.01 points at 1_000, 2_000 and 5_000 with the 32-access batches, +2.61, −0.52 and −1.24 replayed one access per pass as Caffeine's simulator does (the batching helps slightly: a hit key is reordered after the batch's inserts). The harness's `lru` reproduces the ARC paper's own LRU figures for OLTP exactly (32.83, 42.47, 53.65 at 1_000, 2_000, 5_000), and that paper's ARC reaches 38.93, 46.08 and 55.25 there; a +10 margin at 1_000 would need 42.8%, above ARC. The window sweep shows the policy reacting as it should to a recency-biased trace (a 20% window adds 4.9, 4.4 and 2.7 points over the 1% window: +8.5, +4.6 and +1.7 over LRU, still short of +10), and `loop` shows the admission filter working (58.84% against LRU 0). The loop may not relax a specs/09 threshold (PROMPT_build.md step 5), so the rows stand, `mix bench hitrate` exits non-zero on them, and the decision is a human's.
 
+10. **The mixed-run pass p99 is within 1 ms of `pass_budget` since the sweep landed** (found in M3.1, open; not a failure). `mix bench maintenance` passes 4/4 with p99 at 3.99 and 4.17 ms against the 5 ms budget, up from 2.85–2.90 ms (§Benchmark log M3.1). That is the index insert on every TTL write and up to `expire_batch` sweep removals per pass. The split between them has not been measured. A later maintenance task (M3.2, M6.2) that pushes the p99 over the budget should first split the pass by step, as M2.11d did (`bench/results/pass-steps-m211d.exs`), before it changes anything. specs/04 §Budget's lever is the cap: a lower `expire_batch` default (1024 now), re-measured. The threshold stays where it is.
+
 ## Open questions
 
 1. **Resolved 2026-10-29 by a human** (specs/00, 05, 08, 09 §Decisions): the +10 margin is on `loop` 1_000 only; `theine ≥ lru` stays on every row, OLTP included, and is met by the adaptive window, now on by default (M2.13); a `theine_static` subject with `theine ≥ theine_static − 1` on every row keeps the climber honest; the human gate compares `theine` with Caffeine's `HillClimberWindowTinyLfu` (`simple`) and `theine_static` with `WindowTinyLfu`.
@@ -140,6 +142,29 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M3.1 — `mix bench maintenance`, expiry index and sweep in the pass, tree of the M3.1 commit (2026-10-29, two runs, both exit 0: 4/4)
+
+Ran on the uncommitted tree, so the result file is `maintenance-6f33f92.json`
+(overwritten by run 2). The mixed run's writes are half 100 ms TTLs
+(specs/09), so the sweep is the new work here. Until this task those
+entries stayed in the table until a read found them or eviction took them.
+Now each TTL write costs an index insert on arrival and a sweep removal
+100 ms later.
+
+| run | max sample (limit 1001028) | samples | writes (write run) | settled size | passes | p50 us | p99 us | max us | reads (mixed) | writes (mixed) | call-path writes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1001028 | 2633 | 2950777 | 1000000 | 8698 | 2094.66 | 3986.14 | 6341.86 | 11821318 | 3939276 | 12442 |
+| 2 | 1001028 | 2644 | 3138365 | 1000000 | 8652 | 2077.41 | 4168.27 | 6232.63 | 11730606 | 3908990 | 12438 |
+
+Against M2.13's two runs, the pass p50 went from 1.55–1.63 ms to
+2.08–2.09 ms and the p99 from 2.85–2.90 ms to 3.99–4.17 ms. The p99 is
+still under the 5 ms `pass_budget` and the max (6.2–6.3 ms) under 4× it,
+but the p99 headroom fell from about 2.1 ms to 0.8–1.0 ms (discovered
+issue 10). Mixed-run writes fell by about 10% (3.91–3.94 M against
+4.32–4.43 M), and reads by about as much. The write run has no TTLs, and
+its throughput is inside the ±15% band of the maintenance bench memory.
+A5 holds at the bound in both runs.
 
 ### M2.13 — `mix bench hitrate` (full, in two runs) and `mix bench maintenance`, adaptive window on by default, tree of the M2.13 commit (2026-10-29, both exit 0)
 

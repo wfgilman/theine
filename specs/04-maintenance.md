@@ -428,3 +428,19 @@ re-create its row (specs/05 §Events `on_write`, §Decisions M2.12).
   maintenance process wherever it likes. The gap then shows up as
   maintenance CPU spread over every reader's hits rather than as one
   reader's loss, and its size per hit is the same.
+- 2026-10-29 (M3.1): step 4 is `policy_module.expire(policy, now,
+  expire_batch)` (specs/06 §Decisions M3.1), with `now` from the same
+  `Theine.Clock.now/1` as the read path, so a test clock moves the sweep
+  and the readers together. It runs in unbounded caches too, which have
+  no read buffer, sketch or eviction but do have the interval timer.
+  A `:more` from it schedules the follow-up through
+  `ReadBuffer.schedule_drain/1`, like a full stripe or a capped eviction.
+  The follow-up is a drain-triggered pass, so `drain_backoff` spaces the
+  passes of a long sweep. The interval timer never has to wait: 100_000
+  entries due at once go in 98 passes of at most 1024 each with a 60 s
+  interval. The pass's `expired` measurement is the number of entries the
+  sweep deleted from the table. Rows it dropped because a put or delete
+  raced it are not counted, and neither are expired reads, which the
+  `expirations` counter does include. `Theine.Test.Policy` forwards
+  `expire/3` as `:expire`, and the order test's pass now reads `:on_access`
+  …, `:expire`, `:evict`, `:climb`.

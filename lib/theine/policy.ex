@@ -7,6 +7,7 @@ defmodule Theine.Policy do
       policy  :set          {key, id, segment, seq, weight, expires_at}
       order   :ordered_set  {base(segment) + seq, key}
       ids     :set          {id, key}
+      expiry  :ordered_set  {{expires_at, key}, id}       (Theine.Expiry)
 
   In a bounded cache (`max_size` an integer) every key sits in one of three
   LRU segments, `:window`, `:probation` or `:protected`, ordered by `seq`:
@@ -31,6 +32,11 @@ defmodule Theine.Policy do
   `Theine.weighted_size/1` never need `:ets.info/2` and the expiry index
   (specs/06) can find each key's previous `expires_at`.
 
+  The expiry index holds one row per policy row with an integer
+  `expires_at`, kept in step wherever a row is inserted, restored,
+  rewritten or dropped, bounded or not. `expire/3`, step 4 of the
+  maintenance pass, removes the entries it finds due (specs/06 §Index).
+
   `size` and `weighted_size` are published to the cache's `sizes` atomics as
   each event is applied, so readers see them without a call to the process.
   The three segment weights, the region limits and the number of sketch
@@ -45,7 +51,7 @@ defmodule Theine.Policy do
 
   import Bitwise
 
-  alias Theine.{Config, Entry, Sketch}
+  alias Theine.{Config, Entry, Expiry, Sketch}
 
   @type segment :: :window | :probation | :protected | nil
   @type row ::
@@ -83,6 +89,7 @@ defmodule Theine.Policy do
           policy: :ets.table(),
           ids: :ets.table(),
           order: :ets.table() | nil,
+          expiry: Expiry.t(),
           table: Config.cache(),
           sizes: :atomics.atomics_ref(),
           counters: :counters.counters_ref(),
@@ -105,11 +112,12 @@ defmodule Theine.Policy do
           climber: climber() | nil
         }
 
-  @enforce_keys [:policy, :ids, :table, :sizes, :counters, :max_size]
+  @enforce_keys [:policy, :ids, :expiry, :table, :sizes, :counters, :max_size]
   defstruct [
     :policy,
     :ids,
     :order,
+    :expiry,
     :table,
     :sizes,
     :counters,
@@ -151,8 +159,10 @@ defmodule Theine.Policy do
   # Where an entry tuple keeps its id (specs/01 §Layout).
   @entry_id Entry.id_pos()
 
-  # The `evictions` counter (specs/08 §Stats), resolved at compile time.
+  # The `evictions` and `expirations` counters (specs/08 §Stats), resolved
+  # at compile time.
   @evictions Theine.Stats.evictions()
+  @expirations Theine.Stats.expirations()
 
   # Positions in a policy row (1-based, for :ets.update_element/3).
   @row_id 2
@@ -226,6 +236,7 @@ defmodule Theine.Policy do
     state = %__MODULE__{
       policy: :ets.new(__MODULE__, [:set, :private]),
       ids: :ets.new(__MODULE__.Ids, [:set, :private]),
+      expiry: Expiry.new(),
       table: table,
       sizes: sizes,
       counters: counters,
@@ -266,6 +277,7 @@ defmodule Theine.Policy do
       policy: :ets.new(__MODULE__, [:set, :private]),
       ids: :ets.new(__MODULE__.Ids, [:set, :private]),
       order: :ets.new(__MODULE__.Order, [:ordered_set, :private]),
+      expiry: Expiry.new(),
       table: table,
       sizes: sizes,
       counters: counters,
@@ -309,20 +321,21 @@ defmodule Theine.Policy do
       [] ->
         insert(state, key, id, weight, expires_at)
 
-      [{^key, ^id, segment, _seq, old_weight, _old_expires_at}] ->
+      [{^key, ^id, segment, _seq, old_weight, old_expires_at}] ->
         true =
           :ets.update_element(state.policy, key, [
             {@row_weight, weight},
             {@row_expires_at, expires_at}
           ])
 
+        :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
         add(state, 0, weight - old_weight)
 
         state
         |> add_segment(segment, weight - old_weight)
         |> fit(key, segment, weight, old_weight)
 
-      [{^key, old_id, segment, old_seq, old_weight, _old_expires_at}] ->
+      [{^key, old_id, segment, old_seq, old_weight, old_expires_at}] ->
         # The access first: it claims the seq, and a refused seq (the
         # sentinel) must leave every table untouched.
         state = touch(state, key, segment, old_seq)
@@ -336,6 +349,7 @@ defmodule Theine.Policy do
             {@row_expires_at, expires_at}
           ])
 
+        :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
         add(state, 0, weight - old_weight)
 
         state
@@ -367,6 +381,7 @@ defmodule Theine.Policy do
     seq = next_seq(state)
     true = :ets.insert(state.policy, {key, id, nil, seq, weight, expires_at})
     true = :ets.insert(state.ids, {id, key})
+    :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
     add(state, 1, weight)
     %{state | next_seq: seq + 1}
   end
@@ -376,6 +391,7 @@ defmodule Theine.Policy do
     true = :ets.insert(state.policy, {key, id, :window, seq, weight, expires_at})
     true = :ets.insert(state.ids, {id, key})
     true = :ets.insert(state.order, {@window_base + seq, key})
+    :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
     add(state, 1, weight)
     :ok = Sketch.increment(state.sketch, key)
 
@@ -430,7 +446,9 @@ defmodule Theine.Policy do
   (specs/04 §Restart semantics step 3; specs/05 §Events `restore`): a row
   under the table's `id`, `weight` and `expires_at`, placed at the
   **probation** MRU in a bounded cache with no sketch increment, so the
-  rebuilt policy is cold and every entry is a candidate for eviction. A key
+  rebuilt policy is cold and every entry is a candidate for eviction. An
+  integer `expires_at` is indexed, so the sweep finds the entry after a
+  restart as it would have before (specs/06 §Index). A key
   the policy already holds is left alone, whatever its id; the rebuild
   scans a fixed table, so that only happens if the caller restores a key
   twice.
@@ -445,6 +463,7 @@ defmodule Theine.Policy do
 
     if :ets.insert_new(state.policy, {key, id, nil, seq, weight, expires_at}) do
       true = :ets.insert(state.ids, {id, key})
+      :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
       add(state, 1, weight)
       %{state | next_seq: seq + 1, restored_id: max(id, state.restored_id)}
     else
@@ -458,6 +477,7 @@ defmodule Theine.Policy do
     if :ets.insert_new(state.policy, {key, id, :probation, seq, weight, expires_at}) do
       true = :ets.insert(state.ids, {id, key})
       true = :ets.insert(state.order, {@probation_base + seq, key})
+      :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
       add(state, 1, weight)
 
       %{
@@ -961,24 +981,75 @@ defmodule Theine.Policy do
     end
   end
 
-  defp drop(state, {key, id, segment, seq, weight, _expires_at}) do
+  defp drop(state, {key, id, segment, seq, weight, expires_at}) do
     true = :ets.delete(state.policy, key)
     true = :ets.delete(state.ids, id)
     if state.order, do: true = :ets.delete(state.order, base(segment) + seq)
+    :ok = Expiry.delete(state.expiry, key, expires_at)
     add(state, -1, -weight)
     add_segment(state, segment, -weight)
   end
 
   @doc """
-  Empties the tables, zeroes the published sizes and the segment weights,
-  clears the sketch, and restarts the climber from the configured window
-  (`Theine.clear/1`).
+  The expiry sweep, step 4 of the maintenance pass (specs/06 §Index;
+  specs/04 §The pass): walks the expiry index from its earliest row while
+  `expires_at <= now`, at most `limit` rows, and settles each key the way
+  `evict/1` removes one (specs/04 §Removing an entry), by re-reading the
+  entries table:
+
+  - the table holds the policy's version and it is due: the exact tuple is
+    deleted, `expirations` counted, and the rows dropped;
+  - the table holds the policy's version with a later `expires_at`: an
+    `expire/3` or `persist/2` rewrote it in place and its same-id `:put` is
+    still in flight, so the row and the index follow the table and the
+    entry stays;
+  - the table holds another version, or none: a put or delete raced the
+    sweep and its event is in flight; only the policy's rows go, as in an
+    eviction, and the new version is untouched.
+
+  Returns `:more` when it stopped at `limit` with a due row left, so the
+  pass can schedule a follow-up, else `:done`, with the number of entries
+  it deleted from the table.
+  """
+  @spec expire(t(), integer(), pos_integer()) :: {:done | :more, non_neg_integer(), t()}
+  def expire(%__MODULE__{expiry: expiry} = state, now, limit) do
+    {status, {expired, state}} =
+      Expiry.sweep(expiry, now, limit, &expire_key(&1, &2, &3, now, &4), {0, state})
+
+    {status, expired, state}
+  end
+
+  defp expire_key(key, id, expires_at, now, {expired, %__MODULE__{} = state}) do
+    %__MODULE__{policy: policy, table: table, counters: counters} = state
+    [{^key, ^id, _segment, _seq, _weight, ^expires_at} = row] = :ets.lookup(policy, key)
+
+    case :ets.lookup(table, key) do
+      [{^key, _value, ^id, _weight, _written_at, at} = entry] when at <= now ->
+        true = :ets.delete_object(table, entry)
+        :counters.add(counters, @expirations, 1)
+        {expired + 1, drop(state, row)}
+
+      [{^key, _value, ^id, _weight, _written_at, at}] ->
+        true = :ets.update_element(policy, key, {@row_expires_at, at})
+        :ok = Expiry.move(state.expiry, key, id, expires_at, at)
+        {expired, state}
+
+      _replaced_or_gone ->
+        {expired, drop(state, row)}
+    end
+  end
+
+  @doc """
+  Empties the tables, the expiry index included, zeroes the published sizes
+  and the segment weights, clears the sketch, and restarts the climber from
+  the configured window (`Theine.clear/1`).
   """
   @spec reset(t()) :: t()
   def reset(%__MODULE__{} = state) do
     true = :ets.delete_all_objects(state.policy)
     true = :ets.delete_all_objects(state.ids)
     if state.order, do: true = :ets.delete_all_objects(state.order)
+    :ok = Expiry.clear(state.expiry)
     if state.sketch, do: :ok = Sketch.clear(state.sketch)
     publish(state, 0, 0)
 

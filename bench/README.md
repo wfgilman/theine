@@ -203,6 +203,141 @@ Thresholds (specs/09):
   on every row where both ran: the climber may cost at most a point
   against the fixed window.
 
+## Caffeine simulator cross-check (A3 human gate)
+
+specs/09 asks a person, not the loop, to replay the same traces through
+Caffeine's simulator and check, on every row of the hit-rate table, that
+`theine` is within 1 percentage point of `HillClimberWindowTinyLfu` with the
+`simple` strategy and `theine_static` within 1 point of `WindowTinyLfu`. It
+needs a JDK and a checkout of `github.com/ben-manes/caffeine`; nothing here
+runs it.
+
+### Configuration
+
+One `./gradlew simulator:run` per (trace, size) row, with three policies:
+`linked.Lru` as the self-check, and the two counterparts. The `run` task
+passes only `caffeine.*` system properties through to the simulator, so
+every setting is a `-Dcaffeine.simulator.…` flag. The simulator's config
+library ignores keys it does not know, and these keys were written without
+access to the source, so check each one against
+`simulator/src/main/resources/reference.conf` at the tag you build. The
+self-check below catches a wrong trace path or size, not a wrong
+policy setting.
+
+| theine (specs/02, specs/05) | simulator setting |
+|---|---|
+| `max_size: size`, every entry of weight 1 | `maximum-size = size` |
+| the trace file in `bench/traces/` | `trace.source = files`, `trace.files.paths.0 = <format>:<absolute path>` |
+| `window_percent: 1` | `window-tiny-lfu.percent-main.0 = 0.99`, `hill-climber-window-tiny-lfu.percent-main.0 = 0.99` |
+| protected 80% of main | `percent-main-protected = 0.80` in both sections |
+| the climber: sample `10 * max_size`, first step 6.25% toward a smaller window, step × 0.98 per sample, restart at a 5-point change | `hill-climber-window-tiny-lfu.strategy.0 = simple`, `simple.percent-sample = 10`, `simple.percent-pivot = 0.0625`, `simple.step-decay-rate = 0.98`, `simple.sample-decay-rate = 1.0`, `simple.restart-threshold = 0.05`, `simple.tolerance = 0.0` |
+| the 4-bit count-min sketch, halved every `10 * max_size` increments | `tiny-lfu.sketch = count-min-4`, `tiny-lfu.count-min-4.reset = periodic` |
+| no admission filter on the baseline | `admission.0 = Always` (so `linked.Lru` stays plain LRU) |
+
+Trace path mapping: an `arc` trace in `bench/traces.exs` is the simulator's
+`arc` format (`start_block block_count ignored request_id`, one key per
+block, which is how the harness reads it), and a `keys` trace is the
+simulator's `lirs` format (one decimal key per line). Use the files that
+`mix bench.traces` installed and verified, not the simulator's own copies,
+so both sides replay the same bytes.
+
+From the theine checkout, with the traces installed:
+
+```bash
+THEINE=$PWD
+CAFFEINE=$HOME/src/caffeine   # a checkout of github.com/ben-manes/caffeine
+S=caffeine.simulator
+cd "$CAFFEINE"
+while read -r trace format file size; do
+  ./gradlew simulator:run -q </dev/null \
+    -D$S.maximum-size="$size" \
+    -D$S.trace.source=files \
+    -D$S.trace.files.paths.0="$format:$THEINE/bench/traces/$file" \
+    -D$S.policies.0=linked.Lru \
+    -D$S.policies.1=sketch.WindowTinyLfu \
+    -D$S.policies.2=sketch.HillClimberWindowTinyLfu \
+    -D$S.admission.0=Always \
+    -D$S.window-tiny-lfu.percent-main.0=0.99 \
+    -D$S.window-tiny-lfu.percent-main-protected=0.80 \
+    -D$S.hill-climber-window-tiny-lfu.percent-main.0=0.99 \
+    -D$S.hill-climber-window-tiny-lfu.percent-main-protected=0.80 \
+    -D$S.hill-climber-window-tiny-lfu.strategy.0=simple \
+    -D$S.hill-climber-window-tiny-lfu.simple.percent-sample=10 \
+    -D$S.hill-climber-window-tiny-lfu.simple.percent-pivot=0.0625 \
+    -D$S.hill-climber-window-tiny-lfu.simple.step-decay-rate=0.98 \
+    -D$S.hill-climber-window-tiny-lfu.simple.sample-decay-rate=1.0 \
+    -D$S.hill-climber-window-tiny-lfu.simple.restart-threshold=0.05 \
+    -D$S.hill-climber-window-tiny-lfu.simple.tolerance=0.0 \
+    -D$S.tiny-lfu.sketch=count-min-4 \
+    -D$S.tiny-lfu.count-min-4.reset=periodic \
+    > "$THEINE/bench/results/caffeine-$trace-$size.txt"
+done <<'ROWS'
+OLTP    arc  OLTP.lis   1000
+OLTP    arc  OLTP.lis   2000
+OLTP    arc  OLTP.lis   5000
+DS1     arc  DS1.lis    1000000
+DS1     arc  DS1.lis    4000000
+DS1     arc  DS1.lis    8000000
+S3      arc  S3.lis     100000
+S3      arc  S3.lis     400000
+P3      arc  P3.lis     50000
+loop    lirs loop.keys  1000
+zipf    lirs zipf.keys  10000
+zipf    lirs zipf.keys  100000
+ROWS
+```
+
+The rows are the `sizes` of `bench/traces.exs`; test/theine/bench_docs_test.exs
+fails when the two disagree. `</dev/null` keeps Gradle from reading the row
+list from stdin. DS1 at 8 M entries needs several GB of heap; if
+the simulator runs out of memory, raise the `run` task's heap in the
+simulator's Gradle build and re-run that row.
+
+### Self-check
+
+The harness's `lru` is exact LRU, so `linked.Lru` must print the same
+hit rate, to the hundredth, as these rows (and the same request count where
+the report shows one). A row where it does not was read differently, by
+trace, format or size, and its other two policies mean nothing until that is
+fixed:
+
+| trace | size | requests | lru hits | lru hit rate |
+|---|---|---|---|---|
+| OLTP | 1000 | 914145 | 300122 | 32.83 |
+| OLTP | 2000 | 914145 | 388235 | 42.47 |
+| OLTP | 5000 | 914145 | 490443 | 53.65 |
+| DS1 | 1000000 | 43704979 | 1348689 | 3.09 |
+| DS1 | 4000000 | 43704979 | 8847982 | 20.24 |
+| DS1 | 8000000 | 43704979 | 18808317 | 43.03 |
+| S3 | 100000 | 16407702 | 381872 | 2.33 |
+| S3 | 400000 | 16407702 | 1975298 | 12.04 |
+| P3 | 50000 | 3912296 | 268386 | 6.86 |
+| loop | 1000 | 150000 | 0 | 0.00 |
+| zipf | 10000 | 10000000 | 5661385 | 56.61 |
+| zipf | 100000 | 10000000 | 7641405 | 76.41 |
+
+### Comparison table
+
+Take `theine` and `theine_static` from the final gate's `mix bench hitrate`
+run (`IMPLEMENTATION_PLAN.md` §Final gate), and the two Caffeine columns
+from the simulator's hit-rate column for `sketch.HillClimberWindowTinyLfu`
+(the `simple` row) and `sketch.WindowTinyLfu` (the 99% main row). Δ is theine
+minus Caffeine in percentage points; the row passes when both |Δ| ≤ 1.00.
+The template is the one under `IMPLEMENTATION_PLAN.md` §Final gate; fill it
+there and copy it into the README's §Benchmarks.
+
+Three differences are known and are what to look at first when a row misses:
+
+- The harness drains reads in batches of 32 accesses per pass; the simulator
+  applies each access before the next. `mix bench hitrate
+  --accesses-per-pass 1` replays the simulator's way. It is a diagnostic, not
+  the gated row: the gate compares the default configuration.
+- theine's sketch is the block layout of Caffeine's cache (`FrequencySketch`,
+  specs/02 §Decisions M2.1). The simulator's `count-min-4` sketch may not be,
+  so the same keys can collide differently.
+- The admission guard (a candidate of frequency ≥ 6 admitted 1 time in 128)
+  draws from a different random source on each side.
+
 ## `maintenance` (A5, specs/04 budget)
 
 ```bash
@@ -304,5 +439,5 @@ Synthetic traces:
 - `zipf`: 10 000 000 draws from Zipf(0.99) over `1..1_000_000`
   (`Theine.Bench.Zipf`, seed 2026).
 
-The ARC traces (`OLTP`, `DS1`, `S3`, `P3`) have no URL or hash recorded yet.
-See `IMPLEMENTATION_PLAN.md` M0.4b.
+The ARC traces (`OLTP`, `DS1`, `S3`, `P3`) come from the `moka-rs/cache-trace`
+mirror, zstd-compressed, with the hashes recorded in M0.4b.

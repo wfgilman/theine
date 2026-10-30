@@ -76,13 +76,14 @@ defmodule Theine.PolicyTest do
   end
 
   describe "unbounded mode" do
-    test "has no order table, no sketch and no limits", %{policy: policy} do
+    test "has no order table, no sketch, no limits and no climber", %{policy: policy} do
       assert policy.order == nil
       assert policy.sketch == nil
       assert policy.window_max == nil
       assert policy.protected_max == nil
       assert Policy.order_rows(policy) == []
       assert Policy.weights(policy) == %{window: 0, probation: 0, protected: 0}
+      assert Policy.climber(policy) == nil
     end
 
     test "segment weights stay at zero and rows carry segment nil", %{policy: policy} do
@@ -1006,6 +1007,34 @@ defmodule Theine.PolicyTest do
       assert total(policy) == 10
     end
 
+    test "a walk that runs off the probation LRU with candidates left settles them", %{
+      table: table
+    } do
+      # max_size 2: window_max 1, main_max 1. a..d overflow into an empty
+      # probation, all four candidates. d beats a and c beats b, so each
+      # victim (itself a candidate) goes uncounted, and the cursor ends on
+      # b's deleted seq with two candidates counted and nothing below it.
+      policy =
+        [:a, :b, :c, :d, :e]
+        |> Enum.with_index(1)
+        |> Enum.reduce(bounded(2), fn {key, id}, policy -> put(policy, table, key, id) end)
+        |> bump(:d, 5)
+        |> bump(:c, 5)
+
+      assert {:done, 3, policy} = Policy.evict(policy)
+
+      # The third victim, c, goes without a test.
+      assert :ets.lookup(table, :a) == []
+      assert :ets.lookup(table, :b) == []
+      assert :ets.lookup(table, :c) == []
+      assert keys_in_order(policy, :probation) == [:d]
+      assert keys_in_order(policy, :window) == [:e]
+      assert total(policy) == 2
+      assert policy.candidates == 0
+      assert policy.cursor == nil
+      assert evictions(policy) == 3
+    end
+
     test "removal by stale id leaves a concurrently rewritten entry in place", %{table: table} do
       policy =
         bounded(10)
@@ -1213,6 +1242,17 @@ defmodule Theine.PolicyTest do
 
       policy = Policy.resize(policy, policy.climber.adjustment)
       assert %{window_max: 500} = Policy.climber(policy)
+      assert policy.climber.adjustment == 0
+
+      # Growing is capped the same way: 1_000 of the 1_500 probation entries
+      # move, and the limits move by what moved.
+      policy = Policy.resize(policy, 1_200)
+      assert %{window_max: 1_500, protected_max: 6_900} = Policy.climber(policy)
+      assert policy.climber.adjustment == 200
+      assert Policy.weights(policy) == %{window: 1_500, probation: 500, protected: 0}
+
+      policy = Policy.resize(policy, policy.climber.adjustment)
+      assert %{window_max: 1_700, protected_max: 6_700} = Policy.climber(policy)
       assert policy.climber.adjustment == 0
     end
 

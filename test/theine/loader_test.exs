@@ -311,6 +311,55 @@ defmodule Theine.LoaderTest do
       assert :counters.get(calls, 1) == 1
       assert_loader_tables_empty(cache)
     end
+
+    test "a fetcher whose claimants keep exiting without a value loads alone after three retries",
+         %{cache: cache} do
+      %Config{inflight: inflight, waiters: waiters} = Config.get(cache)
+
+      idle_claim = fn ->
+        claimant =
+          spawn(fn ->
+            receive do
+              :exit -> :ok
+            end
+          end)
+
+        {claimant, make_ref()}
+      end
+
+      await_waiter = fn ref ->
+        assert_eventually(fn -> :ets.match_object(waiters, {{:k, ref}, :_, :_}) != [] end, 5000)
+      end
+
+      {first, first_ref} = idle_claim.()
+      true = :ets.insert_new(inflight, {:k, first, first_ref})
+      [fetcher] = fetchers(cache, :k, gated(fn -> {:commit, :loaded} end), 1)
+
+      # Each claimant hands the claim to a new one, then exits :normal
+      # without committing: the fetcher's retry finds the key claimed again
+      # and waits on the next claimant, attempts 1, 2 and 3.
+      {last, last_ref} =
+        Enum.reduce(1..3, {first, first_ref}, fn _, {claimant, ref} ->
+          await_waiter.(ref)
+          {next, next_ref} = idle_claim.()
+          true = :ets.insert(inflight, {:k, next, next_ref})
+          send(claimant, :exit)
+          {next, next_ref}
+        end)
+
+      # The fourth leaves the key unclaimed, and the fetcher gives up on
+      # coalescing: it loads without claiming.
+      await_waiter.(last_ref)
+      send(last, :exit)
+      assert_receive {:loading, ^fetcher, :k}, 5000
+      assert :ets.tab2list(inflight) == []
+      send(fetcher, :go)
+
+      assert collect([fetcher]) == %{fetcher => {:ok, :loaded}}
+      assert Theine.get(cache, :k) == {:ok, :loaded}
+      assert %Stats{loads: 1} = Theine.stats(cache)
+      assert_loader_tables_empty(cache)
+    end
   end
 
   describe "timeout" do
@@ -382,6 +431,17 @@ defmodule Theine.LoaderTest do
 
       LoaderHook.resume(waiter)
       assert collect([waiter]) == %{waiter => {:ok, :v}}
+      assert_loader_tables_empty(cache)
+    end
+
+    test "a waiter with timeout: :infinity waits for the load", %{cache: cache} do
+      [claimant] = fetchers(cache, :k, gated(fn -> {:commit, :v} end), 1)
+      assert_receive {:loading, ^claimant, :k}, 5000
+      [waiter] = fetchers(cache, :k, & &1, 1, timeout: :infinity)
+
+      assert_eventually(fn -> :ets.info(Config.get(cache).waiters, :size) == 1 end, 5000)
+      send(claimant, :go)
+      assert collect([claimant, waiter]) == %{claimant => {:ok, :v}, waiter => {:ok, :v}}
       assert_loader_tables_empty(cache)
     end
   end

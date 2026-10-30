@@ -44,8 +44,8 @@ removed.
 
 1. `mix format --check-formatted`
 2. `mix compile --warnings-as-errors`
-3. `mix test` (with `--seed` random, as default; a flaky test is a bug, not
-   a retry)
+3. `mix test --cover` (with `--seed` random, as default; a flaky test is a
+   bug, not a retry; the coverage table is the §Coverage report)
 4. `mix dialyzer` (warnings are errors; the plt is cached in CI)
 5. For hot-path tasks: `mix bench get` thresholds (specs/09)
 6. For maintenance/policy tasks: `mix bench maintenance`, `mix bench hitrate`
@@ -99,3 +99,11 @@ correctness is in the branches (claim races, admission ties, stale ids).
   of global `:erlang.trace/3` + `trace_pattern/3`, so concurrent async
   tracing tests cannot see or reset each other's patterns. The call
   messages are the same; the result is `%{{m, f, a} => count}`.
+- 2026-10-29 (M5.2): the gate's test step is `mix test --cover`, so every
+  `mix gate` prints the coverage table and a drop below 100% for
+  `Theine.Loader` or `Theine.Policy` shows in the output of the commit
+  that caused it. There is no CI workflow in the repository; the gate is
+  where the report is read. ExUnit's cover tool gates on the total only
+  (default 90%, the suite is at 97%), so the per-module floor is read, not
+  enforced by the tool. Cover compilation adds about a second to the
+  suite (13.7 s against 12.6 s) and did not change its results.

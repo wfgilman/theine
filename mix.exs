@@ -50,12 +50,14 @@ defmodule Theine.MixProject do
     ]
   end
 
+  # The gate reports coverage on every run: Theine.Loader and Theine.Policy
+  # must show 100% lines in its table (specs/10 §Coverage).
   defp aliases do
     [
       gate: [
         "format --check-formatted",
         "compile --warnings-as-errors",
-        "test",
+        "test --cover",
         "dialyzer"
       ]
     ]

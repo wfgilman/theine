@@ -189,14 +189,6 @@ defmodule Theine.Policy do
   @protected_base 2 <<< @seq_bits
   @window_base 3 <<< @seq_bits
 
-  @doc "Index of the entry count in `config.sizes`."
-  @spec size_index() :: 1
-  def size_index, do: @size
-
-  @doc "Index of the weighted size in `config.sizes`."
-  @spec weighted_size_index() :: 2
-  def weighted_size_index, do: @weighted_size
-
   @doc """
   The `seq` sentinel: every `seq` is below it, so that a segment's `order`
   keys stay within its range, and no row is ever given it.
@@ -759,15 +751,10 @@ defmodule Theine.Policy do
     end
   end
 
-  defp previous(order, seq) do
-    case :ets.prev(order, @probation_base + seq) do
-      order_key when is_integer(order_key) and order_key > @probation_base ->
-        order_key - @probation_base
-
-      _ ->
-        0
-    end
-  end
+  # The seq of the probation entry just below the candidate's. One exists:
+  # the probation LRU is the victim, and a candidate that is not the victim
+  # sits above it (`decide/1`'s victim clause takes the other case).
+  defp previous(order, seq), do: :ets.prev(order, @probation_base + seq) - @probation_base
 
   defp admit?(%__MODULE__{sketch: sketch}, candidate, victim) do
     candidate_freq = Sketch.frequency(sketch, candidate)

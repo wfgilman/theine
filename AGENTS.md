@@ -72,7 +72,11 @@ test/                         mirrors lib/; test/support for shared helpers
 - Prefix every command with `mise exec --` when the shell has no mise activation.
 - `mix gate` runs in `MIX_ENV=test` (`cli/0` preferred_envs). It runs dialyzer on
   `lib/` + `test/support`. PLTs are in `priv/plts/` (gitignored). The first
-  build takes about 2.5 min per env.
+  build takes about 2.5 min per env. Its test step is `mix test --cover`:
+  check that `Theine.Loader` and `Theine.Policy` read 100.00% in the table.
+  To find a missed line, grep `<tr class="miss">` in
+  `cover/Elixir.Theine.<Module>.html`. A `--cover` run of a subset of files
+  exits non-zero on the 90% total threshold; only full-suite numbers count.
 - `mix bench` and its helpers live in `bench/lib`, compiled in `:dev` only. Use
   `mix bench get --sizes 1000 --warmup 0.2 --time 0.5` for a quick smoke run.
 - Run the gating `mix bench get` as

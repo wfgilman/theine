@@ -306,9 +306,13 @@ defmodule Theine.Policy do
   - known key, different id: the ids row is replaced and the row's id,
     weight and expires_at updated; in a bounded cache the key moves to the
     MRU of its current segment and is counted in the sketch, since Caffeine
-    treats an update as an access;
+    treats an update as an access. An `id` below the row's is an older
+    version's event that arrived late, applied only while the entries
+    table still holds that id (specs/05 §Decisions M3.2);
   - known key, same id: weight and expires_at updated only (an `expire/3`
-    or `persist/2` update is not an access).
+    or `persist/2` update is not an access). The `expires_at` is the
+    entries table's while it holds that id, since a later in-place rewrite
+    may have overtaken this event (specs/06 §Decisions M3.2).
   """
   @spec on_write(t(), Entry.key(), Entry.id(), Entry.weight(), Entry.expires_at()) :: t()
   def on_write(%__MODULE__{} = state, key, id, weight, expires_at) do
@@ -322,6 +326,11 @@ defmodule Theine.Policy do
         insert(state, key, id, weight, expires_at)
 
       [{^key, ^id, segment, _seq, old_weight, old_expires_at}] ->
+        # Same-id events carry no order among themselves, so the one
+        # applied last may be older than the table's in-place rewrite: the
+        # table's expires_at is the current one (specs/06 §Decisions M3.2).
+        expires_at = table_expires_at(state.table, key, id, expires_at)
+
         true =
           :ets.update_element(state.policy, key, [
             {@row_weight, weight},
@@ -335,26 +344,48 @@ defmodule Theine.Policy do
         |> add_segment(segment, weight - old_weight)
         |> fit(key, segment, weight, old_weight)
 
-      [{^key, old_id, segment, old_seq, old_weight, old_expires_at}] ->
-        # The access first: it claims the seq, and a refused seq (the
-        # sentinel) must leave every table untouched.
-        state = touch(state, key, segment, old_seq)
-        true = :ets.delete(state.ids, old_id)
-        true = :ets.insert(state.ids, {id, key})
+      [{^key, row_id, _segment, _seq, _weight, _expires_at} = row] when id < row_id ->
+        # An older version's event behind a newer one's: a put whose event
+        # was overtaken, or an expire/3 that reported the version it saw
+        # just before a put replaced it. Applied only while the table still
+        # holds that version (specs/05 §Decisions M3.2).
+        if :ets.lookup_element(state.table, key, @entry_id, nil) == id,
+          do: replace(state, key, id, weight, expires_at, row),
+          else: state
 
-        true =
-          :ets.update_element(state.policy, key, [
-            {@row_id, id},
-            {@row_weight, weight},
-            {@row_expires_at, expires_at}
-          ])
+      [row] ->
+        replace(state, key, id, weight, expires_at, row)
+    end
+  end
 
-        :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
-        add(state, 0, weight - old_weight)
+  defp replace(state, key, id, weight, expires_at, row) do
+    {^key, old_id, segment, old_seq, old_weight, old_expires_at} = row
 
-        state
-        |> add_segment(segment, weight - old_weight)
-        |> fit(key, segment, weight, old_weight)
+    # The access first: it claims the seq, and a refused seq (the
+    # sentinel) must leave every table untouched.
+    state = touch(state, key, segment, old_seq)
+    true = :ets.delete(state.ids, old_id)
+    true = :ets.insert(state.ids, {id, key})
+
+    true =
+      :ets.update_element(state.policy, key, [
+        {@row_id, id},
+        {@row_weight, weight},
+        {@row_expires_at, expires_at}
+      ])
+
+    :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
+    add(state, 0, weight - old_weight)
+
+    state
+    |> add_segment(segment, weight - old_weight)
+    |> fit(key, segment, weight, old_weight)
+  end
+
+  defp table_expires_at(table, key, id, expires_at) do
+    case :ets.lookup(table, key) do
+      [{^key, _value, ^id, _weight, _written_at, at}] -> at
+      _replaced_or_gone -> expires_at
     end
   end
 
@@ -966,12 +997,19 @@ defmodule Theine.Policy do
   one key can apply their `:put` events in the opposite order to their
   inserts, leaving the row with an id the table never kept, and the removal
   of the surviving version is the moment to notice (specs/05 §Decisions).
+
+  A removal with the current id is ignored while the table still holds
+  that id: an `expire/3` rewrote the tuple in place between the remover's
+  lookup and its `delete_object`, so nothing was deleted (specs/06
+  §Decisions M3.2).
   """
   @spec on_remove(t(), Entry.key(), Entry.id()) :: t()
   def on_remove(%__MODULE__{} = state, key, id) do
     case :ets.lookup(state.policy, key) do
       [{^key, ^id, _segment, _seq, _weight, _expires_at} = row] ->
-        drop(state, row)
+        if :ets.lookup_element(state.table, key, @entry_id, nil) == id,
+          do: state,
+          else: drop(state, row)
 
       [{^key, _row_id, _segment, _seq, _weight, _expires_at} = row] ->
         if :ets.member(state.table, key), do: state, else: drop(state, row)

@@ -110,14 +110,17 @@ defmodule Theine.TracingTest do
            }
   end
 
-  test "delete performs persistent_term.get, ets.lookup, ets.delete_object, atomics.add_get",
+  test "delete performs persistent_term.get, ets.lookup, ets.delete_object, ets.lookup_element, atomics.add_get",
        %{cache: cache} do
     calls = Trace.calls(@modules, fn -> :ok = Theine.delete(cache, :present) end)
 
+    # The lookup_element checks that no expire/3 rewrote the tuple in place
+    # under the delete (specs/06 §Decisions M3.2).
     assert calls == %{
              {:persistent_term, :get, 1} => 1,
              {:ets, :lookup, 2} => 1,
              {:ets, :delete_object, 2} => 1,
+             {:ets, :lookup_element, 4} => 1,
              {:atomics, :add_get, 3} => 1
            }
   end

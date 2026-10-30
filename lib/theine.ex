@@ -312,6 +312,63 @@ defmodule Theine do
   end
 
   @doc """
+  Sets a new expiry for an existing `key`, `ms` milliseconds from now or
+  `:infinity`, without changing its value. Returns `true`, or `false` when
+  `key` is absent or already expired. Changing an entry's expiry is not an
+  access: the eviction policy does not count it as a use (specs/05).
+
+      iex> {:ok, _} = Theine.start_link(name: :expire_doc, max_size: :infinity)
+      iex> Theine.put(:expire_doc, :a, 1)
+      :ok
+      iex> Theine.expire(:expire_doc, :a, :timer.minutes(5))
+      true
+      iex> {:ok, ms} = Theine.ttl(:expire_doc, :a)
+      iex> ms > 0 and ms <= :timer.minutes(5)
+      true
+      iex> Theine.expire(:expire_doc, :missing, 1_000)
+      false
+  """
+  @spec expire(cache(), key(), pos_integer() | :infinity) :: boolean()
+  def expire(cache, key, ms) do
+    Entry.expire(:persistent_term.get(cache), key, ms)
+  end
+
+  @doc """
+  Removes the expiry of an existing `key`, so it never expires. Returns
+  `true`, or `false` when `key` is absent or already expired. Same as
+  `expire(cache, key, :infinity)`.
+
+      iex> {:ok, _} = Theine.start_link(name: :persist_doc, max_size: :infinity)
+      iex> Theine.put(:persist_doc, :a, 1, ttl: 1_000)
+      :ok
+      iex> Theine.persist(:persist_doc, :a)
+      true
+      iex> Theine.ttl(:persist_doc, :a)
+      {:ok, :infinity}
+  """
+  @spec persist(cache(), key()) :: boolean()
+  def persist(cache, key), do: expire(cache, key, :infinity)
+
+  @doc """
+  Returns `{:ok, ms}` with the milliseconds left before `key` expires,
+  `{:ok, :infinity}` when it never does, or `:error` when it is absent or
+  already expired. Not a read in the statistics: it counts neither a hit
+  nor a miss.
+
+      iex> {:ok, _} = Theine.start_link(name: :ttl_doc, max_size: :infinity)
+      iex> Theine.put(:ttl_doc, :a, 1)
+      :ok
+      iex> Theine.ttl(:ttl_doc, :a)
+      {:ok, :infinity}
+      iex> Theine.ttl(:ttl_doc, :missing)
+      :error
+  """
+  @spec ttl(cache(), key()) :: {:ok, pos_integer() | :infinity} | :error
+  def ttl(cache, key) do
+    Entry.ttl(:persistent_term.get(cache), key)
+  end
+
+  @doc """
   Number of entries as last seen by the maintenance process: writes it has
   not yet consumed are not counted. Never reads `:ets.info/2`.
 

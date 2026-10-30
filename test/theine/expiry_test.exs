@@ -338,6 +338,191 @@ defmodule Theine.ExpiryTest do
     end
   end
 
+  describe "expire/3, persist/2 and ttl/2 (specs/06 §Semantics)" do
+    test "expire/3 moves the entry in the index and it is swept at the new time with the old row gone",
+         %{cache: cache} do
+      Theine.put(cache, :a, :v, ttl: 10)
+      [{:a, :v, id, 1, 1_000, 1_010}] = :ets.lookup(cache, :a)
+
+      assert Theine.expire(cache, :a, 50) == true
+      assert [{:a, :v, ^id, 1, 1_000, 1_050}] = :ets.lookup(cache, :a)
+      assert {:ok, {:a, ^id, _, _, 1, 1_050}} = Maintenance.policy_row(cache, :a)
+      assert %{expiring: 1, size: 1} = Maintenance.info(cache)
+
+      # The old time passes with nothing indexed there.
+      Clock.advance(cache, 10)
+      Theine.run_maintenance(cache)
+      assert [{:a, :v, ^id, _, _, 1_050}] = :ets.lookup(cache, :a)
+      assert expirations(cache) == 0
+
+      # The sweep, not a read, removes it at the new time.
+      Clock.advance(cache, 40)
+      Theine.run_maintenance(cache)
+      assert :ets.lookup(cache, :a) == []
+      assert %{expiring: 0, size: 0} = Maintenance.info(cache)
+      assert expirations(cache) == 1
+    end
+
+    test "expire/3 sets an expiry on an entry that had none and can shorten one", %{cache: cache} do
+      Theine.put(cache, :a, 1)
+      Theine.put(cache, :b, 2, ttl: 1_000)
+
+      assert Theine.expire(cache, :a, 20)
+      assert Theine.expire(cache, :b, 10)
+      assert %{expiring: 2} = Maintenance.info(cache)
+
+      Clock.advance(cache, 10)
+      Theine.run_maintenance(cache)
+      assert :ets.lookup(cache, :b) == []
+      Clock.advance(cache, 10)
+      Theine.run_maintenance(cache)
+      assert :ets.lookup(cache, :a) == []
+      assert %{expiring: 0, size: 0} = Maintenance.info(cache)
+    end
+
+    test "persist/2 removes the index row and the entry never expires", %{cache: cache} do
+      Theine.put(cache, :a, :v, ttl: 10)
+      assert %{expiring: 1} = Maintenance.info(cache)
+
+      assert Theine.persist(cache, :a) == true
+      assert [{:a, :v, _, _, _, :infinity}] = :ets.lookup(cache, :a)
+      assert {:ok, {:a, _, _, _, _, :infinity}} = Maintenance.policy_row(cache, :a)
+      assert %{expiring: 0, size: 1} = Maintenance.info(cache)
+
+      Clock.advance(cache, 1_000_000)
+      Theine.run_maintenance(cache)
+      assert Theine.get(cache, :a) == {:ok, :v}
+      assert Theine.ttl(cache, :a) == {:ok, :infinity}
+    end
+
+    test "ttl/2 returns remaining ms, :infinity, or :error", %{cache: cache} do
+      Theine.put(cache, :a, 1, ttl: 100)
+      Theine.put(cache, :b, 2)
+      assert Theine.ttl(cache, :a) == {:ok, 100}
+      assert Theine.ttl(cache, :b) == {:ok, :infinity}
+      assert Theine.ttl(cache, :missing) == :error
+
+      Clock.advance(cache, 30)
+      assert Theine.ttl(cache, :a) == {:ok, 70}
+      Clock.advance(cache, 70)
+      assert Theine.ttl(cache, :a) == :error
+
+      # Not a read in the stats, and not a remover: the expired entry is
+      # left for a reader or the sweep.
+      assert [{:a, 1, _, _, _, 1_100}] = :ets.lookup(cache, :a)
+      assert %Stats{hits: 0, misses: 0, expirations: 0} = Theine.stats(cache)
+    end
+
+    test "expire/3 on an absent key returns false", %{cache: cache} do
+      assert Theine.expire(cache, :missing, 10) == false
+      assert Theine.persist(cache, :missing) == false
+      refute :ets.member(cache, :missing)
+
+      # An expired entry is absent too, and stays expired.
+      Theine.put(cache, :a, 1, ttl: 10)
+      Clock.advance(cache, 10)
+      assert Theine.expire(cache, :a, 1_000) == false
+      assert Theine.persist(cache, :a) == false
+      assert [{:a, 1, _, _, _, 1_010}] = :ets.lookup(cache, :a)
+      assert {:ok, {:a, _, _, _, _, 1_010}} = Maintenance.policy_row(cache, :a)
+      assert Theine.get(cache, :a) == :error
+    end
+
+    test "expire/3 rejects an expiry that is not a positive integer or :infinity", %{cache: cache} do
+      Theine.put(cache, :a, 1)
+
+      for bad <- [0, -1, 1.5, :never] do
+        assert_raise ArgumentError, ~r/positive number of milliseconds or :infinity/, fn ->
+          Theine.expire(cache, :a, bad)
+        end
+      end
+
+      assert Theine.ttl(cache, :a) == {:ok, :infinity}
+    end
+
+    test "expire/3 is not an access: the policy row keeps its place" do
+      cache = unique_cache()
+      start_supervised!({Clock, cache: cache, at: 0})
+      start_supervised!({Theine, name: cache, max_size: 100, maintenance_interval: 60_000})
+
+      Theine.put(cache, :a, 1)
+      Theine.put(cache, :b, 2)
+      # The window holds one entry, so b's arrival moved a to probation.
+      {:ok, {:a, id, :probation, seq, 1, :infinity}} = Maintenance.policy_row(cache, :a)
+
+      assert Theine.expire(cache, :a, 50)
+      assert {:ok, {:a, ^id, :probation, ^seq, 1, 50}} = Maintenance.policy_row(cache, :a)
+    end
+
+    test "an expired read that loses its delete to expire/3 leaves the entry and its row", %{
+      cache: cache
+    } do
+      Theine.put(cache, :a, :v, ttl: 10)
+      [{:a, :v, id, _, _, 1_010} = seen] = :ets.lookup(cache, :a)
+
+      # A reader saw `seen` expired; expire/3 rewrote it in place before the
+      # reader's delete_object, which then missed. The reader's
+      # {:removed, :a, id} arrives after the same-id :put.
+      assert Theine.expire(cache, :a, 100)
+      assert Entry.expired(Config.get(cache), seen) == :error
+
+      assert [{:a, :v, ^id, _, _, 1_100}] = :ets.lookup(cache, :a)
+      assert {:ok, {:a, ^id, _, _, _, 1_100}} = Maintenance.policy_row(cache, :a)
+      assert %{size: 1, expiring: 1} = Maintenance.info(cache)
+
+      Clock.advance(cache, 100)
+      Theine.run_maintenance(cache)
+      assert :ets.lookup(cache, :a) == []
+      assert %{size: 0, expiring: 0} = Maintenance.info(cache)
+    end
+
+    test "under real interleavings a delete racing expire/3 always removes the key", %{
+      cache: cache
+    } do
+      for round <- 1..300 do
+        key = {:race, round}
+        Theine.put(cache, key, :v, ttl: 1_000)
+
+        expirer = Task.async(fn -> Theine.expire(cache, key, 5_000) end)
+        deleter = Task.async(fn -> Theine.delete(cache, key) end)
+        [_, :ok] = Task.await_many([expirer, deleter])
+
+        assert :ets.lookup(cache, key) == [], "round #{round} kept a deleted key"
+      end
+
+      assert_eventually(fn -> Maintenance.info(cache).pending == 0 end)
+      assert %{size: 0, expiring: 0} = Maintenance.info(cache)
+    end
+
+    test "under real interleavings puts and expires on one key leave the policy on the table's version",
+         %{cache: cache} do
+      keys = for round <- 1..200, do: {:race, round}
+
+      for key <- keys do
+        Theine.put(cache, key, :old, ttl: 100)
+
+        [
+          fn -> Theine.put(cache, key, :new, ttl: 300) end,
+          fn -> Theine.expire(cache, key, 500) end,
+          fn -> Theine.expire(cache, key, 700) end,
+          fn -> Theine.persist(cache, key) end
+        ]
+        |> Enum.map(&Task.async/1)
+        |> Task.await_many()
+      end
+
+      assert_eventually(fn -> Maintenance.info(cache).pending == 0 end)
+
+      for key <- keys do
+        [{^key, _, id, _, _, expires_at}] = :ets.lookup(cache, key)
+        assert {:ok, {^key, ^id, _, _, _, ^expires_at}} = Maintenance.policy_row(cache, key)
+      end
+
+      finite = Enum.count(keys, &is_integer(:ets.lookup_element(cache, &1, 6)))
+      assert %{size: 200, expiring: ^finite} = Maintenance.info(cache)
+    end
+  end
+
   defp expirations(cache), do: :counters.get(Config.get(cache).counters, Stats.expirations())
 
   # A bounded cache whose policy calls can be held (specs/10 §Required

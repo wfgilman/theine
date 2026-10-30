@@ -132,3 +132,40 @@ test build, and the tracing test in specs/01 traces only `:ets`,
   - `Theine.Maintenance.info/1` reports `expiring`, the index's size, for
     every cache, so a test can watch rows come and go without reading the
     private table.
+- 2026-10-29 (M3.2): `expire/3`, `persist/2` and `ttl/2` as built, and the
+  races of an in-place rewrite.
+  - `expire/3` reads element 6 with `lookup_element/4`. It returns `false`
+    for an absent key and for an expired one, which counts as absent as in
+    `put_new/4`. The expired entry is left in place, not removed or
+    counted, since `expire/3` is not a read. A live entry is rewritten with
+    `update_element/3` (`false` if it went in between). Then the table is
+    read again, and the event names the version found there, with that
+    version's weight and `expires_at`. A put can replace the looked-up
+    version before the update, which then rewrites the new version, so the
+    lookup's id may be the wrong one to report. The new expiry is a
+    positive integer or `:infinity`, as `ttl:` on `put/4`; anything else
+    raises `ArgumentError`.
+  - `ttl/2` is one `lookup_element/4` and, for a finite expiry, one clock
+    read. Like `expire/3` it neither removes an expired entry nor counts a
+    hit, miss or expiration.
+  - Every remover deletes by exact object and treats a failed delete as
+    "another version is there" (specs/01 §Expired read, §Write path;
+    specs/04 §Removing an entry). An in-place rewrite breaks that
+    assumption, because the tuple changes and the id stays. The fixes:
+    `delete/2` re-reads the id after its `delete_object` and starts again
+    if the same id is still there, so a `delete/2` that returns has
+    removed the key. It costs one `lookup_element/4` per delete. The policy
+    ignores a current-id removal while the table holds that id, which
+    covers the expired read and `put_new/4`'s expired branch: both return
+    as if the entry had expired, which is a valid order, but they still
+    report the removal. Same-id `:put` events take `expires_at` from the
+    table, and a late lower-id `:put` is checked against it (specs/05
+    §Decisions M3.2).
+  - An eviction or a sweep that loses its `delete_object` to a rewrite
+    drops the policy rows and counts an eviction or expiration that did not
+    happen. The `expire/3` event, sent after the rewrite, arrives after
+    that pass and re-admits the key as new. The window is a rewrite landing
+    between the pass's lookup and its delete, microseconds wide. The
+    counts are off by one at worst, and checking every eviction's delete
+    would cost the pass a lookup per eviction, so the miscount is accepted.
+    The expired read's double count already has the same exposure (M3.1).

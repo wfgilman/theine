@@ -17,7 +17,8 @@ defmodule Theine.Entry do
   The read path lives in `Theine.get/2` itself, so that a hit pays no call
   into this module; `expired/2` is its only out-of-line branch. `put/4` here
   is the write path, with `put_new/4` and `delete/2` beside it. Both are
-  hot paths (AGENTS.md).
+  hot paths (AGENTS.md). `expire/3` and `ttl/2` read and rewrite an
+  entry's `expires_at`.
   """
 
   alias Theine.{Config, Stats, WriteEvents}
@@ -176,10 +177,84 @@ defmodule Theine.Entry do
     case :ets.lookup(table, key) do
       [{_, _, id, _, _, _} = entry] ->
         true = :ets.delete_object(table, entry)
-        WriteEvents.deliver(config, {:removed, key, id})
+
+        # An `expire/3` that rewrote the tuple in place between the lookup
+        # and the delete keeps the id, so the delete missed a live version
+        # it must remove: try again. A different id is a racing put, which
+        # survives (specs/06 §Decisions M3.2).
+        if :ets.lookup_element(table, key, @id, nil) == id,
+          do: delete(config, key),
+          else: WriteEvents.deliver(config, {:removed, key, id})
 
       [] ->
         :ok
+    end
+  end
+
+  @doc """
+  `Theine.expire/3` and `Theine.persist/2` (specs/06 §Semantics): sets the
+  live entry's `expires_at` to `now + ms`, or `:infinity`, in place with
+  `:ets.update_element/3`, keeping its value and id, and returns `true`.
+  An absent or expired key returns `false` and is left to the reader or
+  the sweep.
+
+  The `{:put, key, id, weight, expires_at}` event reports what the table
+  holds after the update, not what the lookup saw: a put racing the call
+  may have replaced the version the update then rewrote, and the event
+  must name that version (specs/06 §Decisions M3.2).
+  """
+  @spec expire(Config.t(), key(), pos_integer() | :infinity) :: boolean()
+  def expire(%Config{table: table} = config, key, ms)
+      when ms == :infinity or (is_integer(ms) and ms > 0) do
+    now = Theine.Clock.now(config.name)
+
+    case :ets.lookup_element(table, key, @expires_at, nil) do
+      nil ->
+        false
+
+      at when is_integer(at) and now >= at ->
+        false
+
+      _live ->
+        if :ets.update_element(table, key, {@expires_at, expires_at(ms, now)}) do
+          case :ets.lookup(table, key) do
+            [{_, _, id, weight, _, at}] ->
+              WriteEvents.deliver(config, {:put, key, id, weight, at})
+
+            [] ->
+              :ok
+          end
+
+          true
+        else
+          false
+        end
+    end
+  end
+
+  def expire(%Config{}, _key, other) do
+    raise ArgumentError,
+          "the expiry must be a positive number of milliseconds or :infinity, got: #{inspect(other)}"
+  end
+
+  @doc """
+  `Theine.ttl/2` (specs/06 §Semantics): `{:ok, ms}` left before a live
+  entry expires, `{:ok, :infinity}` for one that never does, `:error` for
+  an absent or expired key. A read of one element: it neither removes an
+  expired entry nor counts anything.
+  """
+  @spec ttl(Config.t(), key()) :: {:ok, pos_integer() | :infinity} | :error
+  def ttl(%Config{} = config, key) do
+    case :ets.lookup_element(config.table, key, @expires_at, nil) do
+      nil ->
+        :error
+
+      :infinity ->
+        {:ok, :infinity}
+
+      at ->
+        now = Theine.Clock.now(config.name)
+        if now < at, do: {:ok, at - now}, else: :error
     end
   end
 

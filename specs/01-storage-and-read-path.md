@@ -116,7 +116,10 @@ counted) and the insert is retried (§Decisions 2026-10-27 M1.5).
 
 `delete/2`: `:ets.lookup` to learn the current id (needed so the policy can
 discard the right version), `:ets.delete_object` with that exact tuple, then
-event `{:removed, key, id}`. If the key is absent, no event. A version
+event `{:removed, key, id}`. If the key is absent, no event. If the table
+still holds the same id after the `delete_object`, an `expire/3` rewrote the
+tuple in place in between; the delete starts again and sends nothing for the
+missed attempt (specs/06 §Decisions M3.2). A version
 without the lookup (removing "whatever version the policy has") is not
 allowed: a `put` racing such a delete could leave an entry in ETS that the
 policy has forgotten, which is unbounded until it expires. With the id, the

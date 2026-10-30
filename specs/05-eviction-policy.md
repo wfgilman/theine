@@ -63,11 +63,16 @@ is the main structural concession to the BEAM.
 - If `key` is known with an older id: update `ids` (delete old id, insert
   new), update the `policy` row's id, weight and expires_at, adjust the
   segment weight by the delta, move to MRU of its current segment,
-  `Sketch.increment(key)`. Caffeine treats an update as an access.
+  `Sketch.increment(key)`. Caffeine treats an update as an access. An `id`
+  **below** the row's is an older version's event that arrived late: it is
+  applied as above only while the entries table still holds `key` under
+  `id`, and otherwise ignored (§Decisions M3.2).
 - If `key` is known with the **same** id (an `expire/3` or `persist/2`
   update, or a queued event replayed after a restart rebuild): update
   `expires_at` and weight only. No sketch increment, no MRU move. Changing
-  an entry's expiry is not an access.
+  an entry's expiry is not an access. The `expires_at` is read from the
+  entries table while it holds `key` under `id`, and taken from the event
+  otherwise (§Decisions M3.2).
 - In both known-key cases, a protected key that grew heavier must still
   fit: if its new weight exceeds `protected_max` it moves to probation MRU
   (as `on_access` would refuse to promote it), else protected LRU entries
@@ -79,7 +84,10 @@ is the main structural concession to the BEAM.
 ### `on_remove(key, id)`
 
 If `ids` maps `id` to `key` and `policy` holds that id: delete from all three
-tables and subtract the weight. Otherwise the removal is stale (for a
+tables and subtract the weight, unless the entries table still holds `key`
+under `id`, in which case nothing was deleted and the removal is ignored
+(an `expire/3` rewrote the tuple under the remover; §Decisions M3.2).
+Otherwise the removal is stale (for a
 version already replaced): if the entries table still holds `key`, ignore
 it, since a newer version's `:put` is in flight or already applied; if the
 table lacks `key`, drop the key's rows anyway, because the row's id can be
@@ -459,3 +467,29 @@ the window moves, and records the answer in §Decisions. Unbounded
   overflows of the same pass, at the MRU end, far from the victim, and the
   candidate floor (§Decisions M2.6) keeps both out of the candidate walk.
   So nothing is recorded as a divergence.
+- 2026-10-29 (M3.2): three entries-table checks for `expire/3`'s in-place
+  rewrite, which keeps the id (specs/06 §Decisions M3.2 has the races).
+  (1) A same-id `:put` takes `expires_at` from the table while the table
+  holds that id. Same-id events have no order among themselves (two
+  `expire/3` calls, or a put's own event behind the `expire/3` that
+  rewrote it), so the event applied last can be the stale one. The table
+  is the current value, and the index follows it. This also corrects a
+  restart replay, whose queued original `:put` could carry an expiry that
+  a later `expire/3` had already replaced. (2) A known-key `:put` whose id
+  is below the row's is applied only while the table holds that id.
+  `expire/3` reports the version it re-read after its update, and a put
+  can replace that version and have its own event applied first. Without
+  the check, "last event wins" moved the row back to an id the table no
+  longer holds, and in an unbounded cache nothing but a later removal
+  repaired it. M3.2's put/expire race test failed once in its first 30
+  repeats with the row on another version than the table, and passed about
+  120 full-suite runs with the check. The same check now settles half of
+  the M1.5 race, a put whose
+  event is overtaken by a newer version's. The common case, a new version
+  with a higher id, pays one integer compare. (3) `on_remove` with the
+  current id is ignored while the table holds that id. A reader, a
+  `delete/2` or `put_new/4` that looked the tuple up before an `expire/3`
+  rewrote it then fails its `delete_object`, but it still reports the
+  removal. Dropping the row then would leave a live entry with no policy
+  row, so it is never evicted or swept. The check costs one
+  `lookup_element` per removal event in the pass.

@@ -1476,6 +1476,69 @@ defmodule Theine.PolicyTest do
     assert Policy.weighted_size(sizes) == 5
   end
 
+  test "a same-id write takes expires_at from the entries table while it holds that id", %{
+    policy: policy,
+    table: table
+  } do
+    # Two expire/3 calls rewrote :a in place (to 300, then 500) and their
+    # events arrive in the other order: the last one applied is stale.
+    :ets.insert(table, {:a, nil, 1, 1, 0, 500})
+    policy = Policy.on_write(policy, :a, 1, 1, 100)
+    policy = Policy.on_write(policy, :a, 1, 1, 500)
+    policy = Policy.on_write(policy, :a, 1, 1, 300)
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 500}}
+    assert Expiry.rows(policy.expiry) == [{{500, :a}, 1}]
+
+    # Once the table holds another version, or none, the event stands
+    # until that version's own event settles the row.
+    :ets.insert(table, {:a, nil, 2, 1, 0, :infinity})
+    policy = Policy.on_write(policy, :a, 1, 1, 300)
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 300}}
+    true = :ets.delete(table, :a)
+    policy = Policy.on_write(policy, :a, 1, 1, 400)
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 400}}
+  end
+
+  test "an older id's late :put is applied only while the entries table holds that id", %{
+    policy: policy,
+    table: table
+  } do
+    # expire/3 re-read id 1 just before a put replaced it with id 2, and its
+    # event arrives after id 2's: the row keeps the table's version.
+    :ets.insert(table, {:a, nil, 2, 1, 0, 300})
+    policy = Policy.on_write(policy, :a, 1, 1, 100)
+    policy = Policy.on_write(policy, :a, 2, 1, 300)
+    policy = Policy.on_write(policy, :a, 1, 1, 500)
+    assert {:ok, {:a, 2, nil, _, 1, 300}} = Policy.lookup(policy, :a)
+    assert Expiry.rows(policy.expiry) == [{{300, :a}, 2}]
+    assert Policy.id_count(policy) == 1
+
+    # Two puts raced and the lower id was inserted last: its event wins.
+    :ets.insert(table, {:a, nil, 1, 2, 0, :infinity})
+    policy = Policy.on_write(policy, :a, 1, 2, :infinity)
+    assert {:ok, {:a, 1, nil, _, 2, :infinity}} = Policy.lookup(policy, :a)
+    assert Expiry.rows(policy.expiry) == []
+    assert Policy.weighted_size(policy.sizes) == 2
+  end
+
+  test "on_remove with the current id is ignored while the entries table still holds that id",
+       %{policy: policy, sizes: sizes, table: table} do
+    # An expire/3 rewrote the tuple between a remover's lookup and its
+    # delete_object, so the delete missed and the entry is live.
+    :ets.insert(table, {:a, nil, 1, 1, 0, 500})
+    policy = Policy.on_write(policy, :a, 1, 1, 500)
+    policy = Policy.on_remove(policy, :a, 1)
+    assert {:ok, {:a, 1, _, _, 1, 500}} = Policy.lookup(policy, :a)
+    assert Policy.size(sizes) == 1
+    assert Expiry.rows(policy.expiry) == [{{500, :a}, 1}]
+
+    true = :ets.delete(table, :a)
+    policy = Policy.on_remove(policy, :a, 1)
+    assert Policy.lookup(policy, :a) == :error
+    assert Policy.size(sizes) == 0
+    assert Expiry.rows(policy.expiry) == []
+  end
+
   test "on_remove with the current id deletes both rows", %{policy: policy, sizes: sizes} do
     policy = Policy.on_write(policy, :a, 1, 3, :infinity)
     policy = Policy.on_remove(policy, :a, 1)
@@ -1843,12 +1906,17 @@ defmodule Theine.PolicyTest do
 
       # A new version moves its row, a same-id rewrite moves it in place,
       # and an :infinity rewrite or a removal deletes it.
+      # (`expire/3` rewrites the table before its event, as here; `c` was
+      # restored with no entry, so its event's value stands.)
       policy = put_timed(policy, table, :a, 4, 20)
       policy = Policy.on_write(policy, :c, 3, 1, 5)
+      true = :ets.update_element(table, :b, {6, 15})
       policy = Policy.on_write(policy, :b, 2, 1, 15)
       assert Expiry.rows(policy.expiry) == [{{5, :c}, 3}, {{15, :b}, 2}, {{20, :a}, 4}]
 
+      true = :ets.update_element(table, :b, {6, :infinity})
       policy = Policy.on_write(policy, :b, 2, 1, :infinity)
+      true = :ets.delete(table, :a)
       policy = Policy.on_remove(policy, :a, 4)
       assert Expiry.rows(policy.expiry) == [{{5, :c}, 3}]
 

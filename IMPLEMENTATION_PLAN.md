@@ -68,10 +68,10 @@ Done: M2.1, M2.2, M2.3, M2.4, M2.5, M2.6, M2.7, M2.8, M2.8b, M2.8c, M2.8d, M2.9,
 
 ## M3 Expiration
 
-Done: M3.1.
+Done: M3.1, M3.2.
 
 - [x] M3.1 **(maintenance)** `Theine.Expiry` index and sweep in the pass (specs/06 §Index, §Semantics bullet 4; specs/04 §The pass step 4): `expiry` ordered_set `{{expires_at, key}, id}` maintained from write events using the previous `expires_at` kept on the policy row, `sweep/2` capped by `expire_batch` with removal by id compare, `expirations` counter, follow-up `:drain` when the cap is hit; the restart rebuild (M2.9) must index every entry it restores with a finite `expires_at`, from the same `Policy.restore/5` call or beside it in `Maintenance.rebuild/3`, and `Policy.reset/1` must empty the index for `clear/1` — tests: expiry_test "with maintenance running and no reads an expired entry leaves the table within one maintenance_interval", "100_000 entries expiring at once are removed over several passes of at most expire_batch each without waiting for the timer", "a put racing the sweep of the previous version keeps the new value", "an unbounded cache sweeps expired entries too"; `mix bench maintenance` mixed run stays under `pass_budget`.
-- [ ] M3.2 `expire/3`, `persist/2`, `ttl/2` (specs/06 §Semantics bullets 5–7; specs/08 §Calls): `expire/3` updates element 6 in place and sends `{:put, key, id, weight, expires_at}` with the unchanged id; the policy treats a same-id `:put` as an expiry/weight update with no sketch increment and no MRU move (specs/05 §`on_write`) — tests: expiry_test "expire/3 moves the entry in the index and it is swept at the new time with the old row gone", "persist/2 removes the index row and the entry never expires", "ttl/2 returns remaining ms, :infinity, or :error", "expire/3 on an absent key returns false".
+- [x] M3.2 `expire/3`, `persist/2`, `ttl/2` (specs/06 §Semantics bullets 5–7; specs/08 §Calls): `expire/3` updates element 6 in place and sends `{:put, key, id, weight, expires_at}` with the unchanged id; the policy treats a same-id `:put` as an expiry/weight update with no sketch increment and no MRU move (specs/05 §`on_write`) — tests: expiry_test "expire/3 moves the entry in the index and it is swept at the new time with the old row gone", "persist/2 removes the index row and the entry never expires", "ttl/2 returns remaining ms, :infinity, or :error", "expire/3 on an absent key returns false". Met. `Theine.expire/3`, `persist/2` and `ttl/2` delegate to `Entry.expire/3` and `Entry.ttl/2`. An expired key counts as absent and is left in place. The event names the version the table holds after the update, since a racing put may have replaced the one looked up. The rewrite keeps the id, which breaks every remover's "a failed `delete_object` means another version" assumption, so four checks against the entries table went in (specs/06 and specs/05 §Decisions M3.2). `delete/2` starts again when its `delete_object` missed a same-id rewrite; that is one more `lookup_element` per delete, and the tracing test's delete multiset now counts it. `on_remove` ignores a current-id removal while the table holds that id. A same-id `:put` takes `expires_at` from the table. A known-key `:put` with an id below the row's is applied only while the table holds that id. The new put/expire race test found the last one: its row ended on another version than the table once in 30 repeats. Eviction or sweep losing its delete to a rewrite miscounts by one and the `expire/3` event re-admits the key; that is accepted. Tests: the four named ones plus expiry_test "expire/3 sets an expiry on an entry that had none and can shorten one", "expire/3 rejects an expiry that is not a positive integer or :infinity", "expire/3 is not an access: the policy row keeps its place", "an expired read that loses its delete to expire/3 leaves the entry and its row", and two real-interleaving loops (delete vs expire: the key is always gone; put, two expires and a persist: the policy row and index match the table's version); policy_test "a same-id write takes expires_at from the entries table while it holds that id", "an older id's late :put is applied only while the entries table holds that id", "on_remove with the current id is ignored while the entries table still holds that id". Two existing tests sent a removal for a tuple still in the table, or a same-id event the table contradicted; they now delete or rewrite the table first, as the real callers do. `mix bench maintenance` and `mix bench get` under §Benchmark log M3.2.
 
 ## M4 Loading
 
@@ -107,7 +107,7 @@ Done: nothing yet.
 
 
 1. **`nebulex_local` availability.** Nebulex 3 splits the local adapter into its own package; the exact package name and the Nebulex major it pairs with must be confirmed on Hex in M5.1 before the dep is added.
-2. **Concurrent writes to one key can leave the policy with the wrong id** (found in M1.2, resolved in M1.5). `put/4` allocates the id before the insert, and the write event is sent after it, so two writers racing on one key can produce any interleaving of (insert, send) pairs: the entries table may end with the lower id while the policy applies the higher id's event last, or vice versa. The spec's rules (last `:put` event wins; `on_remove` ignores a stale id) then left a policy row whose id never matched the table; in an unbounded cache `size/1` drifted by one and `delete/2` could not clear the row. Resolved as recommended (specs/05 §Decisions 2026-10-27 M1.5): `on_remove(key, id)` with a non-matching id does one `:ets.member/2` on the entries table and drops the row when the key is absent; when the key is present with a third id, the row stays and that id's `:put` corrects it. Tested in policy_test, maintenance_test and the 200-round race in theine_test.
+2. **Concurrent writes to one key can leave the policy with the wrong id** (found in M1.2, resolved in M1.5). `put/4` allocates the id before the insert, and the write event is sent after it, so two writers racing on one key can produce any interleaving of (insert, send) pairs: the entries table may end with the lower id while the policy applies the higher id's event last, or vice versa. The spec's rules (last `:put` event wins; `on_remove` ignores a stale id) then left a policy row whose id never matched the table; in an unbounded cache `size/1` drifted by one and `delete/2` could not clear the row. Resolved as recommended (specs/05 §Decisions 2026-10-27 M1.5): `on_remove(key, id)` with a non-matching id does one `:ets.member/2` on the entries table and drops the row when the key is absent; when the key is present with a third id, the row stays and that id's `:put` corrects it. Tested in policy_test, maintenance_test and the 200-round race in theine_test. Since M3.2 a lower id's `:put` arriving after a higher id's is applied only while the table holds it, so one direction of the reorder no longer leaves the row on a stale id (specs/05 §Decisions M3.2).
 3. **A write that straddles `clear/1` can leave a policy row with no entry** (noted in M1.5, not fixed). A writer that inserted before `:ets.delete_all_objects/1` and whose `:put` event is consumed after `Maintenance.reset/1` re-adds a policy row for a key the table no longer holds. No later event for that key arrives on its own (a `delete/2` of an absent key sends nothing), so in an unbounded cache the row lives until a `put` of the same key or a Maintenance restart rebuild (M2.9). In a bounded cache the eviction re-lookup drops it. The window is a few microseconds per `clear/1` and the cost is one phantom entry in `size/1`; the spec accepts it (specs/01 §Write path `clear/1`). If it matters later, `reset/1` could record the `ids` high-water mark and `on_write` ignore `:put` events with a lower id until the table confirms the key.
 
 4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6, M2.3). Four crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression (M2.3 did not touch `get/2` at all and crossed at 1.51× over a 362 ns floor), each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry.
@@ -123,6 +123,8 @@ Done: nothing yet.
 7. **The A3 OLTP rows cannot pass as specs/09 states them** (found in M2.10; resolved 2026-10-29 by a human decision, open question 1: the margin is on `loop` only and the adaptive window, M2.13, carries `theine ≥ lru` on OLTP; met in M2.13 at +6.94, +2.97 and +1.51 points, §Benchmark log M2.13). specs/09 puts the +10-point margin on `loop` 1_000 and on `OLTP` 1_000 and 2_000, and asks `theine` ≥ `lru` on every row. specs/00 A3, which specs/09 derives from, puts the margin on "the looping and scan traces", and specs/09's own table types OLTP as "database". OLTP is the recency-biased trace that Caffeine's authors use to motivate the adaptive window (M6.1): a static 1% window W-TinyLFU sits at LRU's level there and trails it at larger sizes, which is what the harness measures with the production policy: +3.61, +0.18 and −1.01 points at 1_000, 2_000 and 5_000 with the 32-access batches, +2.61, −0.52 and −1.24 replayed one access per pass as Caffeine's simulator does (the batching helps slightly: a hit key is reordered after the batch's inserts). The harness's `lru` reproduces the ARC paper's own LRU figures for OLTP exactly (32.83, 42.47, 53.65 at 1_000, 2_000, 5_000), and that paper's ARC reaches 38.93, 46.08 and 55.25 there; a +10 margin at 1_000 would need 42.8%, above ARC. The window sweep shows the policy reacting as it should to a recency-biased trace (a 20% window adds 4.9, 4.4 and 2.7 points over the 1% window: +8.5, +4.6 and +1.7 over LRU, still short of +10), and `loop` shows the admission filter working (58.84% against LRU 0). The loop may not relax a specs/09 threshold (PROMPT_build.md step 5), so the rows stand, `mix bench hitrate` exits non-zero on them, and the decision is a human's.
 
 10. **The mixed-run pass p99 is within 1 ms of `pass_budget` since the sweep landed** (found in M3.1, open; not a failure). `mix bench maintenance` passes 4/4 with p99 at 3.99 and 4.17 ms against the 5 ms budget, up from 2.85–2.90 ms (§Benchmark log M3.1). That is the index insert on every TTL write and up to `expire_batch` sweep removals per pass. The split between them has not been measured. A later maintenance task (M3.2, M6.2) that pushes the p99 over the budget should first split the pass by step, as M2.11d did (`bench/results/pass-steps-m211d.exs`), before it changes anything. specs/04 §Budget's lever is the cap: a lower `expire_batch` default (1024 now), re-measured. The threshold stays where it is.
+
+11. **maintenance_test "a sketch wider than reset_chunk resets one chunk per pass" failed once** (found in M3.2, open). It failed in about 120 full-suite runs with a pattern-match failure on pinned variables, so it is one of the `Maintenance.info/1` matches on `increments` or `reset`. The output was not kept, and 100 further runs did not reproduce it. The test's events never reach M3.2's new branches: one sender, ids rising, no removals, no expiry. A likely cause is a pass the test did not request, started by a write-count trigger, a `:drain`, or a writer blocked above `write_hwm`, running the reset before the first `info/1`. Next time: run `mix test test/theine/maintenance_test.exs --repeat-until-failure 500` and keep the failing match.
 
 ## Open questions
 
@@ -142,6 +144,66 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M3.2 — `mix bench maintenance` and `mix bench get`, `expire/3` and the entries-table checks, tree of the M3.2 commit (2026-10-29; maintenance exit 0: 4/4; get 50/60 full, 18/20 in the `--sizes 1000` rerun)
+
+The runs were on the uncommitted tree, so the result files are
+`maintenance-3dec669.json` and `get-3dec669.json`, the second overwritten by
+the rerun. `get/2` and `put/4` are unchanged. `delete/2` gained one
+`lookup_element`, and the pass gained one per removal event and one
+integer compare per overwrite. The maintenance run went without the
+`ERL_FLAGS` scheduler flags.
+
+| max sample (limit 1001028) | samples | writes (write run) | settled size | passes | p50 us | p99 us | max us | reads (mixed) | writes (mixed) | call-path writes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1001028 | 2687 | 3347073 | 1000000 | 9959 | 1723.05 | 3740.51 | 10841.16 | 13054951 | 4349632 | 14013 |
+
+The pass p99 is 3.74 ms against M3.1's 3.99–4.17, and the max, 10.8 ms,
+is under 4× `pass_budget`. Mixed-run throughput is above M3.1's, within
+the run-to-run band.
+
+`mix bench get`, full run (`+sbt db +sbwt very_long`), 50/60. All 30
+`theine_unbounded` checks passed except A2 at n=1000 tuple3 parallel=4,
+0.65 rounded and just under the limit, where M2.8c had 0.67–0.72. Twenty
+of the 30 `theine` checks passed. The bounded failures are the shapes and
+ratios of M2.8c, the recorded floor (specs/09 §Decisions M2.8d): A1 p99
+n=1000 tuple3 parallel=1 (1.76); A1 p50 and p99 n=1000 tuple3 parallel=4
+(1.57, 1.54); A2 n=1000 tuple3 (0.57); A1 p99 n=1000 binary_1kb
+parallel=1 (2.03); A2 n=100000 tuple3 (0.62); A1 p50 and p99 n=100000
+binary_1kb parallel=1 (1.75, 1.81); A2 n=1000000 tuple3 (0.62).
+
+| n | value | parallel | subject | p50 ns | p99 ns | ips | p50/ets | p99/ets | ips/ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1000 | tuple3 | 1 | theine_unbounded | 310.00 | 566.00 | 2777802 | 1.26 | 1.41 | 0.73 |
+| 1000 | tuple3 | 1 | theine | 363.00 | 707.00 | 2260239 | 1.47 | 1.76 | 0.59 |
+| 1000 | tuple3 | 4 | theine_unbounded | 577.00 | 797.00 | 1529746 | 1.42 | 1.33 | 0.65 |
+| 1000 | tuple3 | 4 | theine | 640.00 | 924.00 | 1333673 | 1.57 | 1.54 | 0.57 |
+| 1000 | binary_1kb | 1 | theine_unbounded | 325.00 | 624.00 | 2506523 | 1.18 | 1.46 | 0.85 |
+| 1000 | binary_1kb | 1 | theine | 392.00 | 866.00 | 2021175 | 1.43 | 2.03 | 0.68 |
+| 1000 | binary_1kb | 4 | theine_unbounded | 581.00 | 888.00 | 1454506 | 1.30 | 1.24 | 0.79 |
+| 1000 | binary_1kb | 4 | theine | 654.00 | 1041.00 | 1292120 | 1.47 | 1.46 | 0.70 |
+| 100000 | tuple3 | 1 | theine_unbounded | 328.00 | 677.00 | 2424561 | 1.21 | 1.07 | 0.78 |
+| 100000 | tuple3 | 1 | theine | 393.00 | 733.00 | 2032299 | 1.46 | 1.16 | 0.65 |
+| 100000 | tuple3 | 4 | theine_unbounded | 554.00 | 966.00 | 1509298 | 1.28 | 1.18 | 0.73 |
+| 100000 | tuple3 | 4 | theine | 644.00 | 1085.00 | 1281835 | 1.49 | 1.32 | 0.62 |
+| 100000 | binary_1kb | 1 | theine_unbounded | 349.00 | 666.00 | 2276534 | 1.20 | 1.07 | 0.89 |
+| 100000 | binary_1kb | 1 | theine | 510.00 | 1127.00 | 1530266 | 1.75 | 1.81 | 0.60 |
+| 100000 | binary_1kb | 4 | theine_unbounded | 591.00 | 1038.00 | 1389117 | 1.23 | 1.13 | 0.83 |
+| 100000 | binary_1kb | 4 | theine | 691.00 | 1184.00 | 1191036 | 1.44 | 1.29 | 0.71 |
+| 1000000 | tuple3 | 1 | theine_unbounded | 396.00 | 670.00 | 2279938 | 1.14 | 1.07 | 0.80 |
+| 1000000 | tuple3 | 1 | theine | 481.00 | 812.00 | 1920505 | 1.39 | 1.30 | 0.67 |
+| 1000000 | tuple3 | 4 | theine_unbounded | 601.00 | 961.00 | 1471685 | 1.24 | 1.15 | 0.74 |
+| 1000000 | tuple3 | 4 | theine | 709.00 | 1132.00 | 1224256 | 1.46 | 1.35 | 0.62 |
+| 1000000 | binary_1kb | 1 | theine_unbounded | 400.00 | 693.00 | 2097140 | 1.15 | 1.11 | 0.86 |
+| 1000000 | binary_1kb | 1 | theine | 501.00 | 815.00 | 1754717 | 1.44 | 1.31 | 0.72 |
+| 1000000 | binary_1kb | 4 | theine_unbounded | 640.00 | 1036.00 | 1331424 | 1.23 | 1.07 | 0.83 |
+| 1000000 | binary_1kb | 4 | theine | 740.00 | 1199.00 | 1163961 | 1.43 | 1.24 | 0.72 |
+
+The `--sizes 1000` rerun on the same tree (AGENTS.md, specs/09 §Decisions
+M1.6) passed every `theine_unbounded` check, n=1000 tuple3 parallel=4 at
+0.73. Of the `theine` checks, 8 of 10 passed. The two failures are the
+floor's tuple3 parallel=4 shape: p50 1.50 (rounded, over the limit) and
+A2 0.61.
 
 ### M3.1 — `mix bench maintenance`, expiry index and sweep in the pass, tree of the M3.1 commit (2026-10-29, two runs, both exit 0: 4/4)
 

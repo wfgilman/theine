@@ -278,6 +278,8 @@ defmodule Theine.MaintenanceTest do
       send(name, {:removed, :a, 6})
       assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 7, nil, 1, 1, :infinity}}
 
+      # A remover deletes the tuple before it reports the id.
+      true = :ets.delete(cache, :a)
       send(name, {:removed, :a, 7})
       assert Maintenance.policy_row(cache, :a) == :error
       assert %{pending: 0, size: 0, weighted_size: 0} = Maintenance.info(cache)

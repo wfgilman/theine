@@ -14,7 +14,7 @@ defmodule Theine.RefreshTest do
   import Theine.Test.Helpers
 
   alias Theine.{Config, Stats}
-  alias Theine.Test.Clock
+  alias Theine.Test.{Clock, LoaderHook}
 
   # Starts a cache on its own clock with `opts`, puts `key` at t=0.
   defp cache_with(opts, puts \\ [k: :old]) do
@@ -331,6 +331,191 @@ defmodule Theine.RefreshTest do
       assert Theine.get(stale, :k) == {:ok, :old}
       assert :ets.info(Config.get(stale).refreshing, :size) == 0
       assert %Stats{refreshes: 0} = Theine.stats(stale)
+    end
+  end
+
+  # A task killed from outside never runs its `after`, so its row stays
+  # behind, naming a dead pid; the next claim must delete it and refresh
+  # (specs/07 §Decisions M4.4b).
+  describe "a killed refresh task" do
+    defp kill(pid) do
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+    end
+
+    test "a refresh task killed mid-load leaves the key refreshable" do
+      calls = :counters.new(1, [])
+      cache = cache_with(refresh_after_write: 20, loader: gated(calls, fn -> {:commit, :new} end))
+      %Config{refreshing: refreshing} = Config.get(cache)
+      Clock.advance(cache, 25)
+
+      assert Theine.get(cache, :k) == {:ok, :old}
+      assert_receive {:loading, task, :k}
+      kill(task)
+      assert [{:k, _, ^task}] = :ets.lookup(refreshing, :k)
+
+      assert Theine.get(cache, :k) == {:ok, :old}
+      assert_receive {:loading, second, :k}
+      assert [{:k, _, ^second}] = :ets.lookup(refreshing, :k)
+
+      # A live task is not reclaimed.
+      assert Theine.get(cache, :k) == {:ok, :old}
+      assert Theine.refresh(cache, :k) == {:error, :refreshing}
+      refute_received {:loading, _, _}
+
+      send(second, :go)
+      await_refreshed(cache)
+      assert Theine.get(cache, :k) == {:ok, :new}
+      assert :counters.get(calls, 1) == 2
+      assert %Stats{refreshes: 2, loads: 1} = Theine.stats(cache)
+    end
+
+    @tag :capture_log
+    test "a task supervisor restart mid-refresh leaves the key refreshable" do
+      calls = :counters.new(1, [])
+      cache = cache_with(loader: gated(calls, fn -> {:commit, :new} end))
+      %Config{refreshing: refreshing, task_supervisor: sup} = Config.get(cache)
+      old_sup = Process.whereis(sup)
+
+      assert Theine.refresh(cache, :k) == :ok
+      assert_receive {:loading, task, :k}
+      monitor = Process.monitor(task)
+      Process.exit(old_sup, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^task, :killed}
+
+      assert_eventually(fn ->
+        assert Process.whereis(sup) not in [nil, old_sup]
+      end)
+
+      # Owner and its tables lived on, and so did the dead task's row.
+      assert [{:k, _, ^task}] = :ets.lookup(refreshing, :k)
+
+      assert Theine.refresh(cache, :k) == :ok
+      assert_receive {:loading, second, :k}
+      send(second, :go)
+      await_refreshed(cache)
+      assert Theine.get(cache, :k) == {:ok, :new}
+    end
+
+    test "a task killed before it writes its pid was named by its starter" do
+      calls = :counters.new(1, [])
+      cache = cache_with(loader: gated(calls, fn -> {:commit, :new} end))
+      %Config{refreshing: refreshing} = Config.get(cache)
+
+      LoaderHook.pause_at(:refresh_task, self())
+      assert Theine.refresh(cache, :k) == :ok
+      assert_receive {:paused, task, :refresh_task, :k}
+      LoaderHook.disarm(:refresh_task)
+      assert [{:k, _, ^task}] = :ets.lookup(refreshing, :k)
+      kill(task)
+
+      assert Theine.refresh(cache, :k) == :ok
+      assert_receive {:loading, second, :k}
+      send(second, :go)
+      await_refreshed(cache)
+      assert Theine.get(cache, :k) == {:ok, :new}
+      assert :counters.get(calls, 1) == 1
+    end
+
+    test "a task whose starter died before writing its pid writes it itself" do
+      calls = :counters.new(1, [])
+      cache = cache_with(loader: gated(calls, fn -> {:commit, :new} end))
+      %Config{refreshing: refreshing} = Config.get(cache)
+      test = self()
+
+      starter =
+        spawn(fn ->
+          LoaderHook.pause_at(:refresh_started, test)
+          Theine.refresh(cache, :k)
+        end)
+
+      assert_receive {:paused, ^starter, :refresh_started, :k}
+      kill(starter)
+      # The loader runs after the task's own write.
+      assert_receive {:loading, task, :k}
+      assert [{:k, _, ^task}] = :ets.lookup(refreshing, :k)
+      kill(task)
+
+      assert Theine.refresh(cache, :k) == :ok
+      assert_receive {:loading, second, :k}
+      send(second, :go)
+      await_refreshed(cache)
+      assert Theine.get(cache, :k) == {:ok, :new}
+    end
+
+    test "a starter's late write leaves a newer refresh's row alone" do
+      calls = :counters.new(1, [])
+      test = self()
+
+      # The first refresh finishes at once, the second waits for `:go`.
+      loader = fn key ->
+        :counters.add(calls, 1, 1)
+
+        if :counters.get(calls, 1) == 1 do
+          {:commit, :first}
+        else
+          send(test, {:loading, self(), key})
+
+          receive do
+            :go -> {:commit, :second}
+          end
+        end
+      end
+
+      cache = cache_with(loader: loader)
+      %Config{refreshing: refreshing} = Config.get(cache)
+
+      starter =
+        spawn(fn ->
+          LoaderHook.pause_at(:refresh_started, test)
+          send(test, {:started, Theine.refresh(cache, :k)})
+        end)
+
+      assert_receive {:paused, ^starter, :refresh_started, :k}
+      await_refreshed(cache)
+      assert Theine.get(cache, :k) == {:ok, :first}
+
+      assert Theine.refresh(cache, :k) == :ok
+      assert_receive {:loading, second, :k}
+      LoaderHook.resume(starter)
+      assert_receive {:started, :ok}
+
+      # Still the second task's row: the first starter's write matched
+      # nothing, so the key is not taken for a dead task's.
+      assert [{:k, _, ^second}] = :ets.lookup(refreshing, :k)
+      assert Theine.refresh(cache, :k) == {:error, :refreshing}
+
+      send(second, :go)
+      await_refreshed(cache)
+      assert Theine.get(cache, :k) == {:ok, :second}
+    end
+
+    test "a key that is not a valid match pattern still gets its task's pid" do
+      key = {:_, :"$1", %{a: 1}}
+      calls = :counters.new(1, [])
+      cache = cache_with([loader: gated(calls, fn -> {:commit, :new} end)], [{key, :old}])
+      %Config{refreshing: refreshing} = Config.get(cache)
+
+      # Another key that the wildcard head would match, mid-refresh too.
+      other = {:x, :y, %{a: 1, b: 2}}
+      assert Theine.refresh(cache, other) == :ok
+      assert_receive {:loading, other_task, ^other}
+
+      LoaderHook.pause_at(:refresh_task, self())
+      assert Theine.refresh(cache, key) == :ok
+      assert_receive {:paused, task, :refresh_task, ^key}
+      LoaderHook.disarm(:refresh_task)
+
+      assert [{^key, _, ^task}] = :ets.lookup(refreshing, key)
+      assert [{^other, _, ^other_task}] = :ets.lookup(refreshing, other)
+
+      LoaderHook.resume(task)
+      assert_receive {:loading, ^task, ^key}
+      send(task, :go)
+      send(other_task, :go)
+      await_refreshed(cache)
+      assert Theine.get(cache, key) == {:ok, :new}
     end
   end
 

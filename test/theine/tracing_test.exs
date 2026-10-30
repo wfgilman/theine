@@ -332,7 +332,7 @@ defmodule Theine.TracingTest do
       assert Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end) == @hit
     end
 
-    test "a stale hit adds one ets.insert_new and the refreshes counter op" do
+    test "a stale hit adds the claim, the task's pid and the refreshes counter op" do
       test = self()
 
       loader = fn _ ->
@@ -356,7 +356,37 @@ defmodule Theine.TracingTest do
                {:persistent_term, :get, 1} => 1,
                {:ets, :lookup, 2} => 1,
                {:ets, :insert_new, 2} => 1,
+               {:ets, :select_replace, 2} => 1,
                {:counters, :add, 3} => 2
+             }
+    end
+
+    test "a stale hit while a refresh runs adds one ets.insert_new and one ets.lookup" do
+      test = self()
+
+      loader = fn _ ->
+        send(test, {:loading, self()})
+
+        receive do
+          :go -> {:commit, 2}
+        end
+      end
+
+      cache = refresh_cache(refresh_after_write: 20, loader: loader)
+      Theine.Test.Clock.advance(cache, 20)
+      {:ok, 1} = Theine.get(cache, :present)
+      assert_receive {:loading, task}
+
+      # The losing claim looks the row up and finds its task alive
+      # (specs/07 §Decisions M4.4b); `Process.alive?/1` is not traced.
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+      send(task, :go)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 2,
+               {:ets, :insert_new, 2} => 1,
+               {:counters, :add, 3} => 1
              }
     end
   end

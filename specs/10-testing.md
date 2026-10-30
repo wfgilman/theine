@@ -34,7 +34,9 @@ removed.
 - `Theine.Test.LoaderHook`: pause points between the steps of the
   single-flight algorithm, armed per fetching process with
   `pause_at(point, notify)` and released with `resume(pid)`; compiled into
-  `Theine.Loader` by the test build only (specs/07 §Decisions M4.2).
+  `Theine.Loader` by the test build only (specs/07 §Decisions M4.2). Two
+  refresh points; `:refresh_task` is armed in the starter, fires in its
+  tasks and stays armed until `disarm(point)` (specs/07 §Decisions M4.4b).
 - `assert_eventually(fun, timeout \\ 1000)`.
 - `spawn_on_scheduler(n, fun)` using `spawn_opt` with `{:scheduler, n}`.
 

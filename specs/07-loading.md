@@ -152,11 +152,16 @@ already-completed task (`Task.completed/1`) and spawn nothing.
 in `fetch/3` or `get/2` where `now - written_at >= ms` and a loader is
 available (per-call or cache-level), the reader:
 
-1. `:ets.insert_new(refreshing, {key, now})`, a third `Theine.Owner` table.
-   If it fails, a refresh is already running; return the stale value.
-2. On success, `Task.Supervisor.start_child(sup, fn -> ... end)` that runs
-   the loader, stores on `:commit` (which assigns a new id and `written_at`),
-   and in an `after` deletes the `refreshing` row. On `:ignore` or an error
+1. `:ets.insert_new(refreshing, {key, ref, nil})`, a third `Theine.Owner`
+   table, with a fresh `ref`. If it fails, a refresh is already running;
+   return the stale value. The one exception is a row naming a dead task
+   (one killed from outside, whose `after` never ran): the reader deletes
+   it by exact object and claims once more (§Decisions M4.4b).
+2. On success, `Task.Supervisor.start_child(sup, fn -> ... end)` that writes
+   its own pid into the row, runs the loader, stores on `:commit` (which
+   assigns a new id and `written_at`), and in an `after` deletes the
+   `refreshing` row. The starter also writes the task's pid, by
+   compare-and-swap on `ref`, once `start_child` returns. On `:ignore` or an error
    the old value stays and the row is deleted; the error is logged at
    `:warning` with the key omitted (keys may be sensitive) and emitted as
    `[:theine, :refresh, :exception]` telemetry.
@@ -166,7 +171,8 @@ available (per-call or cache-level), the reader:
 and the cache has a `loader:`, so the hot-path budget in specs/01 is
 unchanged for every other cache; with both, the cost is a clock read and
 one integer comparison on a hit, and an `insert_new` on a stale hit (it
-fails while the key's refresh runs). See §Decisions M4.4.
+fails while the key's refresh runs, and the failure costs one `lookup` and
+one `Process.alive?/1`). See §Decisions M4.4 and M4.4b.
 
 `refresh(cache, key)` forces the same background refresh regardless of age,
 returning `:ok` if started or `{:error, :refreshing}` if one is running.
@@ -304,8 +310,8 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
   expiry check, then the age check). Sharing the read would mean
   restructuring `get/2`'s expiry branch for every cache, which the
   section above rules out; one more `monotonic_time` BIF on this cache
-  kind only is the cheaper side. The claim row's `started_at` is a third
-  read, once per refresh.
+  kind only is the cheaper side. (The claim row's `started_at` was a third
+  read, once per refresh, until M4.4b replaced it with a ref.)
 - 2026-10-29 (M4.4): details the section left open. `refresh/2` does not
   depend on `refresh_after_write`, and on an absent key it loads and
   stores like any refresh. `refreshes` counts refreshes started (by a
@@ -322,9 +328,40 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
   restarting), the starter deletes its claim row; `refresh/2` then exits
   with the supervisor's reason and a stale hit returns its value as if
   no refresh were due.
-- 2026-10-29 (M4.4, open): a refresh task killed from outside (an
-  explicit `Process.exit(pid, :kill)`, or the task supervisor restarting
-  under `rest_for_one` while Owner lives) never runs its `after`, so its
-  `refreshing` row stays and the key is never refreshed again until the
-  Owner restarts. IMPLEMENTATION_PLAN.md M4.4b fixes it, as M4.1 did for
-  a killed claimant.
+- 2026-10-29 (M4.4, closed by M4.4b): a refresh task killed from outside
+  (an explicit `Process.exit(pid, :kill)`, or the task supervisor
+  restarting under `rest_for_one` while Owner lives) never runs its
+  `after`, so its `refreshing` row stayed and the key was never refreshed
+  again until the Owner restarted.
+- 2026-10-29 (M4.4b): the `refreshing` row is `{key, ref, pid}`, and a
+  claim whose `insert_new` fails looks the row up and, when `pid` is dead,
+  deletes the row by exact object and claims once more (no loop: a second
+  failure is `:refreshing`). A row with no pid yet, or no row, is
+  `:refreshing`. Who writes the pid took some care. If only the task
+  writes it, first thing, a task killed before its first instruction (a
+  supervisor restart can do that) leaves `nil` forever. If the starter
+  writes it with `update_element/3` after `start_child` returns, the task
+  may have finished and deleted its row, and a newer claim taken the key,
+  in between; the starter would then mark the newer row with its dead
+  task, and the next claim would start a second refresh beside the live
+  one. So both write it. The task writes with `update_element/3` (only the
+  task deletes its row, and a claim deletes only a row naming a dead pid,
+  so the row it updates is its own). The starter writes with
+  `:ets.select_replace/2` on `{key, ref, nil}`, a compare-and-swap that
+  the unique `ref` keeps off any newer claim. The replacement takes its key
+  from the matched object (`{:element, 1, :"$_"}`): `select_replace`
+  rejects a `:const` key for a head it cannot prove keeps the key, which is
+  any key holding a map or a match-spec atom (`:_`, `:"$1"`). Such a key
+  only widens the head into a scan of the running refreshes; the ref
+  still selects one row. A row is left with no pid only if the starter is
+  killed between `start_child` and its write and the task is killed
+  before its own. The `started_at` the row held was read by nothing, so
+  the ref replaces it and the clock read is gone. Cost: on a stale hit
+  that wins, one `select_replace` (and the task's `update_element`); on
+  one that loses, one `lookup` and one `Process.alive?/1`; refreshing
+  caches only, the tracing tests pin both. A reused pid could make a dead
+  task look alive until that process exits, which needs the local pid
+  space to wrap while the dead task's row waits. The test build adds two
+  `Theine.Test.LoaderHook` points, `:refresh_started` (in the starter,
+  before its write) and `:refresh_task` (in the task, before its own,
+  armed in the starter and found through `$callers`).

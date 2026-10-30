@@ -37,11 +37,13 @@ defmodule Theine.Loader do
 
   Refreshes (specs/07 §Refresh-after-write) do not go through the claim. A
   reader whose hit is at least `refresh_after_write` old, or a call to
-  `refresh/2`, claims the key in a third table, `refreshing` (`{key,
-  started_at}`), with `:ets.insert_new/2`, and starts a task under the same
+  `refresh/2`, claims the key in a third table, `refreshing` (`{key, ref,
+  task_pid}`), with `:ets.insert_new/2`, and starts a task under the same
   supervisor that loads and stores the value and then deletes the row. The
   reader returns the stale value at once; a reader that loses the
-  `insert_new` returns it too, so one refresh runs per key at a time.
+  `insert_new` returns it too, so one refresh runs per key at a time. The
+  exception is a row whose task is dead: a task killed from outside never
+  deletes its row, so the losing reader deletes it and claims again.
 
   The loader is never called from the maintenance process. Each call is
   wrapped in `[:theine, :load, :start | :stop | :exception]` telemetry with
@@ -52,7 +54,6 @@ defmodule Theine.Loader do
   alias Theine.{Config, Entry, Stats}
 
   require Logger
-  require Theine.Clock
 
   @type key :: Entry.key()
   @type value :: Entry.value()
@@ -177,28 +178,63 @@ defmodule Theine.Loader do
   end
 
   # Steps 1 and 2: claim the key's refresh with `insert_new`, then start the
-  # task, which deletes exactly this row when it is done. A task that could
-  # not be started gives the claim back.
-  defp start_refresh(%Config{refreshing: refreshing, counters: counters} = config, key, loader) do
-    row = {key, Theine.Clock.now(config.name)}
+  # task, which deletes exactly its row when it is done. The row is `{key,
+  # ref, pid}`, with the task's pid once it is known (nil before), so that a
+  # task killed from outside, whose `after` never runs, leaves a row that a
+  # later claim can tell is dead (specs/07 §Decisions M4.4b).
+  defp start_refresh(%Config{refreshing: refreshing} = config, key, loader) do
+    ref = make_ref()
 
-    if :ets.insert_new(refreshing, row) do
-      try do
-        Task.Supervisor.start_child(config.task_supervisor, fn ->
-          refresh_task(config, key, loader, row)
-        end)
-      catch
-        kind, reason ->
-          true = :ets.delete_object(refreshing, row)
-          :erlang.raise(kind, reason, __STACKTRACE__)
-      else
-        {:ok, _pid} ->
-          :counters.add(counters, @refreshes, 1)
-          :ok
-      end
+    if :ets.insert_new(refreshing, {key, ref, nil}),
+      do: start_task(config, key, loader, ref),
+      else: reclaim(config, key, loader, ref)
+  end
+
+  # The claim failed. A row naming a dead task is deleted by exact object
+  # and the key claimed once more; a row whose task is alive, or not known
+  # yet, or no row at all (the refresh just finished) means `:refreshing`.
+  defp reclaim(%Config{refreshing: refreshing} = config, key, loader, ref) do
+    with [{_, _, pid} = row] when is_pid(pid) <- :ets.lookup(refreshing, key),
+         false <- Process.alive?(pid),
+         true <- :ets.delete_object(refreshing, row),
+         true <- :ets.insert_new(refreshing, {key, ref, nil}) do
+      start_task(config, key, loader, ref)
     else
-      {:error, :refreshing}
+      _ -> {:error, :refreshing}
     end
+  end
+
+  # A task that could not be started gives the claim back. One that was
+  # started gets its pid written into the row, unless the task already did
+  # that itself.
+  defp start_task(%Config{refreshing: refreshing} = config, key, loader, ref) do
+    Task.Supervisor.start_child(config.task_supervisor, fn ->
+      refresh_task(config, key, loader, ref)
+    end)
+  catch
+    kind, reason ->
+      true = :ets.delete_object(refreshing, {key, ref, nil})
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  else
+    {:ok, pid} ->
+      pause(:refresh_started, key)
+      record_task(refreshing, key, ref, pid)
+      :counters.add(config.counters, @refreshes, 1)
+      :ok
+  end
+
+  # The starter's write of the task's pid, as a compare-and-swap on the
+  # unique ref: by now the task may have finished and deleted its row, and
+  # the key may hold a newer claim, which `update_element/3` would mark
+  # with this task's (dead) pid. Wildcard atoms or a map in `key` only widen
+  # the head's match (a scan of the running refreshes instead of a lookup);
+  # the ref still picks this one row. The new row's key is taken from the
+  # matched object, because `select_replace/2` rejects a `:const` key it
+  # cannot prove unchanged, which is any key the head does not fully bind.
+  defp record_task(refreshing, key, ref, pid) do
+    new = {{{:element, 1, :"$_"}, {:const, ref}, {:const, pid}}}
+    _ = :ets.select_replace(refreshing, [{{key, ref, nil}, [], [new]}])
+    :ok
   end
 
   # The refresh task: one load as a claimant's (telemetry, the `loads` and
@@ -208,7 +244,13 @@ defmodule Theine.Loader do
   # without the stacktrace, whose top frame can carry the loader's
   # arguments; the telemetry event carries both kind and stacktrace for a
   # handler that wants them.
-  defp refresh_task(%Config{name: name} = config, key, loader, row) do
+  #
+  # The task writes its own pid first, in case its starter died before
+  # doing so. The row is this task's: only the task deletes it, and a claim
+  # deletes only a row naming a dead pid.
+  defp refresh_task(%Config{name: name, refreshing: refreshing} = config, key, loader, ref) do
+    pause(:refresh_task, key)
+    true = :ets.update_element(refreshing, key, {3, self()})
     _ = run(config, key, loader)
     :ok
   catch
@@ -228,7 +270,7 @@ defmodule Theine.Loader do
 
       :ok
   after
-    true = :ets.delete_object(config.refreshing, row)
+    true = :ets.delete_object(refreshing, {key, ref, self()})
   end
 
   # The lookup of `fetch/4` and `fetch_async/4`: `get/2`, unless a stale

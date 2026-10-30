@@ -47,6 +47,8 @@ defmodule Theine.ConfigTest do
     assert config.table == :config_test
     assert config.maintenance == :"Elixir.Theine.Maintenance.config_test"
     assert config.task_supervisor == :"Elixir.Theine.TaskSupervisor.config_test"
+    assert config.inflight == :"Elixir.Theine.Loader.Inflight.config_test"
+    assert config.waiters == :"Elixir.Theine.Loader.Waiters.config_test"
     assert Enum.all?([config.ids, config.pending, config.flags, config.counters], &is_nil/1)
   end
 

@@ -13,7 +13,8 @@ defmodule Theine.Config do
 
   Registered names are atoms derived from the cache name
   (`Theine.Maintenance.my_cache`), because write events are delivered with
-  `send/2`, which needs a local atom name (specs/08 §Decisions).
+  `send/2`, which needs a local atom name (specs/08 §Decisions). The
+  loader's `inflight` and `waiters` tables are named the same way.
   """
 
   @type cache :: atom()
@@ -58,6 +59,8 @@ defmodule Theine.Config do
           table: cache(),
           maintenance: atom(),
           task_supervisor: atom(),
+          inflight: atom(),
+          waiters: atom(),
           ids: :atomics.atomics_ref() | nil,
           pending: :atomics.atomics_ref() | nil,
           flags: :atomics.atomics_ref() | nil,
@@ -69,7 +72,7 @@ defmodule Theine.Config do
           sketch: Theine.Sketch.t() | nil
         }
 
-  @enforce_keys [:name, :max_size, :table, :maintenance, :task_supervisor]
+  @enforce_keys [:name, :max_size, :table, :maintenance, :task_supervisor, :inflight, :waiters]
   defstruct name: nil,
             max_size: :infinity,
             weigher: nil,
@@ -93,6 +96,8 @@ defmodule Theine.Config do
             table: nil,
             maintenance: nil,
             task_supervisor: nil,
+            inflight: nil,
+            waiters: nil,
             ids: nil,
             pending: nil,
             flags: nil,
@@ -182,6 +187,10 @@ defmodule Theine.Config do
       table: name,
       maintenance: Module.concat(Theine.Maintenance, name),
       task_supervisor: Module.concat(Theine.TaskSupervisor, name),
+      # The single-flight tables of Theine.Loader (specs/07 §Single-flight),
+      # named so that a restarted Owner recreates them under the same atom.
+      inflight: Module.concat(Theine.Loader.Inflight, name),
+      waiters: Module.concat(Theine.Loader.Waiters, name),
       stripes: default_stripes()
     }
 

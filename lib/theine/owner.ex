@@ -3,7 +3,8 @@ defmodule Theine.Owner do
   Holds the entries table, the atomics and the counters of one cache
   (specs/08 §Supervision tree, specs/01 §Tables and handles).
 
-  `init/1` creates the public entries table, allocates the `ids`, `pending`,
+  `init/1` creates the public entries table and the loader's `inflight` and
+  `waiters` tables (specs/07 §Single-flight), allocates the `ids`, `pending`,
   `flags` and `sizes` atomics and the stats counters, plus the read buffer
   (specs/03) and the frequency sketch (specs/02) when the cache is bounded,
   and writes the completed `%Theine.Config{}` to `:persistent_term`. An
@@ -32,6 +33,11 @@ defmodule Theine.Owner do
     write_concurrency: :auto,
     decentralized_counters: true
   ]
+
+  # The single-flight tables of Theine.Loader (specs/07 §Single-flight):
+  # `inflight` a set of claims, `waiters` a duplicate bag of waiter rows.
+  # Both are empty whenever no load is in progress.
+  @loader_table_options [:public, :named_table, write_concurrency: :auto]
 
   # Index of the drain flag inside the `flags` atomics (specs/03).
   @drain_flag 1
@@ -62,6 +68,8 @@ defmodule Theine.Owner do
     # Trap exits so a supervisor shutdown runs terminate/2 and erases the term.
     Process.flag(:trap_exit, true)
     _ = :ets.new(config.table, @table_options)
+    _ = :ets.new(config.inflight, [:set | @loader_table_options])
+    _ = :ets.new(config.waiters, [:duplicate_bag | @loader_table_options])
 
     config =
       case :persistent_term.get(Config.key(config.name), nil) do

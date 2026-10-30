@@ -167,12 +167,20 @@ defmodule TheineTest do
     test "stopping the cache removes persistent_term, named tables and registered names" do
       cache = unique_cache()
       start_supervised!({Theine, name: cache, max_size: :infinity})
-      task_supervisor = Config.get(cache).task_supervisor
+
+      %Config{task_supervisor: task_supervisor, inflight: inflight, waiters: waiters} =
+        Config.get(cache)
+
+      assert :ets.info(inflight, :type) == :set
+      assert :ets.info(waiters, :type) == :duplicate_bag
 
       :ok = stop_supervised!({Theine, cache})
 
       assert :persistent_term.get(Config.key(cache), :gone) == :gone
-      assert :ets.whereis(cache) == :undefined
+
+      for table <- [cache, inflight, waiters] do
+        assert :ets.whereis(table) == :undefined
+      end
 
       for name <- [
             Theine.Supervisor.name(cache),
@@ -217,9 +225,12 @@ defmodule TheineTest do
       # Usable and empty afterwards, with the config written only once.
       assert :ets.info(cache, :size) == 0
       assert :ets.info(cache, :owner) == children(sup)[Theine.Owner]
+      assert :ets.info(config.inflight, :owner) == children(sup)[Theine.Owner]
+      assert :ets.info(config.waiters, :owner) == children(sup)[Theine.Owner]
       assert Config.get(cache) == config
       assert :atomics.add_get(config.ids, 1, 1) == 1
       assert Theine.Maintenance.info(cache).passes == 0
+      assert Theine.fetch(cache, :k, fn _ -> {:commit, :loaded} end) == {:ok, :loaded}
     end
   end
 

@@ -17,6 +17,12 @@ defmodule Theine.Stats do
   | 6 | `expirations` |
   | 7 | `refreshes` |
 
+  `loads` counts every completed loader call made by `Theine.fetch/4`,
+  and `load_failures` those that raised, threw or exited, as Caffeine's
+  `loadCount` and `loadFailureCount`; an `{:ignore, value}` result is a
+  successful load. A waiter that received another process's load counts
+  nothing here, only the miss of its `get`.
+
   `hits` is special. A bounded cache never increments its `hits` counter:
   every hit claims a sequence number in its read-buffer stripe, so the sum
   of the stripe tails is already the exact hit count (specs/03 §Hits from

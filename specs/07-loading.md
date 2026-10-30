@@ -61,24 +61,31 @@ fetch(cache, key, loader, opts):
    succeeds, this process is the **claimant**; go to *Load*.
 2. Otherwise `[{^key, pid, ref}] = :ets.lookup(inflight, key)` (if the
    lookup is empty the claimant already finished: go to step 6).
-   `mon = Process.monitor(pid)`. Insert `{{key, ref}, self(), mon}` into
-   `waiters`.
+   `mon = :erlang.monitor(:process, pid, alias: :demonitor)`. Insert
+   `{{key, ref}, self(), mon}` into `waiters`.
 3. **Double-check**: if `:ets.lookup(inflight, key)` no longer returns that
    exact `{key, pid, ref}`, the claimant finished between steps 1 and 2 and
    may have already notified waiters. Deregister (`:ets.delete_object` the
-   waiter row, `Process.demonitor(mon, [:flush])`) and go to step 6.
+   waiter row, `Process.demonitor(mon, [:flush])`); if a
+   `{:theine_loaded, ^mon, result}` is already in the mailbox return
+   `result`, else go to step 6.
 4. `receive` one of:
    - `{:theine_loaded, ^mon, result}` → demonitor with flush, return
      `result`.
    - `{:DOWN, ^mon, :process, _, reason}` → the claimant died before
-     notifying. Delete the waiter row. If the key is now cached (the
-     claimant committed and then died), return it. Else if `reason` is
-     `:normal`, go to step 6 (the claimant finished and this waiter was
+     notifying. Delete the waiter row and the dead claim
+     (`:ets.delete_object(inflight, {key, pid, ref})`, so a new claim is
+     untouched). If the key is now cached (the claimant committed and then
+     died), return it. Else if `reason` is `:normal` or `:noproc`, go to
+     step 6 (`:normal`: the claimant finished and this waiter was
      registered too late; the double-check in step 3 makes this rare but
      not impossible when the claimant is a process that exits right after
-     returning). Else return `{:error, {:load_failed, reason}}`.
+     returning; `:noproc`: the claimant was already dead when monitored,
+     so its claim was stale). Else return `{:error, {:load_failed,
+     reason}}`.
    - after `opts[:timeout]` (default 5000 ms) → delete the waiter row,
-     demonitor with flush, return `{:error, :timeout}`.
+     demonitor with flush; return a `{:theine_loaded, ^mon, result}`
+     already in the mailbox, else `{:error, :timeout}`.
 5. (unreachable)
 6. **Retry**: `get` again; on hit return it. On miss, if `attempts < 3`,
    go to step 1 with `attempts + 1`; else run the loader in this process
@@ -96,9 +103,9 @@ try
     {:ignore, v}       ->                             reply = {:ok, v}
   reply
 after
-  :ets.delete(inflight, key)                        # 1. release the claim
+  :ets.delete_object(inflight, {key, self(), ref})  # 1. release the claim
   for {{^key, ^ref}, pid, mon} <- :ets.lookup(waiters, {key, ref}):  # 2. then read waiters
-    send(pid, {:theine_loaded, mon, reply_or_error})
+    send(mon, {:theine_loaded, mon, reply_or_error})  # to the monitor alias
   :ets.delete(waiters, {key, ref})
 end
 ```
@@ -189,3 +196,46 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
 ## Decisions
 
 (Add dated entries when the implementation forces a change.)
+
+- 2026-10-29 (M4.1): a killed claimant must not block its key. Its `after`
+  never runs, so its claim stays in `inflight`; with the algorithm as
+  first written, the next fetcher would monitor the dead pid, receive
+  `:DOWN` with `:noproc`, and return `{:error, {:load_failed, :noproc}}`
+  on every later miss, which contradicts §Acceptance ("the next `fetch`
+  for that key claims successfully"). Step 4 now deletes the dead claim by
+  exact object on any `:DOWN` and treats `:noproc` like `:normal` (go to
+  step 6), so the first fetcher after the death reclaims the key. Waiters
+  registered before the death still get the monitor's reason, as
+  §The loader function says.
+- 2026-10-29 (M4.1): waiters monitor with `alias: :demonitor` and the
+  claimant sends to the monitor alias rather than the waiter pid. A
+  waiter that times out demonitors, which deactivates the alias, so a
+  notification sent afterwards is dropped by the runtime instead of
+  landing in the mailbox of a long-lived caller (a GenServer would see an
+  unexpected message). A notification that arrived before the demonitor
+  is taken from the mailbox and returned rather than discarded; the same
+  applies when the double-check of step 3 fails, since the claimant may
+  have read the waiter row after its insert. The claimant releases with
+  `:ets.delete_object` on its own claim rather than `:ets.delete` by key,
+  which is the same cost and cannot remove another claim.
+- 2026-10-29 (M4.1): details §The loader function left open. A waiter's
+  `reason` for a raise is `Exception.normalize/3` of what was raised, so
+  an Erlang error such as `:badarg` arrives as `%ArgumentError{}`, while
+  the claimant re-raises the raw reason with its stacktrace, as from any
+  call. A loader result outside the three shapes raises `ArgumentError`
+  in the claimant and fails the waiters with it. `{:commit, v, opts}`
+  takes the options of `put/4` (`ttl:` and `weight:`), not `ttl:` only.
+  `fetch/4` rejects unknown options and a `timeout:` that is not a
+  non-negative integer or `:infinity` with `ArgumentError`, and
+  `fetch/2` raises for a missing loader even on a hit. `loads` counts
+  every completed loader call and `load_failures` the failed ones (as
+  Caffeine's `loadCount` and `loadFailureCount`); `{:ignore, v}` is a
+  successful load, and an uncoalesced load after step 6 counts and emits
+  telemetry like a claimant's.
+- 2026-10-29 (M4.1): the two table names are `%Theine.Config{}` fields
+  (`inflight`, `waiters`, derived from the cache name like `maintenance`)
+  so that a miss does not build atoms. That takes the config map from 33
+  to 35 keys; a compiled probe of the `get/2` hit
+  (`bench/results/config-keys-m41.exs`, `+S 2`) measured 262/326 ns
+  (unbounded/bounded) before and 256/311 ns after, the same within the
+  probe's wander. The config was already past the 32-key flatmap limit.

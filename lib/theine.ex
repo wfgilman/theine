@@ -72,7 +72,7 @@ defmodule Theine do
   blocks writers once `write_hwm` events queue.
   """
 
-  alias Theine.{Config, Entry, Policy, ReadBuffer, Stats}
+  alias Theine.{Config, Entry, Loader, Policy, ReadBuffer, Stats}
 
   require Theine.Clock
 
@@ -221,6 +221,73 @@ defmodule Theine do
       {:ok, value} -> value
       :error -> default
     end
+  end
+
+  @doc """
+  `fetch/4` with the cache's `loader:` and the default options. Raises
+  `ArgumentError` when the cache was started without a loader.
+
+      iex> {:ok, _} = Theine.start_link(name: :fetch2_doc, max_size: :infinity,
+      ...>   loader: fn key -> {:commit, key * 2} end)
+      iex> Theine.fetch(:fetch2_doc, 21)
+      {:ok, 42}
+      iex> Theine.get(:fetch2_doc, 21)
+      {:ok, 42}
+  """
+  @spec fetch(cache(), key()) :: {:ok, value()} | {:error, Loader.error()}
+  def fetch(cache, key), do: Loader.fetch(cache, key, nil, [])
+
+  @doc """
+  Returns `{:ok, value}` for `key`, loading it on a miss with `loader`, or
+  with the cache's `loader:` when `loader` is nil, Caffeine's
+  `LoadingCache.get` (specs/07). A hit never calls the loader.
+
+  Loads are single-flight: while one process (the claimant) runs the
+  loader for a key, every other process that misses the same key waits for
+  its result instead of loading again, so the loader runs once per key per
+  miss however many callers there are. The claimant runs the loader in its
+  own process. What the loader returns decides what is stored:
+
+  - `{:commit, value}` stores `value` with the cache's default TTL and
+    returns it to every caller;
+  - `{:commit, value, opts}` stores it with the options of `put/4`
+    (`ttl:`, `weight:`);
+  - `{:ignore, value}` returns `value` to every caller and stores nothing,
+    for results such as "not found" that should not occupy the cache.
+
+  When the loader raises, throws or exits, the claimant sees it as it would
+  from any function call and nothing is stored. Each waiter instead gets
+  `{:error, {:load_failed, reason}}`, where `reason` is
+
+  - the exception struct, when the loader raised;
+  - `{:nocatch, value}`, when it threw `value`;
+  - the exit reason, when it exited;
+  - the claimant's exit reason as its monitor reports it (for example
+    `:killed`), when the claimant died before it could notify.
+
+  Options:
+
+  - `timeout:` milliseconds a waiter waits for the claimant, or
+    `:infinity`; default 5000. A waiter past it returns `{:error,
+    :timeout}`. The claimant itself is not limited.
+
+  Raises `ArgumentError` when neither `loader` nor the cache's `loader:` is
+  set, or for an unknown option.
+
+      iex> {:ok, _} = Theine.start_link(name: :fetch_doc, max_size: :infinity)
+      iex> Theine.fetch(:fetch_doc, :a, fn _key -> {:commit, 1} end)
+      {:ok, 1}
+      iex> Theine.fetch(:fetch_doc, :a, fn _key -> {:commit, 2} end)
+      {:ok, 1}
+      iex> Theine.fetch(:fetch_doc, :b, fn _key -> {:ignore, :not_found} end)
+      {:ok, :not_found}
+      iex> Theine.get(:fetch_doc, :b)
+      :error
+  """
+  @spec fetch(cache(), key(), Loader.loader() | nil, keyword()) ::
+          {:ok, value()} | {:error, Loader.error()}
+  def fetch(cache, key, loader, opts \\ []) when is_list(opts) do
+    Loader.fetch(cache, key, loader, opts)
   end
 
   @doc """

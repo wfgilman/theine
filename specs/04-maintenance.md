@@ -136,7 +136,10 @@ mailbox and are applied after it completes. The table is fixed
 (`:ets.safe_fixtable/2`) for the scan, so a chunked traversal of the `set`
 neither skips nor repeats an entry under concurrent writes (§Decisions
 M2.9). One `[:theine, :maintenance, :rebuild]` event per maintenance start
-reports the scan's `duration`, `entries` and `chunks`.
+reports the scan's `duration`, `entries` and `chunks`. Some of the queued
+events are the `:put`s of entries the scan restored. The entry may have
+been evicted before its `:put` is applied, and such a `:put` must not
+re-create its row (specs/05 §Events `on_write`, §Decisions M2.12).
 
 ## Acceptance
 

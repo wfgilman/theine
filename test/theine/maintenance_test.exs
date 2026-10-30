@@ -1031,6 +1031,42 @@ defmodule Theine.MaintenanceTest do
       assert :ets.info(cache, :size) == 50
     end
 
+    test "a restored entry evicted before its queued put arrives leaves no row" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine,
+         [name: cache, max_size: 10, test_hooks: true, policy_module: Theine.Test.Policy] ++
+           @quiet}
+      )
+
+      config = Config.get(cache)
+      for i <- 1..10, do: Theine.put(cache, i, i)
+      Maintenance.run(cache)
+
+      # A writer that inserted :late and was descheduled before delivering
+      # its event: the entry is in the table for the scan to restore, and
+      # the event arrives after it.
+      late_id = :atomics.add_get(config.ids, 1, 1)
+      true = :ets.insert(cache, {:late, :v, late_id, 1, 0, :infinity})
+
+      :ok = Theine.Test.Policy.gate(cache, :restore)
+      Process.exit(Process.whereis(Maintenance.name(cache)), :kill)
+      assert_receive {Theine.Test.Policy, ^cache, :gated, :restore, pid}, 5_000
+
+      # Queued behind the scan: a put heavy enough to evict every restored
+      # entry, :late included, its deletion, and then :late's own put.
+      :ok = Theine.put(cache, :x, :big, weight: 10)
+      :ok = Theine.delete(cache, :x)
+      :ok = Theine.WriteEvents.deliver(config, {:put, :late, late_id, 1, :infinity})
+      :ok = Theine.Test.Policy.release(cache, pid)
+
+      assert %{pending: 0, size: 0, weighted_size: 0} = Maintenance.info(cache)
+      assert :ets.info(cache, :size) == 0
+      assert Maintenance.policy_row(cache, :late) == :error
+      assert Theine.stats(cache).evictions == 11
+    end
+
     test "writers do not crash when Maintenance is restarting" do
       cache = unique_cache()
       # A low write_hwm keeps writers on the call path too.

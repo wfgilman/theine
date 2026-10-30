@@ -79,7 +79,8 @@ defmodule Theine.Policy do
           next_seq: pos_integer(),
           candidates: non_neg_integer(),
           cursor: non_neg_integer() | nil,
-          candidate_floor: pos_integer() | nil
+          candidate_floor: pos_integer() | nil,
+          restored_id: non_neg_integer()
         }
 
   @enforce_keys [:policy, :ids, :table, :sizes, :counters, :max_size]
@@ -102,7 +103,8 @@ defmodule Theine.Policy do
     next_seq: 1,
     candidates: 0,
     cursor: nil,
-    candidate_floor: nil
+    candidate_floor: nil,
+    restored_id: 0
   ]
 
   # Caffeine's hash-DoS guard (specs/05 §Events `evict`): a candidate that
@@ -110,6 +112,9 @@ defmodule Theine.Policy do
   # time in 128, so a flood of fresh keys cannot pin the main region.
   @admit_threshold 6
   @admit_odds 128
+
+  # Where an entry tuple keeps its id (specs/01 §Layout).
+  @entry_id Entry.id_pos()
 
   # The `evictions` counter (specs/08 §Stats), resolved at compile time.
   @evictions Theine.Stats.evictions()
@@ -232,7 +237,11 @@ defmodule Theine.Policy do
   `on_write`).
 
   - unknown key: a new row and a new ids row; in a bounded cache the key
-    is placed at the window MRU and counted in the sketch;
+    is placed at the window MRU and counted in the sketch. An `id` at or
+    below the highest one `restore/5` admitted may be a version the
+    rebuild restored and the policy has since removed, so it is admitted
+    only while the entries table still holds it (specs/05 §Decisions
+    M2.12);
   - known key, different id: the ids row is replaced and the row's id,
     weight and expires_at updated; in a bounded cache the key moves to the
     MRU of its current segment and is counted in the sketch, since Caffeine
@@ -243,6 +252,11 @@ defmodule Theine.Policy do
   @spec on_write(t(), Entry.key(), Entry.id(), Entry.weight(), Entry.expires_at()) :: t()
   def on_write(%__MODULE__{} = state, key, id, weight, expires_at) do
     case :ets.lookup(state.policy, key) do
+      [] when id <= state.restored_id ->
+        if :ets.lookup_element(state.table, key, @entry_id, nil) == id,
+          do: insert(state, key, id, weight, expires_at),
+          else: state
+
       [] ->
         insert(state, key, id, weight, expires_at)
 
@@ -370,6 +384,10 @@ defmodule Theine.Policy do
   the policy already holds is left alone, whatever its id; the rebuild
   scans a fixed table, so that only happens if the caller restores a key
   twice.
+
+  The highest restored id is kept: a restored entry's own `:put` may still
+  be queued when the policy evicts it, and `on_write/5` must not bring its
+  row back (specs/05 §Decisions M2.12).
   """
   @spec restore(t(), Entry.key(), Entry.id(), Entry.weight(), Entry.expires_at()) :: t()
   def restore(%__MODULE__{order: nil} = state, key, id, weight, expires_at) do
@@ -378,7 +396,7 @@ defmodule Theine.Policy do
     if :ets.insert_new(state.policy, {key, id, nil, seq, weight, expires_at}) do
       true = :ets.insert(state.ids, {id, key})
       add(state, 1, weight)
-      %{state | next_seq: seq + 1}
+      %{state | next_seq: seq + 1, restored_id: max(id, state.restored_id)}
     else
       state
     end
@@ -391,7 +409,13 @@ defmodule Theine.Policy do
       true = :ets.insert(state.ids, {id, key})
       true = :ets.insert(state.order, {@probation_base + seq, key})
       add(state, 1, weight)
-      %{state | next_seq: seq + 1, probation_weight: state.probation_weight + weight}
+
+      %{
+        state
+        | next_seq: seq + 1,
+          probation_weight: state.probation_weight + weight,
+          restored_id: max(id, state.restored_id)
+      }
     else
       state
     end

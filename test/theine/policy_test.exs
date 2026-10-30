@@ -477,6 +477,51 @@ defmodule Theine.PolicyTest do
       for i <- 1..5, do: assert(Policy.lookup(policy, i) == :error)
       for i <- 6..15, do: assert({:ok, _} = Policy.lookup(policy, i))
     end
+
+    # specs/05 §Decisions M2.12: a writer inserts, the rebuild restores the
+    # entry, and its `:put` queued behind the scan is applied after the
+    # eviction that removed it.
+    test "a queued put for a restored entry evicted since does not bring its row back", %{
+      table: table
+    } do
+      policy = bounded(10)
+      for i <- 2..12, do: :ets.insert(table, entry(i, i))
+
+      policy =
+        Enum.reduce(2..12, policy, fn i, policy -> Policy.restore(policy, i, i, 1, :infinity) end)
+
+      assert policy.restored_id == 12
+      assert {:done, 1, policy} = Policy.evict(policy)
+      assert :ets.lookup(table, 2) == []
+      assert Policy.lookup(policy, 2) == :error
+
+      # Key 2's own event, and a removal racing it, change nothing.
+      policy = Policy.on_write(policy, 2, 2, 1, :infinity)
+      policy = Policy.on_remove(policy, 2, 2)
+      assert Policy.lookup(policy, 2) == :error
+      assert Policy.count(policy) == 10
+      assert Policy.size(policy.sizes) == 10
+      assert Policy.weights(policy) == %{window: 0, probation: 10, protected: 0}
+
+      # An entry inserted before the scan ended that the scan did not see
+      # (its id is below the mark) is admitted, since the table holds it.
+      :ets.insert(table, entry(:late, 1))
+      policy = Policy.on_write(policy, :late, 1, 1, :infinity)
+      assert {:ok, {:late, 1, :window, _, 1, :infinity}} = Policy.lookup(policy, :late)
+
+      # Above the mark nothing is read from the table: a write after the
+      # rebuild is applied as before.
+      policy = Policy.on_write(policy, :fresh, 13, 1, :infinity)
+      assert {:ok, {:fresh, 13, :window, _, 1, :infinity}} = Policy.lookup(policy, :fresh)
+    end
+
+    test "the restored-id mark only rises", %{policy: policy} do
+      policy = Policy.restore(policy, :a, 9, 1, :infinity)
+      policy = Policy.restore(policy, :b, 4, 1, :infinity)
+      policy = Policy.restore(policy, :a, 20, 1, :infinity)
+      assert policy.restored_id == 9
+      assert bounded(10).restored_id == 0
+    end
   end
 
   describe "on_access/2" do

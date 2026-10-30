@@ -55,7 +55,11 @@ is the main structural concession to the BEAM.
 ### `on_write(key, id, weight, expires_at)`
 
 - If `key` is unknown: insert into `policy` and `ids`, place at window MRU,
-  `window_weight += weight`, `Sketch.increment(key)`.
+  `window_weight += weight`, `Sketch.increment(key)`. Except when `id` is
+  at or below the highest id `restore` admitted (`restored_id`) and the
+  entries table does not hold `key` under `id`: the event is ignored,
+  because that version was restored by the rebuild and has since been
+  removed (§Decisions M2.12).
 - If `key` is known with an older id: update `ids` (delete old id, insert
   new), update the `policy` row's id, weight and expires_at, adjust the
   segment weight by the delta, move to MRU of its current segment,
@@ -103,6 +107,8 @@ the **probation** MRU, `probation_weight += weight`, and no
 is a candidate for direct eviction (`candidates` is 0) until reads promote
 it. A key the policy already holds is left alone. Without a bound it is a
 plain row, as `on_write` of an unknown key would make (§Decisions M2.9).
+Each admitted id raises `restored_id`, which `on_write` consults
+(§Decisions M2.12).
 
 ### `evict()`
 
@@ -366,3 +372,31 @@ the window moves, and records the answer in §Decisions. Unbounded
   sample is counted from drained accesses and new-key `:put` events inside
   the maintenance process (§Adaptive window), so it adds nothing to the hit
   path and works with `stats: false`.
+- 2026-10-29 (M2.12): `on_write` of an unknown key checks the entries
+  table when `id <= restored_id`, the highest id `restore` admitted, and
+  ignores the event if the table does not hold `key` under `id`. The
+  stress test that kills the maintenance process under write load
+  (specs/04 §Acceptance restart) found the policy holding 19–23 rows with
+  no entry behind them once idle, all of them for keys written around the
+  kill. The race: a writer inserts K and its `:put` queues behind the
+  rebuild, the scan restores K cold into probation, the eviction after the
+  rebuild removes K from the table and the policy, and then K's queued
+  `:put` re-creates a row for a version that is gone. In steady state this
+  cannot happen, because a key's `:put` is how the policy first learns of
+  it and nothing can evict K before then; the rebuild is the one place
+  where the policy learns of an entry ahead of its event. Ids are
+  allocated from one counter before the insert (specs/01), so every entry
+  the scan saw has an id at or below `restored_id`, and only those events
+  can refer to a restored version. Above the mark the cost is one integer
+  comparison per new-key `:put`, and on a cache that never restarted the
+  mark is 0. At or below it the cost is one `:ets.lookup_element/4`. A
+  phantom row is not permanent in a bounded cache, because the eviction's
+  re-lookup drops it once it reaches the probation LRU. Until then the
+  cache holds that many fewer real entries than `max_size`, and the
+  policy's count is wrong, which specs/04 §Acceptance ("policy count equals
+  table size once idle") forbids. `reset/1` leaves the mark alone, so
+  events of entries cleared by `clear/1` that were restored earlier are
+  also checked; raising the mark to the id counter at `reset/1` would
+  close discovered issue 3 the same way, but that is not done here. The
+  adaptive window's sample (M2.13) counts new-key `:put` events as misses,
+  and an ignored event is not one.

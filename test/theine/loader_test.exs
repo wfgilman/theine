@@ -4,7 +4,9 @@ defmodule Theine.LoaderTest do
   specs/08 §Calls). Loaders that must overlap with other fetchers are
   gated: the claimant reports `{:loading, pid, key}` and blocks until the
   test sends `:go`, so a test can wait until every other fetcher has
-  registered as a waiter before the load completes.
+  registered as a waiter before the load completes. The waiter edge cases
+  stop a fetcher between two steps of the algorithm with
+  `Theine.Test.LoaderHook`, so each interleaving runs every time.
   """
 
   use ExUnit.Case, async: true
@@ -12,6 +14,7 @@ defmodule Theine.LoaderTest do
   import Theine.Test.Helpers
 
   alias Theine.{Config, Stats}
+  alias Theine.Test.LoaderHook
 
   setup do
     cache = unique_cache()
@@ -21,12 +24,15 @@ defmodule Theine.LoaderTest do
 
   # Starts `n` linked processes that each fetch `key` once and report
   # `{:fetched, pid, outcome}`; a raise, throw or exit in the caller is
-  # reported as `{:caught, kind, reason}`.
-  defp fetchers(cache, key, loader, n, opts \\ []) do
+  # reported as `{:caught, kind, reason}`. With `pause:` each arms that
+  # `Theine.Test.LoaderHook` point first.
+  defp fetchers(cache, key, loader, n, opts \\ [], pause \\ nil) do
     test = self()
 
     for _ <- 1..n do
       spawn_link(fn ->
+        if pause, do: LoaderHook.pause_at(pause, test)
+
         outcome =
           try do
             Theine.fetch(cache, key, loader, opts)
@@ -62,11 +68,31 @@ defmodule Theine.LoaderTest do
   # Waits until the claimant is loading and every other fetcher of the
   # claim is registered, then lets the load finish. Returns the claimant.
   defp release_when_waiting(cache, key, waiters) do
+    claimant = await_waiters(cache, key, waiters)
+    send(claimant, :go)
+    claimant
+  end
+
+  defp await_waiters(cache, key, waiters) do
     assert_receive {:loading, claimant, ^key}, 5000
     table = Config.get(cache).waiters
     assert_eventually(fn -> :ets.info(table, :size) == waiters end, 5000)
-    send(claimant, :go)
     claimant
+  end
+
+  # A gated loader that counts its calls in `calls`.
+  defp counted(calls, value) do
+    gated(fn ->
+      :counters.add(calls, 1, 1)
+      {:commit, value}
+    end)
+  end
+
+  defp kill(pid) do
+    Process.unlink(pid)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 5000
   end
 
   defp assert_loader_tables_empty(cache) do
@@ -175,6 +201,252 @@ defmodule Theine.LoaderTest do
 
       assert Theine.get(cache, :k) == :error
       assert_loader_tables_empty(cache)
+    end
+  end
+
+  describe "claimant death" do
+    test "claimant killed mid-load gives waiters {:error, {:load_failed, :killed}} and the next fetch claims successfully",
+         %{cache: cache} do
+      pids = fetchers(cache, :k, gated(fn -> {:commit, :never} end), 10)
+      claimant = await_waiters(cache, :k, 9)
+      kill(claimant)
+      outcomes = collect(pids -- [claimant])
+
+      assert outcomes |> Map.values() |> Enum.uniq() == [{:error, {:load_failed, :killed}}]
+      # The dead claim went with the first waiter's :DOWN.
+      assert_loader_tables_empty(cache)
+      assert Theine.get(cache, :k) == :error
+
+      assert Theine.fetch(cache, :k, fn _ -> {:commit, 1} end) == {:ok, 1}
+      assert_loader_tables_empty(cache)
+      # The killed load never completed.
+      assert %Stats{loads: 1, load_failures: 0} = Theine.stats(cache)
+    end
+
+    test "a claim left by a claimant killed with no waiters is reclaimed by the next fetch",
+         %{cache: cache} do
+      [claimant] = fetchers(cache, :k, gated(fn -> {:commit, :never} end), 1)
+      assert_receive {:loading, ^claimant, :k}, 5000
+      kill(claimant)
+      assert [{:k, ^claimant, _}] = :ets.tab2list(Config.get(cache).inflight)
+
+      # The fetch monitors the dead claimant, sees :noproc, drops the claim
+      # and claims the key itself.
+      assert Theine.fetch(cache, :k, fn _ -> {:commit, 1} end) == {:ok, 1}
+      assert Theine.get(cache, :k) == {:ok, 1}
+      assert_loader_tables_empty(cache)
+    end
+
+    test "a claimant killed after committing leaves waiters with the committed value",
+         %{cache: cache} do
+      test = self()
+
+      loader = fn key ->
+        send(test, {:loading, self(), key})
+
+        receive do
+          :commit -> :ok = Theine.put(cache, key, :committed)
+        end
+
+        send(test, :committed)
+
+        receive do
+          :go -> {:commit, :never}
+        end
+      end
+
+      pids = fetchers(cache, :k, loader, 5)
+      claimant = await_waiters(cache, :k, 4)
+      send(claimant, :commit)
+      assert_receive :committed, 5000
+      kill(claimant)
+
+      assert collect(pids -- [claimant]) |> Map.values() |> Enum.uniq() == [{:ok, :committed}]
+      assert_loader_tables_empty(cache)
+    end
+
+    test "a claimant that exits :normal after committing leaves waiters with the value",
+         %{cache: cache} do
+      # The library's claimant always notifies before it returns, so this
+      # one is played by hand: it holds a claim, commits, and exits without
+      # releasing or notifying.
+      claimant =
+        spawn(fn ->
+          receive do
+            :commit -> :ok = Theine.put(cache, :k, :committed)
+          end
+        end)
+
+      true = :ets.insert_new(Config.get(cache).inflight, {:k, claimant, make_ref()})
+      pids = fetchers(cache, :k, fn _ -> flunk("loader called") end, 5)
+      assert_eventually(fn -> :ets.info(Config.get(cache).waiters, :size) == 5 end, 5000)
+      send(claimant, :commit)
+
+      assert collect(pids) |> Map.values() |> Enum.uniq() == [{:ok, :committed}]
+      assert_loader_tables_empty(cache)
+    end
+
+    test "a claimant that exits :normal without committing sends its waiters to load once",
+         %{cache: cache} do
+      claimant =
+        spawn(fn ->
+          receive do
+            :exit -> :ok
+          end
+        end)
+
+      true = :ets.insert_new(Config.get(cache).inflight, {:k, claimant, make_ref()})
+      calls = :counters.new(1, [])
+
+      loader = fn _ ->
+        :counters.add(calls, 1, 1)
+        {:commit, :loaded}
+      end
+
+      pids = fetchers(cache, :k, loader, 20)
+      assert_eventually(fn -> :ets.info(Config.get(cache).waiters, :size) == 20 end, 5000)
+      send(claimant, :exit)
+
+      assert collect(pids) |> Map.values() |> Enum.uniq() == [{:ok, :loaded}]
+      assert :counters.get(calls, 1) == 1
+      assert_loader_tables_empty(cache)
+    end
+  end
+
+  describe "timeout" do
+    test "a waiter with timeout: 10 and a 100 ms loader returns {:error, :timeout} and leaves no waiter row",
+         %{cache: cache} do
+      test = self()
+
+      loader = fn key ->
+        send(test, {:loading, self(), key})
+        Process.sleep(100)
+        {:commit, :slow}
+      end
+
+      [claimant] = fetchers(cache, :k, loader, 1)
+      assert_receive {:loading, ^claimant, :k}, 5000
+
+      # This process is the waiter.
+      assert Theine.fetch(cache, :k, loader, timeout: 10) == {:error, :timeout}
+      assert :ets.tab2list(Config.get(cache).waiters) == []
+
+      assert collect([claimant]) == %{claimant => {:ok, :slow}}
+      # The claimant has released and notified (its :fetched follows any
+      # notification to this process), and none arrived.
+      refute_received {:theine_loaded, _, _}
+      refute_received {:DOWN, _, _, _, _}
+      assert_loader_tables_empty(cache)
+    end
+
+    test "a notification sent to a timed-out waiter's alias is dropped", %{cache: cache} do
+      test = self()
+      [claimant] = fetchers(cache, :k, gated(fn -> {:commit, :v} end), 1)
+      assert_receive {:loading, ^claimant, :k}, 5000
+
+      waiter =
+        spawn_link(fn ->
+          LoaderHook.pause_at(:registered, test)
+          send(test, {:fetched, self(), Theine.fetch(cache, :k, & &1, timeout: 10)})
+
+          receive do
+            :report -> send(test, {:mailbox, self(), Process.info(self(), :messages)})
+          end
+        end)
+
+      assert_receive {:paused, ^waiter, :registered, :k}, 5000
+      [{{:k, _}, ^waiter, mon}] = :ets.tab2list(Config.get(cache).waiters)
+      LoaderHook.resume(waiter)
+      assert_receive {:fetched, ^waiter, {:error, :timeout}}, 5000
+
+      # What a claimant that read the row just before the waiter deleted it
+      # would send, arriving after the waiter gave up.
+      send(mon, {:theine_loaded, mon, {:ok, :late}})
+      send(claimant, :go)
+      assert collect([claimant]) == %{claimant => {:ok, :v}}
+
+      send(waiter, :report)
+      assert_receive {:mailbox, ^waiter, {:messages, []}}, 5000
+    end
+
+    test "a waiter whose timeout fires as the claimant notifies returns the value",
+         %{cache: cache} do
+      [claimant] = fetchers(cache, :k, gated(fn -> {:commit, :v} end), 1)
+      assert_receive {:loading, ^claimant, :k}, 5000
+      [waiter] = fetchers(cache, :k, & &1, 1, [timeout: 10], :timed_out)
+      assert_receive {:paused, ^waiter, :timed_out, :k}, 5000
+
+      # The waiter's row is still in place, so the claimant notifies it.
+      send(claimant, :go)
+      assert collect([claimant]) == %{claimant => {:ok, :v}}
+
+      LoaderHook.resume(waiter)
+      assert collect([waiter]) == %{waiter => {:ok, :v}}
+      assert_loader_tables_empty(cache)
+    end
+  end
+
+  describe "late registration" do
+    setup %{cache: cache} do
+      calls = :counters.new(1, [])
+      [claimant] = fetchers(cache, :k, counted(calls, :v), 1)
+      assert_receive {:loading, ^claimant, :k}, 5000
+      %{calls: calls, claimant: claimant}
+    end
+
+    # Starts a second fetcher paused at `point`, lets the claimant finish,
+    # then resumes the fetcher and returns its outcome.
+    defp finish_claimant_while_paused(cache, claimant, calls, point) do
+      [fetcher] = fetchers(cache, :k, counted(calls, :again), 1, [], point)
+      assert_receive {:paused, ^fetcher, ^point, :k}, 5000
+
+      send(claimant, :go)
+      assert collect([claimant]) == %{claimant => {:ok, :v}}
+
+      LoaderHook.resume(fetcher)
+      refute_receive {:loading, ^fetcher, :k}, 50
+      collect([fetcher])[fetcher]
+    end
+
+    test "a waiter registering after the claimant's release retries and hits the committed value",
+         %{cache: cache, calls: calls, claimant: claimant} do
+      # Monitoring the claimant, row not yet inserted: the release reads no
+      # row for it, the double-check finds the claim gone, the retry hits.
+      assert finish_claimant_while_paused(cache, claimant, calls, :monitored) == {:ok, :v}
+      assert :counters.get(calls, 1) == 1
+      assert_loader_tables_empty(cache)
+      # The waiter's retry is its second get.
+      assert %Stats{hits: 1, misses: 2, loads: 1} = Theine.stats(cache)
+    end
+
+    test "a waiter that registered before the release but double-checks after it takes the notification",
+         %{cache: cache, calls: calls, claimant: claimant} do
+      assert finish_claimant_while_paused(cache, claimant, calls, :registered) == {:ok, :v}
+      assert :counters.get(calls, 1) == 1
+      assert_loader_tables_empty(cache)
+      # Answered from the mailbox: no second get.
+      assert %Stats{hits: 0, misses: 2, loads: 1} = Theine.stats(cache)
+      refute_received {:theine_loaded, _, _}
+    end
+
+    test "a fetcher whose claim lost to a claimant that then finished retries and hits",
+         %{cache: cache, calls: calls, claimant: claimant} do
+      # The claim failed while the claimant held the key; the lookup after
+      # its release finds no claimant.
+      assert finish_claimant_while_paused(cache, claimant, calls, :claim_lost) == {:ok, :v}
+      assert :counters.get(calls, 1) == 1
+      assert_loader_tables_empty(cache)
+      assert %Stats{hits: 1, misses: 2, loads: 1} = Theine.stats(cache)
+    end
+
+    test "a fetcher that missed before the commit and claims after the release does not load again",
+         %{cache: cache, calls: calls, claimant: claimant} do
+      # Its insert_new succeeds once the claim is released; the claimant's
+      # value is in the table by then.
+      assert finish_claimant_while_paused(cache, claimant, calls, :claim) == {:ok, :v}
+      assert :counters.get(calls, 1) == 1
+      assert_loader_tables_empty(cache)
+      assert %Stats{loads: 1} = Theine.stats(cache)
     end
   end
 

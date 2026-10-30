@@ -18,6 +18,9 @@ defmodule Theine.Loader do
   value on `:commit`, then releases the claim *before* it reads the waiter
   rows, so a waiter that still sees the claim after registering is
   certain to be notified, and one that does not falls through to a retry.
+  A process that wins the claim looks the key up once more before it
+  loads, because the previous claimant may have committed and released
+  between this process's miss and its claim.
 
   The monitor is an alias monitor (`alias: :demonitor`) and the claimant
   sends to the alias, so a waiter that gave up (timeout) and demonitored
@@ -66,6 +69,21 @@ defmodule Theine.Loader do
   @max_attempts 3
 
   @default_timeout 5000
+
+  # The test build pauses a fetcher between the steps of the algorithm, so
+  # that tests can interleave a claimant and a waiter deterministically
+  # (specs/07 §Decisions M4.2). `config/test.exs` sets
+  # `loader_hook: Theine.Test.LoaderHook`; every other build compiles
+  # `pause/2` to `:ok`, as `Theine.Clock` compiles to the BIF.
+  @hook Application.compile_env(:theine, :loader_hook, nil)
+
+  if @hook do
+    defmacrop pause(point, key) do
+      quote do: unquote(@hook).pause(unquote(point), unquote(key))
+    end
+  else
+    defmacrop pause(_point, _key), do: :ok
+  end
 
   @doc """
   `Theine.fetch/4`: the value of `key`, loaded with `loader` (or the
@@ -120,10 +138,13 @@ defmodule Theine.Loader do
   # it finished between the two lookups.
   defp claim_or_wait(%Config{inflight: inflight} = config, key, loader, timeout, attempts) do
     ref = make_ref()
+    pause(:claim, key)
 
     if :ets.insert_new(inflight, {key, self(), ref}) do
       claim(config, key, loader, ref)
     else
+      pause(:claim_lost, key)
+
       case :ets.lookup(inflight, key) do
         [{_, pid, claim_ref}] -> wait(config, key, loader, timeout, attempts, pid, claim_ref)
         [] -> retry(config, key, loader, timeout, attempts)
@@ -139,8 +160,10 @@ defmodule Theine.Loader do
   defp wait(config, key, loader, timeout, attempts, pid, ref) do
     %Config{inflight: inflight, waiters: waiters} = config
     mon = :erlang.monitor(:process, pid, alias: :demonitor)
+    pause(:monitored, key)
     row = {{key, ref}, self(), mon}
     true = :ets.insert(waiters, row)
+    pause(:registered, key)
 
     case :ets.lookup(inflight, key) do
       [{_, ^pid, ^ref}] ->
@@ -186,6 +209,7 @@ defmodule Theine.Loader do
         end
     after
       timeout ->
+        pause(:timed_out, key)
         true = :ets.delete_object(waiters, row)
         # Deactivates the alias: a notification sent from now on is dropped.
         Process.demonitor(mon, [:flush])
@@ -216,8 +240,16 @@ defmodule Theine.Loader do
   # Load, as the claimant: release the claim, then notify the waiters
   # registered on it, whatever the loader did. A failure is re-raised here
   # with its original kind and stacktrace, as from any function call.
+  #
+  # The claim is checked against the table first: a claimant that finished
+  # between this process's miss and its `insert_new` has committed and
+  # released, and loading again would break exactly-once (specs/07
+  # §Decisions M4.2).
   defp claim(config, key, loader, ref) do
-    run(config, key, loader)
+    case Entry.peek(config, key) do
+      {:ok, _} = hit -> hit
+      :error -> run(config, key, loader)
+    end
   catch
     kind, reason ->
       stack = __STACKTRACE__

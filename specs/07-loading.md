@@ -58,7 +58,9 @@ fetch(cache, key, loader, opts):
 **claim_or_wait**:
 
 1. `ref = make_ref()`. If `:ets.insert_new(inflight, {key, self(), ref})`
-   succeeds, this process is the **claimant**; go to *Load*.
+   succeeds, this process is the **claimant**; go to *Load*, which first
+   looks the key up again (a previous claimant may have committed and
+   released since this process missed).
 2. Otherwise `[{^key, pid, ref}] = :ets.lookup(inflight, key)` (if the
    lookup is empty the claimant already finished: go to step 6).
    `mon = :erlang.monitor(:process, pid, alias: :demonitor)`. Insert
@@ -96,11 +98,14 @@ fetch(cache, key, loader, opts):
 
 ```
 try
-  result = loader.(key)
-  case result:
-    {:commit, v}       -> put(cache, key, v);         reply = {:ok, v}
-    {:commit, v, opts} -> put(cache, key, v, opts);   reply = {:ok, v}
-    {:ignore, v}       ->                             reply = {:ok, v}
+  if the table holds a live entry for key with value v:  # no stats, no read record
+    reply = {:ok, v}                                      # committed since our miss
+  else
+    result = loader.(key)
+    case result:
+      {:commit, v}       -> put(cache, key, v);         reply = {:ok, v}
+      {:commit, v, opts} -> put(cache, key, v, opts);   reply = {:ok, v}
+      {:ignore, v}       ->                             reply = {:ok, v}
   reply
 after
   :ets.delete_object(inflight, {key, self(), ref})  # 1. release the claim
@@ -239,3 +244,31 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
   (`bench/results/config-keys-m41.exs`, `+S 2`) measured 262/326 ns
   (unbounded/bounded) before and 256/311 ns after, the same within the
   probe's wander. The config was already past the 32-key flatmap limit.
+- 2026-10-29 (M4.2): the claimant looks the key up again before it loads.
+  As first written, step 1 broke exactly-once: a fetcher whose `get`
+  missed while another claimant was loading, and whose `insert_new` ran
+  after that claimant had committed and released, won a fresh claim and
+  ran the loader a second time. Caffeine's `compute` cannot do this,
+  because the map bin is locked across the check and the load. The
+  window is a few calls wide and needs the fetcher to be descheduled
+  inside it: 300 rounds of 500 racing fetchers never hit it. The paused
+  interleaving below hits it every time. The recheck is
+  `Theine.Entry.peek/2`, one `:ets.lookup` with no stats, no read-buffer
+  record and no expired delete, so the fetch counts one miss, as a waiter
+  does. On a live value the claimant releases with `{:ok, v}` (waiters
+  that registered on its claim receive it) and loads nothing: no
+  telemetry, no `loads`. A value the previous claimant returned with
+  `{:ignore, v}` is not in the table, so it is loaded again, as it would
+  be on any later miss.
+- 2026-10-29 (M4.2): the waiter edge cases are tested at fixed
+  interleavings, not by racing. `Theine.Loader` calls a `pause(point,
+  key)` macro between the steps (`:claim` before the `insert_new`,
+  `:claim_lost` before step 2's lookup, `:monitored` and `:registered`
+  around the waiter-row insert, `:timed_out` before the timed-out
+  waiter's cleanup). The test build sets `config :theine, loader_hook:
+  Theine.Test.LoaderHook`, which stops a fetcher that armed the point.
+  Every other build compiles the macro to `:ok`, chosen once by
+  `Application.compile_env/3`, as `Theine.Clock` does for the clock
+  (specs/06 §Clock). Without the seam, the step-3 double-check branches,
+  step 1's empty lookup and the late notification after a timeout run
+  only by chance. M5.2 needs every one of those lines covered.

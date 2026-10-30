@@ -238,6 +238,26 @@ defmodule Theine.Entry do
   end
 
   @doc """
+  The value of a live entry, `{:ok, value}`, else `:error`, with none of a
+  read's side effects: no stats, no read-buffer record, and an expired
+  entry is left in place. The loader's claimant uses it to check for a
+  value committed while it was claiming (specs/07 §Decisions M4.2).
+  """
+  @spec peek(Config.t(), key()) :: {:ok, value()} | :error
+  def peek(%Config{} = config, key) do
+    case :ets.lookup(config.table, key) do
+      [{_, value, _, _, _, :infinity}] ->
+        {:ok, value}
+
+      [{_, value, _, _, _, at}] ->
+        if Theine.Clock.now(config.name) < at, do: {:ok, value}, else: :error
+
+      [] ->
+        :error
+    end
+  end
+
+  @doc """
   `Theine.ttl/2` (specs/06 §Semantics): `{:ok, ms}` left before a live
   entry expires, `{:ok, :infinity}` for one that never does, `:error` for
   an absent or expired key. A read of one element: it neither removes an

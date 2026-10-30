@@ -31,6 +31,10 @@ removed.
   calls (specs/01 tracing test).
 - `Theine.Test.Policy`: an instrumented policy that records call order
   (specs/04 order test), injected via a test-only config field.
+- `Theine.Test.LoaderHook`: pause points between the steps of the
+  single-flight algorithm, armed per fetching process with
+  `pause_at(point, notify)` and released with `resume(pid)`; compiled into
+  `Theine.Loader` by the test build only (specs/07 §Decisions M4.2).
 - `assert_eventually(fun, timeout \\ 1000)`.
 - `spawn_on_scheduler(n, fun)` using `spawn_opt` with `{:scheduler, n}`.
 

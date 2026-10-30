@@ -80,8 +80,11 @@ test/                         mirrors lib/; test/support for shared helpers
   p99 at n=1000 tuple3 parallel=1 wanders by ±0.1× between runs of the same
   tree, flags or not, and has crossed the A1 limit three times (M1.5, M1.6).
   If that is the only failed check, re-run `--sizes 1000` on the same tree;
-  a pass there clears it (specs/09 §Decisions M1.6). The full run takes
-  about 12 minutes, the `--sizes 1000` run about 3.
+  a pass there clears it (specs/09 §Decisions M1.6). The full run (get and
+  put, six subjects, M5.1) takes about 15 minutes; `--scenarios get` drops
+  the put runs, which no hot-path read change needs. The bench starts one
+  subject at a time; a probe that keeps a Cachex or Nebulex cache alive
+  beside theine picks up their timers and Nebulex's generation deletion.
 - To cost a hit-path change before the 12-minute bench, time `Theine.get/2`
   in a compiled module (a `defmodule` in an `.exs` run with
   `mise exec -- env ERL_FLAGS=... mix run script.exs`; anonymous funs in

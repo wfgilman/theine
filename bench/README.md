@@ -67,14 +67,14 @@ readers from contending on one refcount.
 Shapes: `n` in 1 000, 100 000, 1 000 000; both value kinds; `parallel` 1 and
 `System.schedulers_online()`. Warm-up 2 s, measurement 10 s per scenario.
 
-Extra `system` fields: `warmup_s`, `time_s`, `sizes`, `parallel` (list),
+Extra `system` fields: `warmup_s`, `time_s`, `sizes`, `scenarios` (list), `parallel` (list),
 `zipf_s`, `missing_erl_flags` (list).
 
 Each `results` row:
 
 | field | type | meaning |
 |---|---|---|
-| `scenario` | string | `"get"` (M5.1 adds `"put"`) |
+| `scenario` | string | `"get"` or `"put"` |
 | `subject` | string | `ets`, `theine`, `theine_unbounded`, `theine_nostats`, `cachex`, `nebulex` |
 | `n` | integer | entries pre-populated |
 | `value` | string | `"tuple3"` or `"binary_1kb"` |
@@ -83,19 +83,39 @@ Each `results` row:
 | `average_ns` | number | mean latency, ns |
 | `ips` | number | Benchee ips: 1 / mean latency, i.e. **per process**; multiply by `parallel` for aggregate throughput. Ratios are unaffected |
 | `sample_size` | integer | samples behind the statistics (Benchee caps at 1M per process) |
-| `ratio_to_ets` | object | `p50`, `p99`, `ips` divided by the `ets` row of the same shape |
+| `ratio_to_ets` | object | `p50`, `p99`, `ips` divided by the `ets` row of the same scenario and shape |
 
 Subjects: `ets` is the floor; `theine` is bounded at `max_size: n` with
 the policy on (every hit records into the read buffer, which the
 maintenance process drains while the readers run); `theine_unbounded` is
 `max_size: :infinity`; `theine_nostats` is bounded with `stats: false` and
-is reported for information only. `cachex` and `nebulex` arrive in M5.1.
+is reported for information only. `cachex` is Cachex 4 bounded by the
+`Cachex.Limit.Scheduled` hook at `n` with default options (least recently
+written, pruned every 3 s once over `n`). `nebulex` is Nebulex 3's local
+adapter (`Theine.Bench.NebulexCache`, in `bench/lib`) with `max_size: n`
+and its defaults otherwise; it rotates generations when a size check
+(every 10 s) finds `size >= n`, so it rotates during the run.
 
-Thresholds (specs/09). They are evaluated for `theine` and `theine_unbounded`.
+Each subject is populated, measured and torn down before the next one
+starts (one Benchee job per suite), so no subject's background work runs
+while another is measured; ratios still compare rows of the same run.
+
+The `put` scenario runs after the subject's `get` runs, on the same
+populated subject: `ets` (`:ets.insert/2`), `theine`, `cachex`,
+`nebulex`. `--scenarios get` (or `put`) runs one of the two. Its inputs are `{key, value}` pairs pre-drawn like the `get`
+keys, each key's value the one it already holds, so every subject stays at
+`n` entries. The puts are sustained for the whole measurement, so the
+`theine` figure includes the time writers spend blocked above `write_hwm`
+(specs/03 §Delivery with backpressure).
+
+Thresholds (specs/09). The `get` ones are evaluated for `theine` and
+`theine_unbounded`.
 
 - A1: `p50/ets <= 1.5` and `p99/ets <= 1.5`, every shape.
 - A2: `ips/ets >= 0.65` at full parallelism; `ips / cachex ips >= 2` and
-  `ips / nebulex ips >= 2` at full parallelism when those subjects exist.
+  `ips / nebulex ips >= 2` at full parallelism.
+- put (id `"put"`): `theine` put `ips/ets >= 0.5`, every shape and both
+  parallelisms.
 
 ## `hitrate` (A3)
 

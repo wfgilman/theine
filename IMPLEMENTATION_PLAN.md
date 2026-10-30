@@ -86,9 +86,10 @@ Done: M4.1, M4.2, M4.3, M4.4, M4.4b, M4.5. M4 complete.
 
 ## M5 Gate
 
-Done: nothing yet.
+Done: M5.1 (harness; the put threshold is M5.1b, blocked on open question 2).
 
-- [ ] M5.1 `mix bench get` Cachex and Nebulex subjects and the `put` scenario (specs/09 §`mix bench get` subjects table and put paragraph): `cachex`, `nebulex` and `nebulex_local` as dev-only deps per AGENTS.md, `put` scenario for `theine` vs `ets` insert vs Cachex vs Nebulex — outcome: `mix bench get` exits 0 with `theine` ips ≥ 2 × `cachex` and ≥ 2 × `nebulex` at full parallelism (A2) and `theine` put ips ≥ 0.5 × `ets` insert ips; table pasted under §Benchmark log.
+- [x] M5.1 `mix bench get` Cachex and Nebulex subjects and the `put` scenario (specs/09 §`mix bench get` subjects table and put paragraph): `cachex`, `nebulex` and `nebulex_local` as dev-only deps per AGENTS.md, `put` scenario for `theine` vs `ets` insert vs Cachex vs Nebulex — outcome: `mix bench get` exits 0 with `theine` ips ≥ 2 × `cachex` and ≥ 2 × `nebulex` at full parallelism (A2) and `theine` put ips ≥ 0.5 × `ets` insert ips; table pasted under §Benchmark log. Harness met, outcome not: `lib/` unchanged. Cachex 4.1.1 (bounded by the `Cachex.Limit.Scheduled` hook, its size option being a hook since 4.0), Nebulex 3.1.0 with `nebulex_local` 3.1.0 (`Theine.Bench.NebulexCache` in `bench/lib`), every subject populated, measured and torn down alone, the put scenario on overwrites, `--scenarios get` to skip it (specs/09 §Decisions M5.1). `theine` ≥ 2 × `nebulex` passes on every shape (5–7×). `theine` ≥ 2 × `cachex` fails on every shape for the bounded subject (1.78–1.92×), which is the recorded bounded-hit floor of specs/09 §Decisions M2.8d and not a new cost; the final gate records it with the other floor rows. `theine_unbounded` passes it on five shapes and sat at 1.99 on the sixth (2.03 in the first run). The put threshold fails on every shape at 0.03–0.19× and cannot be met under specs/03's one-message-per-write design: one `send/2` alone costs more than the insert on this machine (open question 2, M5.1b).
+- [ ] M5.1b **(hot path)** The `put` threshold of specs/09, once open question 2 is settled: blocked until a human answers it. If the 0.5× limit stands, this is a write-path redesign that changes specs/03 (writes not sending one message each) and must keep A5's bound; if the threshold is restated, this task makes `mix bench get` evaluate the restated check and meets it — outcome: the put check(s) of specs/09 pass in a full `mix bench get`, table under §Benchmark log. M5.2–M5.5 do not depend on it; M5.6 does.
 - [ ] M5.2 Coverage floor for `Theine.Loader` and `Theine.Policy` (specs/10 §Coverage): add the tests needed for 100% line coverage of both modules, `mix test --cover` reported in CI output — outcome: `mix test --cover` shows 100% lines for `Theine.Loader` and `Theine.Policy`.
 - [ ] M5.3 Documentation (specs/08 §Documentation; specs/00 §Mapping to Caffeine): `@doc` with an example on every public function, every option documented in `start_link/1`, module doc noting the per-start `persistent_term` write, `ex_doc` as a dev-only dep (allowed by AGENTS.md), README with the Caffeine mapping table — outcome: `mix docs` runs without warnings and every function in the specs/08 §Calls table has a doctest or unit test for each return shape.
 - [ ] M5.4 Package hygiene and hex build (specs/00 A6; specs/10 §Gates step 7): package metadata, `files:` excluding `bench/`, `test/`, `specs/` and the dev-only Mix task — outcome: `mix hex.build` succeeds and the tarball listing contains no `.so`, no bench or test files, and no NIF/port/make dependency in `mix.exs`.
@@ -107,7 +108,7 @@ Done: nothing yet.
 ## Discovered issues
 
 
-1. **`nebulex_local` availability.** Nebulex 3 splits the local adapter into its own package; the exact package name and the Nebulex major it pairs with must be confirmed on Hex in M5.1 before the dep is added.
+1. **`nebulex_local` availability** (resolved in M5.1). Nebulex 3 splits the local adapter into its own package: `nebulex_local` 3.1.0 pairs with `nebulex` 3.1.0 on Hex (both 2026-10-18), and both are dev-only deps.
 2. **Concurrent writes to one key can leave the policy with the wrong id** (found in M1.2, resolved in M1.5). `put/4` allocates the id before the insert, and the write event is sent after it, so two writers racing on one key can produce any interleaving of (insert, send) pairs: the entries table may end with the lower id while the policy applies the higher id's event last, or vice versa. The spec's rules (last `:put` event wins; `on_remove` ignores a stale id) then left a policy row whose id never matched the table; in an unbounded cache `size/1` drifted by one and `delete/2` could not clear the row. Resolved as recommended (specs/05 §Decisions 2026-10-27 M1.5): `on_remove(key, id)` with a non-matching id does one `:ets.member/2` on the entries table and drops the row when the key is absent; when the key is present with a third id, the row stays and that id's `:put` corrects it. Tested in policy_test, maintenance_test and the 200-round race in theine_test. Since M3.2 a lower id's `:put` arriving after a higher id's is applied only while the table holds it, so one direction of the reorder no longer leaves the row on a stale id (specs/05 §Decisions M3.2).
 3. **A write that straddles `clear/1` can leave a policy row with no entry** (noted in M1.5, not fixed). A writer that inserted before `:ets.delete_all_objects/1` and whose `:put` event is consumed after `Maintenance.reset/1` re-adds a policy row for a key the table no longer holds. No later event for that key arrives on its own (a `delete/2` of an absent key sends nothing), so in an unbounded cache the row lives until a `put` of the same key or a Maintenance restart rebuild (M2.9). In a bounded cache the eviction re-lookup drops it. The window is a few microseconds per `clear/1` and the cost is one phantom entry in `size/1`; the spec accepts it (specs/01 §Write path `clear/1`). If it matters later, `reset/1` could record the `ids` high-water mark and `on_write` ignore `:put` events with a lower id until the table confirms the key.
 
@@ -135,6 +136,11 @@ Done: nothing yet.
 
 1. **Resolved 2026-10-29 by a human** (specs/00, 05, 08, 09 §Decisions): the +10 margin is on `loop` 1_000 only; `theine ≥ lru` stays on every row, OLTP included, and is met by the adaptive window, now on by default (M2.13); a `theine_static` subject with `theine ≥ theine_static − 1` on every row keeps the climber honest; the human gate compares `theine` with Caffeine's `HillClimberWindowTinyLfu` (`simple`) and `theine_static` with `WindowTinyLfu`.
 
+2. **Open (raised 2026-10-29 in M5.1): the `put` threshold of specs/09 cannot be met by the write path specs/03 prescribes.** specs/09 asks `theine` put ips ≥ 0.5 × `ets` insert ips and prices a write as "an insert, an id allocation and a message send". The isolated `mix bench get` run with the put scenario measured 0.14–0.19× at parallel 1 and 0.03–0.06× at parallel 4 on every shape. Cachex's put was 0.32–0.42× and Nebulex's 0.06–0.12× in the same run. A compiled probe (specs/09 §Decisions M5.1) puts the floor in the design, not the code. One `send/2` of the event costs 290–330 ns, even to a suspended process, against a 145–214 ns insert, so insert plus send alone is 2.4–3.5× an insert. `Theine.put/3` is 4–5× with no consumer running, and 17–21× sustained, because a writer that outruns the one maintenance process blocks above `write_hwm` (specs/03 §Delivery with backpressure, which A5's bound rests on). The threshold stands until a human changes it. Choices:
+   - (a) Keep 0.5×. That needs writes that do not each send a message, for example a striped lossless write buffer over ETS or `:atomics` that the maintenance process drains, as Caffeine's write buffer is drained. This rewrites specs/03 §Write events and the A5 argument, and is several tasks, not M5.1b alone.
+   - (b) Restate the check as one the design can meet and that still catches a write-path regression. **Recommended:** make put informational against `ets`, and gate it against the rivals: `theine` put ips ≥ `cachex` put ips at parallel 1. Theine was 0.41–0.53× of Cachex there in this run, and 0.10–0.15× at parallel 4, so this check fails today too. Add a task that cuts the maintenance process's cost per write event and the backpressure round trip, measured by `mix bench maintenance`'s write run.
+   - (c) Restate it as a caller-cost check in bursts under `write_hwm` (`put` p50 ≤ k × insert p50). This measures what the parenthetical prices, but needs a k from a human. The probe has bursts at 5.8–8.5× with the consumer running.
+
 Earlier: M0.4b was done by hand on 2026-10-27, so `mix bench hitrate`
 runs every trace and policy tasks must run it in full, not with
 `--traces loop,zipf`.
@@ -149,6 +155,164 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M5.1 — `mix bench get` with `cachex`, `nebulex` and the put scenario, and a compiled put probe, tree of the M5.1 commit (2026-10-29, 61/96 in the isolated full run, 64/96 in the first; `lib/` unchanged)
+
+Both runs were on the uncommitted tree, so the result file is
+`get-c1f3b06.json`, the second overwriting the first. Both used `+sbt db
++sbwt very_long`. The first run kept all six subjects alive for a whole
+shape. Its `theine` p50 at n=1000000 tuple3 parallel 1 was 2.12×, which
+fits Nebulex's generation work landing in `theine`'s window. The harness
+now populates, measures and tears down one subject at a time (specs/09
+§Decisions M5.1), and that row came back at 1.48×. The isolated run took
+15 minutes.
+
+The 35 failures are 12 of A1 and 11 of A2 on the get rows, and 12 of put.
+The A1 and A2 `ets` failures are the bounded floor of specs/09 §Decisions
+M2.8d, at its shapes and ratios. Two of them are `theine_unbounded`
+borderline rows: A2 0.64 at n=1000 tuple3 parallel 4 (0.65 in M3.2) and
+1.99 against `cachex` at n=1000000 binary_1kb parallel 4. The six bounded
+`cachex` failures (1.78–1.92) follow from the same floor. Every
+`nebulex` check passes at 5–7×. The 12 put failures are open question 2.
+
+| scenario | n | value | parallel | subject | p50 ns | p99 ns | ips | p50/ets | p99/ets | ips/ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| get | 1000 | tuple3 | 1 | ets | 262.00 | 424.00 | 3624555 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | tuple3 | 4 | ets | 398.00 | 600.00 | 2410180 | 1.00 | 1.00 | 1.00 |
+| put | 1000 | tuple3 | 1 | ets | 363.00 | 646.00 | 2652178 | 1.00 | 1.00 | 1.00 |
+| put | 1000 | tuple3 | 4 | ets | 587.00 | 1024.00 | 1427069 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | tuple3 | 1 | theine | 381.00 | 638.00 | 2185935 | 1.45 | 1.50 | 0.60 |
+| get | 1000 | tuple3 | 4 | theine | 628.00 | 905.00 | 1327624 | 1.58 | 1.51 | 0.55 |
+| put | 1000 | tuple3 | 1 | theine | 1146.00 | 2286.00 | 425159 | 3.16 | 3.54 | 0.16 |
+| put | 1000 | tuple3 | 4 | theine | 1895.00 | 5782.90 | 56997 | 3.23 | 5.65 | 0.04 |
+| get | 1000 | tuple3 | 1 | theine_unbounded | 332.00 | 574.00 | 2658489 | 1.27 | 1.35 | 0.73 |
+| get | 1000 | tuple3 | 4 | theine_unbounded | 568.00 | 804.00 | 1554386 | 1.43 | 1.34 | 0.64 |
+| get | 1000 | tuple3 | 1 | theine_nostats | 373.00 | 596.00 | 2212411 | 1.42 | 1.41 | 0.61 |
+| get | 1000 | tuple3 | 4 | theine_nostats | 606.00 | 891.00 | 1360717 | 1.52 | 1.49 | 0.56 |
+| get | 1000 | tuple3 | 1 | cachex | 813.00 | 1514.00 | 1136923 | 3.10 | 3.57 | 0.31 |
+| get | 1000 | tuple3 | 4 | cachex | 1308.00 | 2088.00 | 697310 | 3.29 | 3.48 | 0.29 |
+| put | 1000 | tuple3 | 1 | cachex | 1039.00 | 1779.00 | 854105 | 2.86 | 2.75 | 0.32 |
+| put | 1000 | tuple3 | 4 | cachex | 1686.00 | 3185.00 | 503120 | 2.87 | 3.11 | 0.35 |
+| get | 1000 | tuple3 | 1 | nebulex | 2041.00 | 3649.99 | 437681 | 7.79 | 8.61 | 0.12 |
+| get | 1000 | tuple3 | 4 | nebulex | 3885.00 | 6204.00 | 224294 | 9.76 | 10.34 | 0.09 |
+| put | 1000 | tuple3 | 1 | nebulex | 2837.00 | 5748.00 | 308958 | 7.82 | 8.90 | 0.12 |
+| put | 1000 | tuple3 | 4 | nebulex | 5254.00 | 12045.00 | 162547 | 8.95 | 11.76 | 0.11 |
+| get | 1000 | binary_1kb | 1 | ets | 270.00 | 437.00 | 3001592 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | binary_1kb | 4 | ets | 429.00 | 703.00 | 1897030 | 1.00 | 1.00 | 1.00 |
+| put | 1000 | binary_1kb | 1 | ets | 444.00 | 668.00 | 2237211 | 1.00 | 1.00 | 1.00 |
+| put | 1000 | binary_1kb | 4 | ets | 724.00 | 1733.00 | 883930 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | binary_1kb | 1 | theine | 401.00 | 664.00 | 2060457 | 1.49 | 1.52 | 0.69 |
+| get | 1000 | binary_1kb | 4 | theine | 659.00 | 1068.00 | 1279734 | 1.54 | 1.52 | 0.67 |
+| put | 1000 | binary_1kb | 1 | theine | 1291.00 | 2516.00 | 429845 | 2.91 | 3.77 | 0.19 |
+| put | 1000 | binary_1kb | 4 | theine | 2029.00 | 6678.00 | 56264 | 2.80 | 3.85 | 0.06 |
+| get | 1000 | binary_1kb | 1 | theine_unbounded | 354.00 | 524.00 | 2414911 | 1.31 | 1.20 | 0.80 |
+| get | 1000 | binary_1kb | 4 | theine_unbounded | 600.00 | 871.00 | 1407347 | 1.40 | 1.24 | 0.74 |
+| get | 1000 | binary_1kb | 1 | theine_nostats | 400.00 | 644.00 | 2073781 | 1.48 | 1.47 | 0.69 |
+| get | 1000 | binary_1kb | 4 | theine_nostats | 648.00 | 1009.00 | 1291568 | 1.51 | 1.44 | 0.68 |
+| get | 1000 | binary_1kb | 1 | cachex | 830.00 | 1303.00 | 1102730 | 3.07 | 2.98 | 0.37 |
+| get | 1000 | binary_1kb | 4 | cachex | 1353.00 | 2293.00 | 665925 | 3.15 | 3.26 | 0.35 |
+| put | 1000 | binary_1kb | 1 | cachex | 1134.00 | 2020.00 | 804057 | 2.55 | 3.02 | 0.36 |
+| put | 1000 | binary_1kb | 4 | cachex | 1836.00 | 4037.00 | 374909 | 2.54 | 2.33 | 0.42 |
+| get | 1000 | binary_1kb | 1 | nebulex | 2063.00 | 3119.00 | 445617 | 7.64 | 7.14 | 0.15 |
+| get | 1000 | binary_1kb | 4 | nebulex | 3908.00 | 6169.00 | 229062 | 9.11 | 8.78 | 0.12 |
+| put | 1000 | binary_1kb | 1 | nebulex | 3769.00 | 9807.00 | 125767 | 8.49 | 14.68 | 0.06 |
+| put | 1000 | binary_1kb | 4 | nebulex | 5564.00 | 17644.00 | 92355 | 7.69 | 10.18 | 0.10 |
+| get | 100000 | tuple3 | 1 | ets | 277.00 | 613.00 | 3090745 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | tuple3 | 4 | ets | 425.00 | 800.00 | 2100353 | 1.00 | 1.00 | 1.00 |
+| put | 100000 | tuple3 | 1 | ets | 391.00 | 675.00 | 2395929 | 1.00 | 1.00 | 1.00 |
+| put | 100000 | tuple3 | 4 | ets | 632.00 | 1080.00 | 1496918 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | tuple3 | 1 | theine | 441.00 | 829.00 | 1873692 | 1.59 | 1.35 | 0.61 |
+| get | 100000 | tuple3 | 4 | theine | 667.00 | 1097.00 | 1224828 | 1.57 | 1.37 | 0.58 |
+| put | 100000 | tuple3 | 1 | theine | 1202.00 | 2463.00 | 355969 | 3.07 | 3.65 | 0.15 |
+| put | 100000 | tuple3 | 4 | theine | 1930.00 | 5173.00 | 49871 | 3.05 | 4.79 | 0.03 |
+| get | 100000 | tuple3 | 1 | theine_unbounded | 358.00 | 688.99 | 2230106 | 1.29 | 1.12 | 0.72 |
+| get | 100000 | tuple3 | 4 | theine_unbounded | 602.00 | 1023.00 | 1404374 | 1.42 | 1.28 | 0.67 |
+| get | 100000 | tuple3 | 1 | theine_nostats | 430.00 | 771.00 | 1921122 | 1.55 | 1.26 | 0.62 |
+| get | 100000 | tuple3 | 4 | theine_nostats | 651.00 | 1095.00 | 1245270 | 1.53 | 1.37 | 0.59 |
+| get | 100000 | tuple3 | 1 | cachex | 862.00 | 1465.00 | 1067188 | 3.11 | 2.39 | 0.35 |
+| get | 100000 | tuple3 | 4 | cachex | 1340.00 | 2245.00 | 670206 | 3.15 | 2.81 | 0.32 |
+| put | 100000 | tuple3 | 1 | cachex | 1124.00 | 2033.00 | 800440 | 2.87 | 3.01 | 0.33 |
+| put | 100000 | tuple3 | 4 | cachex | 1717.00 | 3127.00 | 489455 | 2.72 | 2.90 | 0.33 |
+| get | 100000 | tuple3 | 1 | nebulex | 2137.00 | 4419.00 | 420269 | 7.71 | 7.21 | 0.14 |
+| get | 100000 | tuple3 | 4 | nebulex | 3928.00 | 6811.00 | 219759 | 9.24 | 8.51 | 0.10 |
+| put | 100000 | tuple3 | 1 | nebulex | 2960.00 | 6796.99 | 293134 | 7.57 | 10.07 | 0.12 |
+| put | 100000 | tuple3 | 4 | nebulex | 5255.00 | 12149.00 | 162957 | 8.31 | 11.25 | 0.11 |
+| get | 100000 | binary_1kb | 1 | ets | 292.00 | 615.00 | 2597614 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | binary_1kb | 4 | ets | 470.00 | 931.00 | 1687181 | 1.00 | 1.00 | 1.00 |
+| put | 100000 | binary_1kb | 1 | ets | 463.00 | 778.00 | 2082262 | 1.00 | 1.00 | 1.00 |
+| put | 100000 | binary_1kb | 4 | ets | 779.00 | 1754.00 | 1068139 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | binary_1kb | 1 | theine | 454.00 | 818.00 | 1788954 | 1.55 | 1.33 | 0.69 |
+| get | 100000 | binary_1kb | 4 | theine | 706.00 | 1201.00 | 1170037 | 1.50 | 1.29 | 0.69 |
+| put | 100000 | binary_1kb | 1 | theine | 1330.00 | 2914.00 | 332656 | 2.87 | 3.75 | 0.16 |
+| put | 100000 | binary_1kb | 4 | theine | 2084.00 | 6339.00 | 48550 | 2.68 | 3.61 | 0.05 |
+| get | 100000 | binary_1kb | 1 | theine_unbounded | 370.00 | 692.00 | 2138639 | 1.27 | 1.13 | 0.82 |
+| get | 100000 | binary_1kb | 4 | theine_unbounded | 629.00 | 1057.00 | 1319131 | 1.34 | 1.14 | 0.78 |
+| get | 100000 | binary_1kb | 1 | theine_nostats | 602.00 | 1180.00 | 1346416 | 2.06 | 1.92 | 0.52 |
+| get | 100000 | binary_1kb | 4 | theine_nostats | 694.00 | 1222.00 | 1181834 | 1.48 | 1.31 | 0.70 |
+| get | 100000 | binary_1kb | 1 | cachex | 851.00 | 1363.00 | 1045486 | 2.91 | 2.22 | 0.40 |
+| get | 100000 | binary_1kb | 4 | cachex | 1381.00 | 2460.00 | 640223 | 2.94 | 2.64 | 0.38 |
+| put | 100000 | binary_1kb | 1 | cachex | 1194.00 | 1826.00 | 767810 | 2.58 | 2.35 | 0.37 |
+| put | 100000 | binary_1kb | 4 | cachex | 1849.00 | 3594.00 | 417857 | 2.37 | 2.05 | 0.39 |
+| get | 100000 | binary_1kb | 1 | nebulex | 2156.00 | 3523.00 | 428631 | 7.38 | 5.73 | 0.17 |
+| get | 100000 | binary_1kb | 4 | nebulex | 3960.00 | 6987.00 | 224290 | 8.43 | 7.50 | 0.13 |
+| put | 100000 | binary_1kb | 1 | nebulex | 4087.00 | 11477.00 | 118307 | 8.83 | 14.75 | 0.06 |
+| put | 100000 | binary_1kb | 4 | nebulex | 5555.00 | 15693.00 | 112342 | 7.13 | 8.95 | 0.11 |
+| get | 1000000 | tuple3 | 1 | ets | 331.00 | 617.00 | 2892826 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | tuple3 | 4 | ets | 475.00 | 825.00 | 1977693 | 1.00 | 1.00 | 1.00 |
+| put | 1000000 | tuple3 | 1 | ets | 422.00 | 730.00 | 2349090 | 1.00 | 1.00 | 1.00 |
+| put | 1000000 | tuple3 | 4 | ets | 650.00 | 1068.00 | 1457809 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | tuple3 | 1 | theine | 491.00 | 842.00 | 1821825 | 1.48 | 1.36 | 0.63 |
+| get | 1000000 | tuple3 | 4 | theine | 718.00 | 1125.00 | 1182504 | 1.51 | 1.36 | 0.60 |
+| put | 1000000 | tuple3 | 1 | theine | 1217.00 | 2476.00 | 328750 | 2.88 | 3.39 | 0.14 |
+| put | 1000000 | tuple3 | 4 | theine | 1957.00 | 5605.88 | 48430 | 3.01 | 5.25 | 0.03 |
+| get | 1000000 | tuple3 | 1 | theine_unbounded | 415.00 | 748.00 | 2176816 | 1.25 | 1.21 | 0.75 |
+| get | 1000000 | tuple3 | 4 | theine_unbounded | 634.00 | 1004.00 | 1393513 | 1.33 | 1.22 | 0.70 |
+| get | 1000000 | tuple3 | 1 | theine_nostats | 489.00 | 762.00 | 1855553 | 1.48 | 1.24 | 0.64 |
+| get | 1000000 | tuple3 | 4 | theine_nostats | 701.00 | 1104.00 | 1213396 | 1.48 | 1.34 | 0.61 |
+| get | 1000000 | tuple3 | 1 | cachex | 906.00 | 1388.00 | 1050558 | 2.74 | 2.25 | 0.36 |
+| get | 1000000 | tuple3 | 4 | cachex | 1370.00 | 2237.00 | 665327 | 2.88 | 2.71 | 0.34 |
+| put | 1000000 | tuple3 | 1 | cachex | 1126.00 | 1944.00 | 806037 | 2.67 | 2.66 | 0.34 |
+| put | 1000000 | tuple3 | 4 | cachex | 1730.00 | 3228.00 | 470458 | 2.66 | 3.02 | 0.32 |
+| get | 1000000 | tuple3 | 1 | nebulex | 2158.00 | 4498.00 | 415237 | 6.52 | 7.29 | 0.14 |
+| get | 1000000 | tuple3 | 4 | nebulex | 3960.00 | 6931.00 | 216884 | 8.34 | 8.40 | 0.11 |
+| put | 1000000 | tuple3 | 1 | nebulex | 3036.00 | 6962.00 | 282441 | 7.19 | 9.54 | 0.12 |
+| put | 1000000 | tuple3 | 4 | nebulex | 5364.00 | 12679.00 | 156240 | 8.25 | 11.87 | 0.11 |
+| get | 1000000 | binary_1kb | 1 | ets | 332.00 | 622.00 | 2443535 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | binary_1kb | 4 | ets | 514.00 | 941.00 | 1627599 | 1.00 | 1.00 | 1.00 |
+| put | 1000000 | binary_1kb | 1 | ets | 469.00 | 790.00 | 2035643 | 1.00 | 1.00 | 1.00 |
+| put | 1000000 | binary_1kb | 4 | ets | 799.00 | 1593.00 | 1103596 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | binary_1kb | 1 | theine | 499.00 | 830.99 | 1739638 | 1.50 | 1.34 | 0.71 |
+| get | 1000000 | binary_1kb | 4 | theine | 747.00 | 1214.00 | 1144113 | 1.45 | 1.29 | 0.70 |
+| put | 1000000 | binary_1kb | 1 | theine | 1328.00 | 2903.00 | 321443 | 2.83 | 3.67 | 0.16 |
+| put | 1000000 | binary_1kb | 4 | theine | 2137.00 | 6242.00 | 47829 | 2.67 | 3.92 | 0.04 |
+| get | 1000000 | binary_1kb | 1 | theine_unbounded | 418.00 | 834.00 | 2031315 | 1.26 | 1.34 | 0.83 |
+| get | 1000000 | binary_1kb | 4 | theine_unbounded | 669.00 | 1071.00 | 1275864 | 1.30 | 1.14 | 0.78 |
+| get | 1000000 | binary_1kb | 1 | theine_nostats | 496.00 | 856.00 | 1759193 | 1.49 | 1.38 | 0.72 |
+| get | 1000000 | binary_1kb | 4 | theine_nostats | 734.00 | 1204.00 | 1165644 | 1.43 | 1.28 | 0.72 |
+| get | 1000000 | binary_1kb | 1 | cachex | 911.00 | 1431.00 | 1029868 | 2.74 | 2.30 | 0.42 |
+| get | 1000000 | binary_1kb | 4 | cachex | 1408.00 | 2401.00 | 639650 | 2.74 | 2.55 | 0.39 |
+| put | 1000000 | binary_1kb | 1 | cachex | 1225.00 | 1982.00 | 714546 | 2.61 | 2.51 | 0.35 |
+| put | 1000000 | binary_1kb | 4 | cachex | 1868.00 | 4063.00 | 366597 | 2.34 | 2.55 | 0.33 |
+| get | 1000000 | binary_1kb | 1 | nebulex | 2177.00 | 3705.00 | 426667 | 6.56 | 5.96 | 0.17 |
+| get | 1000000 | binary_1kb | 4 | nebulex | 4006.00 | 8421.99 | 218614 | 7.79 | 8.95 | 0.13 |
+| put | 1000000 | binary_1kb | 1 | nebulex | 4117.00 | 11779.23 | 113964 | 8.78 | 14.91 | 0.06 |
+| put | 1000000 | binary_1kb | 4 | nebulex | 5691.00 | 18308.00 | 88720 | 7.12 | 11.49 | 0.08 |
+
+Compiled put probe, `bench/results/put-m51.exs` (gitignored), one writer,
+`+sbt db +sbwt very_long`, ns per op, second of two runs (the first
+agrees within 10%):
+
+| row | n=1000 | over insert | n=1000000 | over insert |
+| --- | --- | --- | --- | --- |
+| `:ets.insert/2` of `{k, v}` | 145.0 | 1.00× | 214.0 | 1.00× |
+| insert of the 6-tuple entry | 174.3 | 1.20× | 227.4 | 1.06× |
+| + `send/2` to a process in a receive loop | 500.8 | 3.45× | 514.0 | 2.40× |
+| + `send/2` to a suspended process | 495.8 | 3.42× | 533.3 | 2.49× |
+| replica: id, insert, `pending`, send | 601.9 | 4.15× | 605.2 | 2.83× |
+| `Theine.put/3`, bursts of 1000, maintenance paused | 771.1 | 5.32× | 869.5 | 4.06× |
+| `Theine.put/3`, bursts of 1000, drained between | 1227.0 | 8.46× | 1237.5 | 5.78× |
+| `Theine.put/3` sustained, unbounded | 1799.3 | 12.41× | 1682.3 | 7.86× |
+| `Theine.put/3` sustained, bounded | 3064.4 | 21.14× | 3594.4 | 16.80× |
 
 ### M4.4 — `mix bench get` and a compiled A/B probe of the hit, refresh clause added to `get/2`, tree of the M4.4 commit (2026-10-29, 49/60 full run, 15/20 in the `--sizes 100000` rerun; probe: no difference)
 

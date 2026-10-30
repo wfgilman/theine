@@ -378,3 +378,51 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   must check where the passes ran, with `:erlang.system_info(:scheduler_id)`
   in a `[:theine, :maintenance, :pass]` handler; `+S` alone does not place
   them.
+- 2026-10-29 (M5.1): the rival subjects and the put scenario, where the
+  table above names them. Cachex 4 has no `limit:` option; its size bound
+  is a hook, and the subject uses `Cachex.Limit.Scheduled` with `{n, [],
+  []}` (least recently written, pruned every 3 s once over `n`), the policy
+  its docs lead with. Nebulex is 3.1 with the `nebulex_local` 3.1 adapter,
+  `max_size: n` and the adapter's defaults otherwise (stats and command
+  telemetry on, a size check every 10 s). Nebulex rotates generations when
+  a check finds `size >= max_size`, so a subject holding exactly `n`
+  rotates once during each shape's run, and a hit on the older generation
+  then moves its entry to the newer one; that is the bound the spec asks
+  for, and theine is 5–7× its get ips at every shape either way. Each
+  subject is populated, measured and torn down before the next starts,
+  one Benchee job per suite: the first run kept all six alive together,
+  and the `theine` p50 at n=1_000_000 tuple3 parallel 1 came out at 2.12×
+  against 1.39× in M3.2 and 1.34× for `theine_nostats` in the same run,
+  which fits the deletion of Nebulex's old 1M-entry generation landing in
+  `theine`'s window (Benchee runs jobs in name order, `nebulex` just
+  before `theine`). The put scenario runs after the subject's get runs,
+  with pre-drawn `{key, value}` pairs from the get keys, so every put
+  overwrites a key with the value it holds and the subject stays at `n`.
+  `--scenarios get` skips it for hot-path gating. The thresholds stand;
+  the runs (IMPLEMENTATION_PLAN.md §Benchmark log M5.1) showed two
+  things:
+  - `theine` ips ≥ 2 × `cachex` fails on all six shapes for the bounded
+    subject (1.78–1.92 isolated, 1.75–1.93 in the first run).
+    `theine_unbounded` passes on five shapes (2.06–2.23) and sits at 1.99
+    on n=1_000_000 binary_1kb, where the first run had 2.03. Cachex's hit
+    is 0.29–0.39× `ets` at parallel 4, so 2× Cachex asks 0.58–0.78×
+    `ets`. The bounded subject's recorded floor is 0.57–0.62× on tuple3
+    and 0.71–0.72× on binary_1kb (the M2.8d entry). So this is the same
+    floor, not a new cost.
+  - `theine` put ips ≥ 0.5 × `ets` insert ips fails on every shape: 0.14–0.19
+    at parallel 1 and 0.03–0.06 at parallel 4 (Cachex 0.32–0.37 and
+    0.32–0.42, Nebulex 0.06–0.12 and 0.08–0.11). A compiled probe
+    (`bench/results/put-m51.exs`, one writer, `+sbt db +sbwt very_long`)
+    finds the floor in the design: one `send/2` of the five-tuple event to
+    a local process costs 290–330 ns on the reference machine, even to a
+    suspended one that is never woken, against a 145–214 ns insert. Insert,
+    id, `pending` and send together are 2.8–4.2× an insert with nothing
+    consuming. `Theine.put/3` is 4.1–5.3× with the maintenance process
+    paused, 5.8–8.5× in bursts of 1_000 that it drains between, and
+    16.8–21.1× sustained (7.9–12.4× unbounded): a sustained writer runs
+    above `write_hwm` and is paced by the one consumer (specs/03 §Delivery
+    with backpressure). The parenthetical cost model above ("an insert, an
+    id allocation and a message send") prices the send near zero; on this
+    machine it is more than the insert. Meeting 0.5× would need writes that
+    do not send a message each, which specs/03 rules out. Open for a
+    human to settle: IMPLEMENTATION_PLAN.md open question 2.

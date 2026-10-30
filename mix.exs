@@ -41,7 +41,12 @@ defmodule Theine.MixProject do
       {:telemetry, "~> 1.3"},
       {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:benchee, "~> 1.3", only: :dev, runtime: false}
+      {:benchee, "~> 1.3", only: :dev, runtime: false},
+      # The A2 rivals in `mix bench get` (specs/09). Not `runtime: false`:
+      # the bench starts their caches in the dev VM.
+      {:cachex, "~> 4.1", only: :dev},
+      {:nebulex, "~> 3.1", only: :dev},
+      {:nebulex_local, "~> 3.1", only: :dev}
     ]
   end
 

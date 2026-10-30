@@ -104,8 +104,9 @@ test/                         mirrors lib/; test/support for shared helpers
   land on separate cores). `Theine.Maintenance.pause/1` (with `test_hooks:
   true`) is the way to measure a bounded hit with no passes running (M2.8d).
 - `mix test --include stress test/stress` runs only the soak tier (about
-  35 s; the whole suite with it about 41 s). Those modules are
-  `async: false` because they pin a writer to every scheduler.
+  45 s; the whole suite with it about 60 s). Those modules are
+  `async: false` because they pin a writer to every scheduler or start
+  1_000 fetchers per round.
 - Probe scripts under `bench/results/` are gitignored but still formatted
   by `mix format --check-formatted`; run `mix format` on them before the gate.
 - `mix bench hitrate --traces OLTP` (about 3 min) is the quick policy check;

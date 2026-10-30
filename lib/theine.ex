@@ -291,6 +291,35 @@ defmodule Theine do
   end
 
   @doc """
+  `fetch/4` as a task, Caffeine's `AsyncLoadingCache.get` (specs/07
+  §Asynchronous). Await it with `Task.await/2` or `Task.yield/2`; it
+  completes with what `fetch/4` would return.
+
+  On a hit the task is already completed (`Task.completed/1`) and nothing
+  is spawned. On a miss the load runs in a task under the cache's
+  `Task.Supervisor`, coalesced with every other `fetch/4` and
+  `fetch_async/4` of the key, so ten calls for one key start ten tasks but
+  run the loader once. The task is not linked to the caller: a loader that
+  raises, throws or exits reaches the caller as a `Task.await/2` exit or a
+  `Task.yield/2` `{:exit, reason}`, never as a crash of the caller.
+
+  `loader` and the options are those of `fetch/4`, and a missing loader or
+  an invalid option raises `ArgumentError` in the caller.
+
+      iex> {:ok, _} = Theine.start_link(name: :fetch_async_doc, max_size: :infinity)
+      iex> task = Theine.fetch_async(:fetch_async_doc, :a, fn _key -> {:commit, 1} end)
+      iex> Task.await(task)
+      {:ok, 1}
+      iex> hit = Theine.fetch_async(:fetch_async_doc, :a, fn _key -> {:commit, 2} end)
+      iex> {hit.pid, Task.await(hit)}
+      {nil, {:ok, 1}}
+  """
+  @spec fetch_async(cache(), key(), Loader.loader() | nil, keyword()) :: Task.t()
+  def fetch_async(cache, key, loader \\ nil, opts \\ []) when is_list(opts) do
+    Loader.fetch_async(cache, key, loader, opts)
+  end
+
+  @doc """
   Stores `value` under `key`, replacing any existing entry, and returns
   `:ok`. The maintenance process learns of the write asynchronously.
 

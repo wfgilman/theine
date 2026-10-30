@@ -520,6 +520,151 @@ defmodule Theine.LoaderTest do
 
   defp raise_from_loader, do: raise("from loader")
 
+  defp assert_no_tasks(cache) do
+    sup = Config.get(cache).task_supervisor
+    assert_eventually(fn -> Task.Supervisor.children(sup) == [] end, 5000)
+  end
+
+  describe "fetch_async" do
+    test "ten fetch_async tasks for one key run the loader once", %{cache: cache} do
+      calls = :counters.new(1, [])
+      tasks = for _ <- 1..10, do: Theine.fetch_async(cache, :k, counted(calls, :loaded))
+
+      assert Enum.all?(tasks, &is_pid(&1.pid))
+      release_when_waiting(cache, :k, 9)
+
+      assert Task.await_many(tasks, 5000) == List.duplicate({:ok, :loaded}, 10)
+      assert :counters.get(calls, 1) == 1
+      refute_received {:loading, _, _}
+      assert Theine.get(cache, :k) == {:ok, :loaded}
+      assert_loader_tables_empty(cache)
+      assert_no_tasks(cache)
+      # Each caller's lookup counts the miss once; the tasks look up nothing.
+      assert %Stats{loads: 1, misses: 10} = Theine.stats(cache)
+    end
+
+    test "fetch_async tasks and fetch/4 callers share one load", %{cache: cache} do
+      calls = :counters.new(1, [])
+      loader = counted(calls, :loaded)
+      pids = fetchers(cache, :k, loader, 5)
+      tasks = for _ <- 1..5, do: Theine.fetch_async(cache, :k, loader)
+      release_when_waiting(cache, :k, 9)
+
+      assert Task.await_many(tasks, 5000) == List.duplicate({:ok, :loaded}, 5)
+      assert collect(pids) |> Map.values() |> Enum.uniq() == [{:ok, :loaded}]
+      assert :counters.get(calls, 1) == 1
+      assert_loader_tables_empty(cache)
+    end
+
+    @tag :capture_log
+    test "a loader crash surfaces through Task.yield as {:exit, _} and does not crash the caller",
+         %{cache: cache} do
+      # The tasks are not linked: the claimant's crash would otherwise take
+      # this process down before the assertions below.
+      tasks = for _ <- 1..5, do: Theine.fetch_async(cache, :k, gated(fn -> raise "boom" end))
+      claimant = release_when_waiting(cache, :k, 4)
+
+      outcomes = Map.new(tasks, &{&1.pid, Task.yield(&1, 5000)})
+
+      assert {:exit, {%RuntimeError{message: "boom"}, [_ | _]}} = outcomes[claimant]
+
+      for {pid, outcome} <- outcomes, pid != claimant do
+        assert outcome == {:ok, {:error, {:load_failed, %RuntimeError{message: "boom"}}}}
+      end
+
+      assert Theine.get(cache, :k) == :error
+      assert_loader_tables_empty(cache)
+      assert_no_tasks(cache)
+      assert %Stats{loads: 1, load_failures: 1} = Theine.stats(cache)
+
+      # The key is not stuck.
+      assert Theine.fetch_async(cache, :k, fn _ -> {:commit, 1} end) |> Task.await() == {:ok, 1}
+    end
+
+    @tag :capture_log
+    test "a throw or an exit in the loader reaches Task.await as an exit of the caller only",
+         %{cache: cache} do
+      thrown = Theine.fetch_async(cache, :t, fn _ -> throw(:nope) end)
+      assert {:exit, {{:nocatch, :nope}, [_ | _]}} = Task.yield(thrown, 5000)
+
+      exited = Theine.fetch_async(cache, :e, fn _ -> exit(:gone) end)
+      assert catch_exit(Task.await(exited, 5000)) == {:gone, {Task, :await, [exited, 5000]}}
+      assert_loader_tables_empty(cache)
+    end
+
+    test "fetch_async on a hit returns an already-completed task", %{cache: cache} do
+      :ok = Theine.put(cache, :k, :cached)
+      sup = Config.get(cache).task_supervisor
+
+      task = Theine.fetch_async(cache, :k, fn _ -> flunk("loader called on a hit") end)
+
+      assert task.pid == nil
+      assert Task.Supervisor.children(sup) == []
+      assert Task.await(task, 0) == {:ok, :cached}
+      assert %Stats{hits: 1, misses: 0, loads: 0} = Theine.stats(cache)
+    end
+
+    test "{:ignore, v} and {:commit, v, ttl: ms} complete the task as fetch/4 does",
+         %{cache: cache} do
+      assert Theine.fetch_async(cache, :a, fn _ -> {:ignore, :none} end) |> Task.await() ==
+               {:ok, :none}
+
+      assert Theine.get(cache, :a) == :error
+
+      assert Theine.fetch_async(cache, :b, fn _ -> {:commit, 2, ttl: 60_000} end)
+             |> Task.await() == {:ok, 2}
+
+      assert {:ok, ttl} = Theine.ttl(cache, :b)
+      assert is_integer(ttl) and ttl > 0 and ttl <= 60_000
+    end
+
+    test "the cache loader is used without a per-call loader, and a waiter's timeout: applies" do
+      cache = unique_cache()
+      test = self()
+
+      loader = fn key ->
+        send(test, {:loading, self(), key})
+
+        receive do
+          :go -> {:commit, key}
+        end
+      end
+
+      start_supervised!({Theine, name: cache, max_size: :infinity, loader: loader})
+
+      claimant = Theine.fetch_async(cache, :k)
+      assert_receive {:loading, pid, :k}, 5000
+      assert pid == claimant.pid
+
+      waiter = Theine.fetch_async(cache, :k, nil, timeout: 10)
+      assert Task.await(waiter, 5000) == {:error, :timeout}
+
+      send(pid, :go)
+      assert Task.await(claimant, 5000) == {:ok, :k}
+      assert Theine.fetch_async(cache, :k) |> Task.await() == {:ok, :k}
+      assert_loader_tables_empty(cache)
+    end
+
+    test "a missing loader or an invalid option raises ArgumentError in the caller",
+         %{cache: cache} do
+      sup = Config.get(cache).task_supervisor
+
+      assert_raise ArgumentError, ~r/has no loader/, fn -> Theine.fetch_async(cache, :k) end
+
+      assert_raise ArgumentError, ~r/timeout/, fn ->
+        Theine.fetch_async(cache, :k, fn _ -> {:commit, 1} end, timeout: -1)
+      end
+
+      assert_raise ArgumentError, fn ->
+        Theine.fetch_async(cache, :k, fn _ -> {:commit, 1} end, bogus: 1)
+      end
+
+      assert_raise ArgumentError, fn -> Theine.fetch_async(cache, :k, :not_a_fun) end
+      assert Task.Supervisor.children(sup) == []
+      assert %Stats{misses: 0} = Theine.stats(cache)
+    end
+  end
+
   # Only the attached cache's loads: the async tests' caches emit the same
   # events.
   def handle_load(event, measurements, %{cache: cache} = metadata, %{cache: cache, test: test}) do

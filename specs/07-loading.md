@@ -272,3 +272,16 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
   (specs/06 §Clock). Without the seam, the step-3 double-check branches,
   step 1's empty lookup and the late notification after a timeout run
   only by chance. M5.2 needs every one of those lines covered.
+- 2026-10-29 (M4.3): `fetch_async` is not literally `async_nolink(sup,
+  fn -> fetch(...) end)`. The caller resolves the loader, validates the
+  options and does the `get/2` itself, as §Asynchronous's optional
+  hit shortcut needs anyway. Then, on a miss, the task enters the
+  single-flight at step 1 (the claim) instead of calling `fetch/4`. Two
+  reasons. A missing loader or a bad `timeout:` raises `ArgumentError` in
+  the caller, as `fetch/4` does, rather than as an exit from the task. A
+  task that called `fetch/4` would also look the key up a second time, so
+  every async miss would count two misses in `stats/1`. Skipping the
+  lookup does not weaken exactly-once: a value committed between the
+  caller's miss and the task's claim is found by the claimant's recheck
+  (M4.2) or by waiting on the live claim. The hit shortcut is taken:
+  `Task.completed/1`, nothing spawned.

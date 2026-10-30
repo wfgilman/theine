@@ -32,6 +32,9 @@ defmodule Theine.Loader do
   `:normal` sends the waiter back to claim, so a killed claimant never
   blocks the key (specs/07 §Decisions M4.1).
 
+  `fetch_async/4` runs the same algorithm in a task under the cache's
+  `Task.Supervisor`, so the task is the claimant or a waiter.
+
   The loader is never called from the maintenance process. Each call is
   wrapped in `[:theine, :load, :start | :stop | :exception]` telemetry with
   `%{cache: name}` metadata (the key is omitted) and counted in the
@@ -103,6 +106,34 @@ defmodule Theine.Loader do
     case Theine.get(cache, key) do
       {:ok, _} = hit -> hit
       :error -> claim_or_wait(config, key, loader, timeout, 0)
+    end
+  end
+
+  @doc """
+  `Theine.fetch_async/4`: `fetch/4` in a task under the cache's
+  `Task.Supervisor`, unlinked from the caller (specs/07 §Asynchronous).
+
+  The loader and the options are checked in the caller, so an
+  `ArgumentError` raises there rather than in the task. A hit returns an
+  already-completed task and spawns nothing. On a miss the task goes
+  straight to the claim: the caller's lookup has already counted the miss,
+  and a value committed since is found by the claimant's recheck or by
+  waiting on the claim, as in `fetch/4` (specs/07 §Decisions M4.3).
+  """
+  @spec fetch_async(Config.cache(), key(), loader() | nil, keyword()) :: Task.t()
+  def fetch_async(cache, key, loader, opts) when is_list(opts) do
+    config = :persistent_term.get(cache)
+    loader = resolve!(config, loader)
+    timeout = timeout!(opts)
+
+    case Theine.get(cache, key) do
+      {:ok, _} = hit ->
+        Task.completed(hit)
+
+      :error ->
+        Task.Supervisor.async_nolink(config.task_supervisor, fn ->
+          claim_or_wait(config, key, loader, timeout, 0)
+        end)
     end
   end
 

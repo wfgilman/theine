@@ -552,6 +552,25 @@ defmodule Theine.LoaderTest do
       assert_loader_tables_empty(cache)
     end
 
+    @tag :capture_log
+    test "fetch/2 returns {:error, {:load_failed, _}} when the cache loader fails for its claimant" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, name: cache, max_size: :infinity, loader: gated(fn -> raise "boom" end)}
+      )
+
+      claimant = Theine.fetch_async(cache, :k)
+      waiter = Task.async(fn -> Theine.fetch(cache, :k) end)
+      assert await_waiters(cache, :k, 1) == claimant.pid
+      send(claimant.pid, :go)
+
+      assert Task.await(waiter, 5000) == {:error, {:load_failed, %RuntimeError{message: "boom"}}}
+      assert {:exit, {%RuntimeError{message: "boom"}, _}} = Task.yield(claimant, 5000)
+      assert Theine.get(cache, :k) == :error
+      assert_loader_tables_empty(cache)
+    end
+
     test "invalid loaders and options raise ArgumentError", %{cache: cache} do
       assert_raise ArgumentError, ~r/arity 1/, fn -> Theine.fetch(cache, :k, fn -> 1 end) end
 
@@ -650,6 +669,34 @@ defmodule Theine.LoaderTest do
       exited = Theine.fetch_async(cache, :e, fn _ -> exit(:gone) end)
       assert catch_exit(Task.await(exited, 5000)) == {:gone, {Task, :await, [exited, 5000]}}
       assert_loader_tables_empty(cache)
+    end
+
+    @tag :capture_log
+    test "a waiting task completes with {:load_failed, _} for a throw, an exit and a killed claimant",
+         %{cache: cache} do
+      cases = [
+        {fn -> throw(:thrown) end, {:nocatch, :thrown}},
+        {fn -> exit(:gone) end, :gone},
+        {:kill, :killed}
+      ]
+
+      for {{body, reason}, i} <- Enum.with_index(cases) do
+        loader = gated(if body == :kill, do: fn -> {:commit, :never} end, else: body)
+        claimant = Theine.fetch_async(cache, i, loader)
+        waiter = Theine.fetch_async(cache, i, loader)
+        assert await_waiters(cache, i, 1) == claimant.pid
+
+        if body == :kill,
+          do: Process.exit(claimant.pid, :kill),
+          else: send(claimant.pid, :go)
+
+        assert Task.yield(waiter, 5000) == {:ok, {:error, {:load_failed, reason}}}
+        assert {:exit, _} = Task.yield(claimant, 5000)
+        assert Theine.get(cache, i) == :error
+        assert_loader_tables_empty(cache)
+      end
+
+      assert_no_tasks(cache)
     end
 
     test "fetch_async on a hit returns an already-completed task", %{cache: cache} do

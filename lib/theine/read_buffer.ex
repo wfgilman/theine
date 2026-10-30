@@ -109,8 +109,8 @@ defmodule Theine.ReadBuffer do
   pass step 2), so a trigger during a pass schedules the next one.
 
   Never raises: if the name is not registered (the process is restarting),
-  the message is dropped and the flag stays set. `Theine.Maintenance.init/1`
-  resets the flag and schedules its own pass when the rebuilt cache is over
+  the message is dropped and the flag stays set. The restarted
+  `Theine.Maintenance` process resets the flag and schedules its own pass when the rebuilt cache is over
   capacity (specs/04 §Restart semantics), so nothing is owed to the reader.
   Returns `:ok`.
   """

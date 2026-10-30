@@ -2,6 +2,7 @@ defmodule Theine.MixProject do
   use Mix.Project
 
   @version "0.1.0"
+  @source_url "https://github.com/wfgilman/theine"
 
   def project do
     [
@@ -12,7 +13,10 @@ defmodule Theine.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
-      dialyzer: dialyzer()
+      dialyzer: dialyzer(),
+      name: "theine",
+      source_url: @source_url,
+      docs: docs()
     ]
   end
 
@@ -42,6 +46,7 @@ defmodule Theine.MixProject do
       {:stream_data, "~> 1.1", only: [:dev, :test]},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:benchee, "~> 1.3", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       # The A2 rivals in `mix bench get` (specs/09). Not `runtime: false`:
       # the bench starts their caches in the dev VM.
       {:cachex, "~> 4.1", only: :dev},
@@ -59,6 +64,36 @@ defmodule Theine.MixProject do
         "compile --warnings-as-errors",
         "test --cover",
         "dialyzer"
+      ]
+    ]
+  end
+
+  # `mix docs` (specs/08 §Documentation). The bench modules compile in :dev
+  # beside lib/ but are not part of the library, so they are filtered out.
+  defp docs do
+    [
+      main: "readme",
+      source_ref: "v#{@version}",
+      extras: ["README.md"],
+      filter_modules: fn module, _metadata ->
+        not String.starts_with?(inspect(module), ["Theine.Bench", "Mix.Tasks.Bench"])
+      end,
+      groups_for_modules: [
+        API: [Theine, Theine.Stats],
+        Internals: [
+          Theine.Config,
+          Theine.Entry,
+          Theine.Sketch,
+          Theine.ReadBuffer,
+          Theine.WriteEvents,
+          Theine.Maintenance,
+          Theine.Policy,
+          Theine.Expiry,
+          Theine.Loader,
+          Theine.Owner,
+          Theine.Supervisor,
+          Theine.Clock
+        ]
       ]
     ]
   end

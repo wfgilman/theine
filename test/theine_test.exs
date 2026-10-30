@@ -49,6 +49,19 @@ defmodule TheineTest do
       end
     end
 
+    test "every option has a table row and a description in the start_link/1 doc" do
+      {table, prose} =
+        function_doc(:start_link, 1)
+        |> String.split("\n")
+        |> Enum.split_with(&String.starts_with?(&1, "|"))
+        |> then(fn {table, prose} -> {Enum.join(table, "\n"), Enum.join(prose, "\n")} end)
+
+      for option <- Config.options() do
+        assert table =~ "| `#{option}` |", "#{option} has no row in the options table"
+        assert prose =~ ~r/`#{option}[`:]/, "#{option} is not described below the table"
+      end
+    end
+
     test "a cache cannot start when its name is a foreign persistent_term key" do
       cache = unique_cache()
       :persistent_term.put(cache, :not_a_cache)
@@ -622,6 +635,33 @@ defmodule TheineTest do
       assert Theine.get(cache, :a) == :error
       assert Theine.put(cache, :a, 2) == :ok
     end
+  end
+
+  describe "documentation" do
+    # specs/08 §Documentation: every public function has a doc with an
+    # example, which `doctest Theine` above runs.
+    test "every public function of Theine has a doc with an iex> example" do
+      {:docs_v1, _, :elixir, _, _, _, docs} = Code.fetch_docs(Theine)
+      functions = for {{:function, name, arity}, _, _, doc, _} <- docs, do: {name, arity, doc}
+
+      # One entry per function, its default-argument arities included;
+      # `@doc false` (`refreshing_get/3`) is :hidden, a missing @doc :none.
+      assert length(functions) >= 18
+
+      for {name, arity, doc} <- functions, doc != :hidden do
+        assert %{"en" => text} = doc, "#{name}/#{arity} has no doc"
+        assert text =~ "iex>", "#{name}/#{arity} has no example"
+      end
+    end
+  end
+
+  defp function_doc(name, arity) do
+    {:docs_v1, _, :elixir, _, _, _, docs} = Code.fetch_docs(Theine)
+
+    Enum.find_value(docs, fn
+      {{:function, ^name, ^arity}, _, _, %{"en" => doc}, _} -> doc
+      _ -> nil
+    end)
   end
 
   defp children(sup) do

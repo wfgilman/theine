@@ -147,6 +147,10 @@ test/                         mirrors lib/; test/support for shared helpers
   the traced fun is the first in the VM to call a module (lazy code loading
   reads it), so a multiset depends on test order. Run the path once before
   tracing, as the stale-hit tracing test does (M4.4).
+- `mix docs` (`:dev`) must print no warnings. The bench modules are filtered
+  out of the docs, so a bare backticked `mix bench` in a doc or the README
+  autolinks to a filtered module and warns; write the subcommand out
+  (`mix bench get`).
 - A bare `mix dialyzer` (`:dev`) also checks `bench/lib` and reports unknown
   `Mix`/`:httpc` functions there because the dev PLT lacks those apps. That
   is noise; the gate is `mix gate`, whose dialyzer run is clean.

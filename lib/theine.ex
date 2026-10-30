@@ -11,8 +11,20 @@ defmodule Theine do
   Put a cache in your supervision tree:
 
       children = [
-        {Theine, name: :sessions, max_size: :infinity}
+        {Theine, name: :sessions, max_size: 100_000, expire_after_write: :timer.minutes(10)}
       ]
+
+  and call it by name:
+
+      Theine.put(:sessions, session_id, session)
+      Theine.get(:sessions, session_id)
+      #=> {:ok, session}
+      Theine.fetch(:sessions, session_id, &load_session/1)
+      #=> {:ok, session}
+
+  Every option is documented in `start_link/1`.
+
+  ## The `:persistent_term` write
 
   Each start writes the cache's resolved configuration to `:persistent_term`
   under the cache name once, and stopping the cache erases it. A
@@ -21,6 +33,30 @@ defmodule Theine do
   pays that cost per cache. The key is the bare cache name, so a cache
   cannot share its name with a `:persistent_term` key used elsewhere;
   `start_link/1` fails if that key already holds a foreign term.
+  """
+
+  alias Theine.{Config, Entry, Loader, Policy, ReadBuffer, Stats}
+
+  require Theine.Clock
+
+  @type cache :: Config.cache()
+  @type key :: Entry.key()
+  @type value :: Entry.value()
+
+  # :counters indices, resolved at compile time so the hot path makes no
+  # call into Theine.Stats.
+  @hits Stats.hits()
+  @misses Stats.misses()
+
+  @doc """
+  Starts a cache and its supervision tree, linked to the caller.
+
+  Returns `{:ok, pid}` of the cache's supervisor, or
+  `{:error, {:already_started, pid}}` when a cache with that name is running.
+
+      iex> {:ok, pid} = Theine.start_link(name: :start_link_doc, max_size: :infinity)
+      iex> Theine.start_link(name: :start_link_doc, max_size: :infinity)
+      {:error, {:already_started, pid}}
 
   ## Options
 
@@ -42,12 +78,26 @@ defmodule Theine do
   | `expire_batch` | pos_integer | 1024 |
   | `evict_batch` | pos_integer | 1024 |
   | `maintenance_interval` | ms | 1000 |
+  | `drain_backoff` | non_neg_integer | 3 |
   | `stats` | boolean | `true` |
   | `test_hooks` | boolean | `false` |
   | `policy_module` | module | `Theine.Policy` (tests only, needs `test_hooks`) |
 
   An unknown option, a missing `name` or `max_size`, or a value of the wrong
   type raises `ArgumentError` naming the option.
+
+  `name` is the atom every other call takes. It also names the cache's
+  public ETS table, its `:persistent_term` key and its processes, so it
+  must be unique among them.
+
+  `expire_after_write: ms` gives every entry written without a `ttl:`
+  option that lifetime; `put/4`'s `ttl:` and a loader's `{:commit, v,
+  ttl: ms}` override it per entry, and `expire/3` and `persist/2` change it
+  after the write. An expired entry is never returned, and the
+  maintenance process removes those nobody reads.
+
+  `loader` is the function `fetch/2`, `refresh/2` and a `refresh_after_write`
+  refresh call to load a missing key; see `fetch/4` for what it returns.
 
   `max_size: :infinity` disables the policy entirely: no frequency sketch,
   no read buffer, no eviction; expiration and loading still work. A finite
@@ -75,31 +125,39 @@ defmodule Theine do
   `Theine.Policy` (the test suite injects an instrumented one that records
   the call order of a pass). Never set it in production: a paused cache
   blocks writers once `write_hwm` events queue.
-  """
 
-  alias Theine.{Config, Entry, Loader, Policy, ReadBuffer, Stats}
+  ### Tuning
 
-  require Theine.Clock
+  The remaining options size the machinery between the readers, the
+  writers and the maintenance process. The defaults suit most caches; the
+  ones that must be powers of two are used as bit masks on the hit path.
 
-  @type cache :: Config.cache()
-  @type key :: Entry.key()
-  @type value :: Entry.value()
-
-  # :counters indices, resolved at compile time so the hot path makes no
-  # call into Theine.Stats.
-  @hits Stats.hits()
-  @misses Stats.misses()
-
-  @doc """
-  Starts a cache and its supervision tree, linked to the caller.
-
-  Returns `{:ok, pid}` of the cache's supervisor, or
-  `{:error, {:already_started, pid}}` when a cache with that name is running.
-  See the module documentation for the options.
-
-      iex> {:ok, pid} = Theine.start_link(name: :start_link_doc, max_size: :infinity)
-      iex> Theine.start_link(name: :start_link_doc, max_size: :infinity)
-      {:error, {:already_started, pid}}
+  - `stripes`: the number of read-buffer rings. A bounded hit records its
+    read in the ring of its scheduler, so the default gives every
+    scheduler its own.
+  - `read_buffer_slots`: the reads each ring holds before it overwrites
+    undrained ones. Reads are lossy by design: a dropped read only
+    weakens the frequency estimate.
+  - `drain_threshold`: every `drain_threshold`-th read on a ring asks the
+    maintenance process for a pass. Keep it at most half of
+    `read_buffer_slots`.
+  - `write_hwm`: the write events that may wait for the maintenance
+    process before a writer blocks until it catches up. This is also the
+    most a bounded cache can transiently hold above `max_size`, plus one
+    in-flight write per writer.
+  - `write_batch`: the maintenance process runs a pass after this many
+    write events, and flushes at most this many queued events in one.
+  - `expire_batch`: the expired entries one pass removes at most.
+  - `evict_batch`: the evictions one pass makes at most.
+  - `maintenance_interval`: milliseconds between passes on an idle cache,
+    so expired entries are removed even when nothing reads or writes.
+  - `drain_backoff`: a pass asked for by readers waits this multiple of
+    the previous pass's duration after it, which caps the maintenance
+    process's share of a scheduler under heavy reads; 0 runs such passes
+    back to back.
+  - `stats`: `false` stops `get/2` from counting hits and misses (see
+    `stats/1`); load, eviction, expiration and refresh counts are kept
+    either way.
   """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) when is_list(opts) do

@@ -86,13 +86,13 @@ Done: M4.1, M4.2, M4.3, M4.4, M4.4b, M4.5. M4 complete.
 
 ## M5 Gate
 
-Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5.2, M5.3, M5.4, M5.5.
+Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5.1c, M5.2, M5.3, M5.4, M5.5.
 
 **Unblocked 2026-11-02:** open question 2 is settled (specs/09 §Decisions 2026-11-02). The put threshold is now a burst cost check, and A1/A2 are judged on the reference machine, with `--dev-floor` on the development machine. Order: M5.1b, M5.1c, M5.6.
 
 - [x] M5.1 `mix bench get` Cachex and Nebulex subjects and the `put` scenario (specs/09 §`mix bench get` subjects table and put paragraph): `cachex`, `nebulex` and `nebulex_local` as dev-only deps per AGENTS.md, `put` scenario for `theine` vs `ets` insert vs Cachex vs Nebulex — outcome: `mix bench get` exits 0 with `theine` ips ≥ 2 × `cachex` and ≥ 2 × `nebulex` at full parallelism (A2) and `theine` put ips ≥ 0.5 × `ets` insert ips; table pasted under §Benchmark log. Harness met, outcome not: `lib/` unchanged. Cachex 4.1.1 (bounded by the `Cachex.Limit.Scheduled` hook, its size option being a hook since 4.0), Nebulex 3.1.0 with `nebulex_local` 3.1.0 (`Theine.Bench.NebulexCache` in `bench/lib`), every subject populated, measured and torn down alone, the put scenario on overwrites, `--scenarios get` to skip it (specs/09 §Decisions M5.1). `theine` ≥ 2 × `nebulex` passes on every shape (5–7×). `theine` ≥ 2 × `cachex` fails on every shape for the bounded subject (1.78–1.92×), which is the recorded bounded-hit floor of specs/09 §Decisions M2.8d and not a new cost; the final gate records it with the other floor rows. `theine_unbounded` passes it on five shapes and sat at 1.99 on the sixth (2.03 in the first run). The put threshold fails on every shape at 0.03–0.19× and cannot be met under specs/03's one-message-per-write design: one `send/2` alone costs more than the insert on this machine (open question 2, M5.1b).
 - [x] M5.1b The restated `put` check (specs/09 §`mix bench get` put paragraph and §Decisions 2026-11-02; human decision on open question 2): `bench/get.exs` gains the burst measurement at `parallel: 1` on every shape. That is bursts of 1_000 overwrites of present keys, with the maintenance process running and the cache drained between bursts outside the clock (wait until nothing is pending, as `bench/results/put-m51.exs` does), and the `ets` subject timed the same way with `:ets.insert/2`. It replaces the `put ips / ets insert ips ≥ 0.5` check with `theine burst cost per put / ets burst cost per insert ≤ 10`. The sustained put runs stay, with no threshold, and report ips with ratios to `ets` and to `cachex`. `bench/README.md` (the put paragraph, the JSON fields and the threshold list) and AGENTS.md's bench timing note follow. If the check fails on some shape, the put path's caller-side cost is the lever, not the threshold — outcome: a full `mix bench get` has the burst check passing on every shape and the sustained put table reported; the table is under §Benchmark log. Expect `lib/` unchanged. Met; `lib/` unchanged. `bench/get.exs` has a third scenario, `put_burst` (`ets` and `theine`, parallel 1). It runs between the get and the sustained put runs, so its bursts start from a drained cache rather than from a 10 s write backlog. Each burst of 1_000 present-key overwrites runs as a compiled loop timed with `:erlang.monotonic_time(:nanosecond)`, with no fun call per put. `wait_for_maintenance/1` drains outside the clock. 100 untimed bursts come first, then 1_000 timed (`--bursts`). The check is the total time over the total puts against `ets`'s (`ratio_to_ets.average`). The row also carries per-burst p50/p99 per put. The sustained `put` rows gained `ratio_to_cachex` and have no threshold. The summary now prints three tables (get, put_burst, put). The full run passed the burst check on all six shapes at 5.58–6.23×, and a burst-only rerun passed at 5.29–8.21× (§Benchmark log M5.1b). Its 11 failures are all bounded-`theine` A1/A2, the M2.8d floor, for M5.1c's band; see discovered issue 4 for the two p99 rows past the band. `bench/README.md` (scenarios, JSON fields, threshold list) and AGENTS.md's timing note follow. The top-level README's "open question" sentence on put now gives the burst and sustained figures. M5.6 still replaces those tables. No unit test: the harness lives in a `.exs` script and `bench/lib`, neither of which is compiled in `:test`. M5.1c's verdict test is the first to need a testable home for the check logic.
-- [ ] M5.1c Development band and machine record (specs/09 §Reference machine): `mix bench get --dev-floor`. Each check gets a strict verdict and, with the flag, one of `pass`, `floor` (misses the threshold, inside the band of specs/09's table) or `fail`. Only `fail` makes the run exit non-zero. Without the flag, the exit status is as today. The JSON result and the markdown summary record the verdicts, the band, the CPU model, the OS, the OTP version and `schedulers_online`. `bench/README.md` gets a §Reference machine run section for the person who runs the bench on the Mac: the exact command without `--dev-floor` (`ERL_FLAGS` as specs/09, noting that macOS ignores scheduler binding), a quiet machine on AC power, and where the result goes under §Final gate. The band values live in one place in `bench/get.exs`, and a test pins them to specs/09's table, as bench_docs_test does for the traces — tests: a unit test for the verdict function (pass, floor and fail for each check kind, both directions, `nebulex` and the put burst having no band) and the band pin — outcome: `mix bench get --dev-floor` on the current tree exits 0 with every A1/A2 miss reported as `floor`, and the same tree without the flag still lists them as failures.
+- [x] M5.1c Development band and machine record (specs/09 §Reference machine): `mix bench get --dev-floor`. Each check gets a strict verdict and, with the flag, one of `pass`, `floor` (misses the threshold, inside the band of specs/09's table) or `fail`. Only `fail` makes the run exit non-zero. Without the flag, the exit status is as today. The JSON result and the markdown summary record the verdicts, the band, the CPU model, the OS, the OTP version and `schedulers_online`. `bench/README.md` gets a §Reference machine run section for the person who runs the bench on the Mac: the exact command without `--dev-floor` (`ERL_FLAGS` as specs/09, noting that macOS ignores scheduler binding), a quiet machine on AC power, and where the result goes under §Final gate. The band values live in one place in `bench/get.exs`, and a test pins them to specs/09's table, as bench_docs_test does for the traces — tests: a unit test for the verdict function (pass, floor and fail for each check kind, both directions, `nebulex` and the put burst having no band) and the band pin — outcome: `mix bench get --dev-floor` on the current tree exits 0 with every A1/A2 miss reported as `floor`, and the same tree without the flag still lists them as failures. Met on the third run, after two runs each had one `fail` on the n=1000 parallel-1 p99 row (discovered issue 4); `lib/` unchanged. The thresholds and the band are in `Theine.Bench.Verdict` (`bench/lib/theine/bench/verdict.ex`), not in `bench/get.exs`. The script runs the bench when it is evaluated and needs Cachex, which is not in `:test`. The module depends on nothing but Elixir, so test/theine/bench_verdict_test.exs loads it with `Code.require_file`. `Verdict.check/4` gives every check its strict `passed`. With `--dev-floor` its `verdict` is `pass`, `floor` or `fail`. Without the flag it is `pass` or `fail`. `Verdict.failures/1` (the `fail`s) is what the script returns, so the exit status without the flag is unchanged. JSON: each `get` threshold gains `kind`, `band` and `verdict`, and `system` gains `dev_floor`. Every bench's `system` gains `cpu_model` and `os` (`Theine.Bench.Report`). The summary opens with a machine line and ends with a table of every missed threshold with its band and verdict. `bench/README.md` has §Development band and §Reference machine run (the Mac command under `caffeinate -i`, without the flag, and where the result goes). Tests: the band pin parses specs/09's table and compares it with `Verdict.limits/0`. The verdict tests cover pass, floor and fail at and around both edges for the three banded kinds, a miss on `ips_nebulex` and `put_burst` failing with the flag, and `failures/1` with and without the flag. Runs (§Benchmark log M5.1c): the full run had 74 pass, 15 floor and 1 fail (theine p99 n=1000 tuple3 parallel 1, 1.90). The first `--sizes 1000 --scenarios get` rerun had 25/2/1, with that row at 1.39 and binary_1kb at 1.66. The second rerun had 22/6/0 and exited 0. A short run without the flag on the same tree listed all six misses as `fail` and exited non-zero. All six burst checks passed (6.01–7.16×).
 - [x] M5.2 Coverage floor for `Theine.Loader` and `Theine.Policy` (specs/10 §Coverage): add the tests needed for 100% line coverage of both modules, `mix test --cover` reported in CI output — outcome: `mix test --cover` shows 100% lines for `Theine.Loader` and `Theine.Policy`. Met: 100% for both under seeds 1–4 and the random-seed gate run, and `policy_test.exs` alone gives Policy 100%. Before: Loader 98.45%, Policy 98.70%, with one Policy line covered only under some seeds (`candidate/1` returning `nil` past the probation LRU, reached by the eviction properties' random data). New tests: loader_test "a fetcher whose claimants keep exiting without a value loads alone after three retries" (the retry fallback, through four chained claimants that each hand the claim on) and "a waiter with timeout: :infinity waits for the load"; policy_test "a walk that runs off the probation LRU with candidates left settles them", the grow half of the 1_000-entry resize cap, and `climber/1` on an unbounded policy. Two removals instead of tests. `Policy.size_index/0` and `weighted_size_index/0` had no caller in lib, test or bench. `previous/2`'s `0` branch could not be reached: a candidate that is not the victim sits above the probation LRU. A broken invariant there now crashes with badarith instead of ending the walk. `mix bench hitrate --traces OLTP,loop` gives M2.13's table to the hundredth on all 12 rows, and `theine_static`'s OLTP hits equal `hitrate-408f736.json` exactly. The gate's test step is now `mix test --cover` (specs/10 §Decisions M5.2); there is no CI workflow, so the gate output is the report.
 - [x] M5.3 Documentation (specs/08 §Documentation; specs/00 §Mapping to Caffeine): `@doc` with an example on every public function, every option documented in `start_link/1`, module doc noting the per-start `persistent_term` write, `ex_doc` as a dev-only dep (allowed by AGENTS.md), README with the Caffeine mapping table — outcome: `mix docs` runs without warnings and every function in the specs/08 §Calls table has a doctest or unit test for each return shape. Met: `mix docs` (ex_doc 0.40.4, dev-only) is silent. Most of the docs were already written task by task. This task moved the option reference from the module doc into `start_link/1`, as specs/08 asks. It also added the missing `drain_backoff` row and a description of every option the table only listed (`name`, `expire_after_write`, `loader` and the tuning knobs). theine_test "every option has a table row and a description in the start_link/1 doc" checks this against `Config.options/0`, and "every public function of Theine has a doc with an iex> example" checks the docs chunk. The bench modules compiled in `:dev` are filtered out of the docs, and the internal modules are grouped under "Internals". A sweep for return shapes found two that no test asserted: `fetch/2` returning `{:error, {:load_failed, _}}` through the cache loader, and a `fetch_async` waiter completing with `{:nocatch, _}`, an exit reason or `:killed`. loader_test now covers both. The README is now user-facing: usage, the calls table, the Caffeine mapping and a benchmark summary from the latest log entries (get M5.1, hitrate M2.13, maintenance M3.2), with the bounded floor and the put gap stated as they are. M5.6 replaces those tables with the final gate's.
 - [x] M5.4 Package hygiene and hex build (specs/00 A6; specs/10 §Gates step 7): package metadata, `files:` excluding `bench/`, `test/`, `specs/` and the dev-only Mix task — outcome: `mix hex.build` succeeds and the tarball listing contains no `.so`, no bench or test files, and no NIF/port/make dependency in `mix.exs`. Met: `mix hex.build` (Hex 2.6.0) builds `theine-0.1.0.tar`, and the package holds `lib/` (15 files), `mix.exs`, `README.md` and `LICENSE`. The only dependency is `telemetry ~> 1.3`. Before this task the build failed on missing `description`, `licenses` and `links`. Its default file list would also have shipped `priv/plts`, the 8 MB of dialyzer PLTs, so `files:` is now an explicit list (specs/00 §Decisions M5.4). The package was unpacked with `mix hex.build --unpack` into `bench/results/hex-m54`. A path-dependency consumer (`bench/results/consumer-m54`) compiled it in `:prod` with `--warnings-as-errors` and ran a put, get and fetch. test/theine/package_test.exs pins the file list, the metadata and A6: no native file or native build script packaged, no extra compiler, telemetry the only runtime dep, and no `load_nif`, `@on_load`, port or `System.cmd` in `lib/`. The license is MIT, a placeholder the owner should confirm before publishing (open question 3).
@@ -115,7 +115,7 @@ Done: nothing yet.
 2. **Concurrent writes to one key can leave the policy with the wrong id** (found in M1.2, resolved in M1.5). `put/4` allocates the id before the insert, and the write event is sent after it, so two writers racing on one key can produce any interleaving of (insert, send) pairs: the entries table may end with the lower id while the policy applies the higher id's event last, or vice versa. The spec's rules (last `:put` event wins; `on_remove` ignores a stale id) then left a policy row whose id never matched the table; in an unbounded cache `size/1` drifted by one and `delete/2` could not clear the row. Resolved as recommended (specs/05 §Decisions 2026-10-27 M1.5): `on_remove(key, id)` with a non-matching id does one `:ets.member/2` on the entries table and drops the row when the key is absent; when the key is present with a third id, the row stays and that id's `:put` corrects it. Tested in policy_test, maintenance_test and the 200-round race in theine_test. Since M3.2 a lower id's `:put` arriving after a higher id's is applied only while the table holds it, so one direction of the reorder no longer leaves the row on a stale id (specs/05 §Decisions M3.2).
 3. **A write that straddles `clear/1` can leave a policy row with no entry** (noted in M1.5, not fixed). A writer that inserted before `:ets.delete_all_objects/1` and whose `:put` event is consumed after `Maintenance.reset/1` re-adds a policy row for a key the table no longer holds. No later event for that key arrives on its own (a `delete/2` of an absent key sends nothing), so in an unbounded cache the row lives until a `put` of the same key or a Maintenance restart rebuild (M2.9). In a bounded cache the eviction re-lookup drops it. The window is a few microseconds per `clear/1` and the cost is one phantom entry in `size/1`; the spec accepts it (specs/01 §Write path `clear/1`). If it matters later, `reset/1` could record the `ids` high-water mark and `on_write` ignore `:put` events with a lower id until the table confirms the key.
 
-4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6, M2.3). Four crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression (M2.3 did not touch `get/2` at all and crossed at 1.51× over a 362 ns floor), each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry. M5.1b (2026-11-03, `lib/` unchanged) saw the bounded `theine` p99 at n=1000 parallel 1 past the 1.65 development band of specs/09 §Reference machine in two runs of the same tree. The full run had binary_1kb at 1.98 and tuple3 at 1.47. The `--sizes 1000` rerun had binary_1kb at 1.44 and tuple3 at 1.73. `theine_nostats` moved with it (1.76, then 1.73). So M5.1c's `--dev-floor` run can report `fail` on this row with no regression. The M1.6 rerun procedure still applies, and the band is not widened.
+4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6, M2.3). Four crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression (M2.3 did not touch `get/2` at all and crossed at 1.51× over a 362 ns floor), each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry. M5.1b (2026-11-03, `lib/` unchanged) saw the bounded `theine` p99 at n=1000 parallel 1 past the 1.65 development band of specs/09 §Reference machine in two runs of the same tree. The full run had binary_1kb at 1.98 and tuple3 at 1.47. The `--sizes 1000` rerun had binary_1kb at 1.44 and tuple3 at 1.73. `theine_nostats` moved with it (1.76, then 1.73). So M5.1c's `--dev-floor` run can report `fail` on this row with no regression. The M1.6 rerun procedure still applies, and the band is not widened. M5.1c bore it out. It made three `--dev-floor` runs of one tree, and the row left the band in two of them, on one value kind each time: tuple3 1.90 (binary_1kb 1.46), then binary_1kb 1.66 (tuple3 1.39), then neither (1.46, 1.37). Counting M5.1b, the bounded p99 at n=1000 parallel 1 was past 1.65 in three of five runs. Both sides of the ratio move: `ets` p99 at tuple3 was 361, 460 and 420 ns, and `theine`'s binary_1kb p99 was 618, 692 and 646 ns. M5.6 should expect a rerun. The bench-only lever above (the `ets` floor measured beside each theine subject, or the p99 checks taken over several runs) would need a specs/09 §Decisions entry. It must not loosen the check. Nothing else in the band is close: in the full run the next-worst floor row was 1.61 on a p50.
 
 5. **A heavier rewrite of a protected key left `protected_weight` above `protected_max`** (found by M2.6's eviction property at run 158 of 3_000, resolved in M2.6). `on_write` of a known key adjusted the segment weight by the delta and moved the key to its segment's MRU, but only `on_access` demoted; a 7-weight protected key rewritten at weight 9 beside another protected key exceeded the 15-weight limit of `max_size` 20. Caffeine's `demoteFromMainProtected` runs at the end of every maintenance; here `on_write` applies the `on_access` rule after a weight increase (demote the protected LRU until it fits, or move a key heavier than `protected_max` to the probation MRU), so the specs/05 §Acceptance invariant now says "after every event" (specs/05 §Events `on_write`, §Decisions M2.6). The M2.5 property had the same exposure at 100 runs and never hit it; the eviction property keeps `max_runs: 1000` (about a second).
 
@@ -164,6 +164,147 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M5.1c — `mix bench get --dev-floor`, tree of the M5.1c commit (2026-11-03; full run 74 pass, 15 floor, 1 fail; `--sizes 1000` reruns 25/2/1 and 22/6/0, the last exiting 0; `lib/` unchanged)
+
+The runs were on the uncommitted tree with `+sbt db +sbwt very_long`, so
+every result file is `get-3ddf419.json`, each overwriting the one before.
+Machine: Intel(R) Core(TM) i5-5257U CPU @ 2.70GHz; Linux 7.2.5-3-omarchy;
+OTP 28; `schedulers_online` 4. The full run took about 15 minutes. Its
+sustained put rows (no threshold) had theine at 0.14–0.21× `ets` ips at
+parallel 1 and 0.03–0.06× at parallel 4, and at 0.44–1.19× `cachex` and
+0.10–0.22× respectively. The full run's get and burst tables:
+
+| scenario | n | value | parallel | subject | p50 ns | p99 ns | ips | p50/ets | p99/ets | ips/ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| get | 1000 | tuple3 | 1 | ets | 258.00 | 361.00 | 3731724 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | tuple3 | 4 | ets | 410.00 | 618.00 | 2262705 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | tuple3 | 1 | theine | 386.00 | 685.00 | 2227884 | 1.50 | 1.90 | 0.60 |
+| get | 1000 | tuple3 | 4 | theine | 620.00 | 906.00 | 1402052 | 1.51 | 1.47 | 0.62 |
+| get | 1000 | tuple3 | 1 | theine_unbounded | 331.00 | 571.00 | 2775034 | 1.28 | 1.58 | 0.74 |
+| get | 1000 | tuple3 | 4 | theine_unbounded | 541.00 | 777.00 | 1622991 | 1.32 | 1.26 | 0.72 |
+| get | 1000 | tuple3 | 1 | theine_nostats | 380.00 | 598.00 | 2263567 | 1.47 | 1.66 | 0.61 |
+| get | 1000 | tuple3 | 4 | theine_nostats | 619.00 | 899.00 | 1390846 | 1.51 | 1.45 | 0.61 |
+| get | 1000 | tuple3 | 1 | cachex | 810.00 | 1298.00 | 1175192 | 3.14 | 3.60 | 0.31 |
+| get | 1000 | tuple3 | 4 | cachex | 1324.00 | 2071.00 | 705156 | 3.23 | 3.35 | 0.31 |
+| get | 1000 | tuple3 | 1 | nebulex | 2074.00 | 4323.00 | 427254 | 8.04 | 11.98 | 0.11 |
+| get | 1000 | tuple3 | 4 | nebulex | 3874.00 | 6209.00 | 223755 | 9.45 | 10.05 | 0.10 |
+| get | 1000 | binary_1kb | 1 | ets | 273.00 | 424.00 | 2983007 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | binary_1kb | 4 | ets | 441.00 | 720.00 | 1855452 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | binary_1kb | 1 | theine | 399.00 | 618.00 | 2095483 | 1.46 | 1.46 | 0.70 |
+| get | 1000 | binary_1kb | 4 | theine | 644.00 | 1074.00 | 1296891 | 1.46 | 1.49 | 0.70 |
+| get | 1000 | binary_1kb | 1 | theine_unbounded | 343.00 | 555.00 | 2421576 | 1.26 | 1.31 | 0.81 |
+| get | 1000 | binary_1kb | 4 | theine_unbounded | 580.00 | 843.00 | 1454248 | 1.32 | 1.17 | 0.78 |
+| get | 1000 | binary_1kb | 1 | theine_nostats | 397.00 | 642.00 | 2104879 | 1.45 | 1.51 | 0.71 |
+| get | 1000 | binary_1kb | 4 | theine_nostats | 651.00 | 1092.00 | 1278655 | 1.48 | 1.52 | 0.69 |
+| get | 1000 | binary_1kb | 1 | cachex | 825.00 | 1294.00 | 1118377 | 3.02 | 3.05 | 0.37 |
+| get | 1000 | binary_1kb | 4 | cachex | 1375.00 | 2480.00 | 653831 | 3.12 | 3.44 | 0.35 |
+| get | 1000 | binary_1kb | 1 | nebulex | 2114.00 | 3580.00 | 434334 | 7.74 | 8.44 | 0.15 |
+| get | 1000 | binary_1kb | 4 | nebulex | 3902.00 | 6124.00 | 230340 | 8.85 | 8.51 | 0.12 |
+| get | 100000 | tuple3 | 1 | ets | 272.00 | 583.00 | 3102039 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | tuple3 | 4 | ets | 435.00 | 810.00 | 2046554 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | tuple3 | 1 | theine | 438.00 | 767.00 | 1956041 | 1.61 | 1.32 | 0.63 |
+| get | 100000 | tuple3 | 4 | theine | 655.00 | 1092.00 | 1271361 | 1.51 | 1.35 | 0.62 |
+| get | 100000 | tuple3 | 1 | theine_unbounded | 357.00 | 734.00 | 2371963 | 1.31 | 1.26 | 0.76 |
+| get | 100000 | tuple3 | 4 | theine_unbounded | 572.00 | 990.00 | 1506952 | 1.31 | 1.22 | 0.74 |
+| get | 100000 | tuple3 | 1 | theine_nostats | 730.00 | 1153.00 | 1212268 | 2.68 | 1.98 | 0.39 |
+| get | 100000 | tuple3 | 4 | theine_nostats | 660.00 | 1100.00 | 1280612 | 1.52 | 1.36 | 0.63 |
+| get | 100000 | tuple3 | 1 | cachex | 845.00 | 1307.00 | 1113541 | 3.11 | 2.24 | 0.36 |
+| get | 100000 | tuple3 | 4 | cachex | 1348.00 | 2152.00 | 681807 | 3.10 | 2.66 | 0.33 |
+| get | 100000 | tuple3 | 1 | nebulex | 2147.00 | 3562.00 | 421107 | 7.89 | 6.11 | 0.14 |
+| get | 100000 | tuple3 | 4 | nebulex | 3916.00 | 6835.00 | 220697 | 9.00 | 8.44 | 0.11 |
+| get | 100000 | binary_1kb | 1 | ets | 295.00 | 609.00 | 2624646 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | binary_1kb | 4 | ets | 470.00 | 937.00 | 1680939 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | binary_1kb | 1 | theine | 429.00 | 837.00 | 1816604 | 1.45 | 1.37 | 0.69 |
+| get | 100000 | binary_1kb | 4 | theine | 699.00 | 1220.00 | 1176669 | 1.49 | 1.30 | 0.70 |
+| get | 100000 | binary_1kb | 1 | theine_unbounded | 359.00 | 702.00 | 2199894 | 1.22 | 1.15 | 0.84 |
+| get | 100000 | binary_1kb | 4 | theine_unbounded | 608.00 | 1029.00 | 1355286 | 1.29 | 1.10 | 0.81 |
+| get | 100000 | binary_1kb | 1 | theine_nostats | 683.00 | 1229.00 | 1197561 | 2.32 | 2.02 | 0.46 |
+| get | 100000 | binary_1kb | 4 | theine_nostats | 700.00 | 1250.00 | 1177551 | 1.49 | 1.33 | 0.70 |
+| get | 100000 | binary_1kb | 1 | cachex | 835.00 | 1392.00 | 1065711 | 2.83 | 2.29 | 0.41 |
+| get | 100000 | binary_1kb | 4 | cachex | 1403.00 | 2437.00 | 638581 | 2.99 | 2.60 | 0.38 |
+| get | 100000 | binary_1kb | 1 | nebulex | 2171.00 | 3951.00 | 421911 | 7.36 | 6.49 | 0.16 |
+| get | 100000 | binary_1kb | 4 | nebulex | 3960.00 | 7429.00 | 225570 | 8.43 | 7.93 | 0.13 |
+| get | 1000000 | tuple3 | 1 | ets | 329.00 | 591.00 | 2911770 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | tuple3 | 4 | ets | 483.00 | 826.00 | 1950897 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | tuple3 | 1 | theine | 492.00 | 775.00 | 1846392 | 1.50 | 1.31 | 0.63 |
+| get | 1000000 | tuple3 | 4 | theine | 706.00 | 1107.00 | 1223825 | 1.46 | 1.34 | 0.63 |
+| get | 1000000 | tuple3 | 1 | theine_unbounded | 440.00 | 686.00 | 2279041 | 1.34 | 1.16 | 0.78 |
+| get | 1000000 | tuple3 | 4 | theine_unbounded | 632.00 | 1015.00 | 1204010 | 1.31 | 1.23 | 0.62 |
+| get | 1000000 | tuple3 | 1 | theine_nostats | 505.00 | 1049.00 | 1631189 | 1.53 | 1.77 | 0.56 |
+| get | 1000000 | tuple3 | 4 | theine_nostats | 707.00 | 1113.00 | 1222687 | 1.46 | 1.35 | 0.63 |
+| get | 1000000 | tuple3 | 1 | cachex | 905.00 | 1591.00 | 1074337 | 2.75 | 2.69 | 0.37 |
+| get | 1000000 | tuple3 | 4 | cachex | 1390.00 | 2167.00 | 673196 | 2.88 | 2.62 | 0.35 |
+| get | 1000000 | tuple3 | 1 | nebulex | 2187.00 | 3915.00 | 414127 | 6.65 | 6.62 | 0.14 |
+| get | 1000000 | tuple3 | 4 | nebulex | 3936.00 | 7171.00 | 216265 | 8.15 | 8.68 | 0.11 |
+| get | 1000000 | binary_1kb | 1 | ets | 333.00 | 626.00 | 2474048 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | binary_1kb | 4 | ets | 520.00 | 960.00 | 1598744 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | binary_1kb | 1 | theine | 499.00 | 813.00 | 1747321 | 1.50 | 1.30 | 0.71 |
+| get | 1000000 | binary_1kb | 4 | theine | 743.00 | 1226.00 | 1136219 | 1.43 | 1.28 | 0.71 |
+| get | 1000000 | binary_1kb | 1 | theine_unbounded | 411.00 | 701.00 | 2084019 | 1.23 | 1.12 | 0.84 |
+| get | 1000000 | binary_1kb | 4 | theine_unbounded | 662.00 | 1117.00 | 1287937 | 1.27 | 1.16 | 0.81 |
+| get | 1000000 | binary_1kb | 1 | theine_nostats | 518.00 | 1022.00 | 1672131 | 1.56 | 1.63 | 0.68 |
+| get | 1000000 | binary_1kb | 4 | theine_nostats | 737.00 | 1223.00 | 1165339 | 1.42 | 1.27 | 0.73 |
+| get | 1000000 | binary_1kb | 1 | cachex | 897.00 | 1582.00 | 1020268 | 2.69 | 2.53 | 0.41 |
+| get | 1000000 | binary_1kb | 4 | cachex | 1426.00 | 2531.00 | 637320 | 2.74 | 2.64 | 0.40 |
+| get | 1000000 | binary_1kb | 1 | nebulex | 2214.00 | 4089.00 | 414586 | 6.65 | 6.53 | 0.17 |
+| get | 1000000 | binary_1kb | 4 | nebulex | 3987.00 | 7254.00 | 221874 | 7.67 | 7.56 | 0.14 |
+
+| scenario | n | value | subject | ns/put | burst p50 ns/put | burst p99 ns/put | bursts | ns/put / ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| put_burst | 1000 | tuple3 | ets | 203.63 | 200.70 | 263.49 | 1000 | 1.00 |
+| put_burst | 1000 | tuple3 | theine | 1416.15 | 1378.60 | 2987.60 | 1000 | 6.95 |
+| put_burst | 1000 | binary_1kb | ets | 216.14 | 214.43 | 245.61 | 1000 | 1.00 |
+| put_burst | 1000 | binary_1kb | theine | 1496.73 | 1425.23 | 4186.81 | 1000 | 6.92 |
+| put_burst | 100000 | tuple3 | ets | 235.08 | 232.00 | 318.15 | 1000 | 1.00 |
+| put_burst | 100000 | tuple3 | theine | 1624.70 | 1588.89 | 3197.89 | 1000 | 6.91 |
+| put_burst | 100000 | binary_1kb | ets | 258.76 | 257.77 | 286.38 | 1000 | 1.00 |
+| put_burst | 100000 | binary_1kb | theine | 1853.04 | 1673.92 | 5592.56 | 1000 | 7.16 |
+| put_burst | 1000000 | tuple3 | ets | 264.31 | 263.21 | 296.91 | 1000 | 1.00 |
+| put_burst | 1000000 | tuple3 | theine | 1726.26 | 1662.78 | 3709.92 | 1000 | 6.53 |
+| put_burst | 1000000 | binary_1kb | ets | 293.43 | 292.33 | 321.83 | 1000 | 1.00 |
+| put_burst | 1000000 | binary_1kb | theine | 1762.11 | 1694.23 | 5315.08 | 1000 | 6.01 |
+
+Thresholds: 74/90 passed
+Development band (--dev-floor): 74 pass, 15 floor, 1 fail
+
+| id | check | actual | limit | band | verdict |
+| --- | --- | --- | --- | --- | --- |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=1 | 1.90 | <= 1.5 | <= 1.65 | fail |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=4 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=1000 tuple3 parallel=4 | 0.62 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=1000 tuple3 parallel=4 | 1.99 | >= 2.0 | >= 1.7 | floor |
+| A1 | theine_unbounded p99 / ets p99, n=1000 tuple3 parallel=1 | 1.58 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / cachex ips, n=1000 binary_1kb parallel=4 | 1.98 | >= 2.0 | >= 1.7 | floor |
+| A1 | theine p50 / ets p50, n=100000 tuple3 parallel=1 | 1.61 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p50 / ets p50, n=100000 tuple3 parallel=4 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=100000 tuple3 parallel=4 | 0.62 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=100000 tuple3 parallel=4 | 1.86 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine ips / cachex ips, n=100000 binary_1kb parallel=4 | 1.84 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine ips / ets ips, n=1000000 tuple3 parallel=4 | 0.63 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=1000000 tuple3 parallel=4 | 1.82 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine_unbounded ips / ets ips, n=1000000 tuple3 parallel=4 | 0.62 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine_unbounded ips / cachex ips, n=1000000 tuple3 parallel=4 | 1.79 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine ips / cachex ips, n=1000000 binary_1kb parallel=4 | 1.78 | >= 2.0 | >= 1.7 | floor |
+
+The first `--sizes 1000 --scenarios get --dev-floor` rerun, 25/2/1: the
+p99 at tuple3 parallel 1 was 1.39 and binary_1kb's was 1.66 (`fail`). The
+`floor` rows were `theine` ips/ets at tuple3 parallel 4 (0.60) and
+ips/cachex at binary_1kb (2.00, under 2.0 before rounding). The second
+rerun, 22/6/0, exited 0:
+
+| id | check | actual | limit | band | verdict |
+| --- | --- | --- | --- | --- | --- |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=1 | 1.54 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=4 | 1.59 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=4 | 1.54 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=1000 tuple3 parallel=4 | 0.57 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=1000 tuple3 parallel=4 | 1.88 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine ips / cachex ips, n=1000 binary_1kb parallel=4 | 1.92 | >= 2.0 | >= 1.7 | floor |
+
+A smoke run without the flag on the same tree (`--sizes 1000 --scenarios
+get --warmup 0.5 --time 2`, not a gate figure) listed its six misses as
+`fail` and exited non-zero.
 
 ### M5.1b — `mix bench get` with the `put_burst` scenario, tree of the M5.1b commit (2026-11-03, 79/90 in the full run; all 6 burst checks pass; `lib/` unchanged)
 

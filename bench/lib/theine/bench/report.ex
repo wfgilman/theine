@@ -47,7 +47,11 @@ defmodule Theine.Bench.Report do
     missing
   end
 
-  @doc "The `system` object of the result envelope."
+  @doc """
+  The `system` object of the result envelope. `cpu_model` and `os` with
+  `otp` and `schedulers_online` are the machine record the final gate
+  keeps with each run (specs/09 §Reference machine).
+  """
   @spec system(map()) :: map()
   def system(extra \\ %{}) do
     Map.merge(
@@ -56,10 +60,52 @@ defmodule Theine.Bench.Report do
         elixir: System.version(),
         schedulers_online: System.schedulers_online(),
         erl_flags: System.get_env("ERL_FLAGS", ""),
-        scheduler_bind_type: inspect(:erlang.system_info(:scheduler_bind_type))
+        scheduler_bind_type: inspect(:erlang.system_info(:scheduler_bind_type)),
+        cpu_model: cpu_model(),
+        os: os()
       },
       extra
     )
+  end
+
+  # Linux names the CPU in /proc/cpuinfo, macOS through sysctl (an Apple
+  # chip has no `machdep.cpu.brand_string` on older releases, hence the
+  # fallback to the architecture string).
+  defp cpu_model do
+    with {:ok, info} <- File.read("/proc/cpuinfo"),
+         [_, model] <- Regex.run(~r/^model name\s*:\s*(.+)$/m, info) do
+      String.trim(model)
+    else
+      _ ->
+        case cmd("sysctl", ["-n", "machdep.cpu.brand_string"]) do
+          {:ok, model} -> model
+          :error -> to_string(:erlang.system_info(:system_architecture))
+        end
+    end
+  end
+
+  # `uname -sr` (e.g. "Linux 6.8.0", "Darwin 24.1.0"), plus the product
+  # version on macOS, since the Darwin release does not name it.
+  defp os do
+    base =
+      case cmd("uname", ["-sr"]) do
+        {:ok, uname} -> uname
+        :error -> inspect(:os.type())
+      end
+
+    case cmd("sw_vers", ["-productVersion"]) do
+      {:ok, version} -> "#{base} (macOS #{version})"
+      :error -> base
+    end
+  end
+
+  defp cmd(command, args) do
+    with path when is_binary(path) <- System.find_executable(command),
+         {out, 0} <- System.cmd(path, args, stderr_to_stdout: true) do
+      {:ok, String.trim(out)}
+    else
+      _ -> :error
+    end
   end
 
   @doc """

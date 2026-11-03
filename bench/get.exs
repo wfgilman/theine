@@ -6,13 +6,17 @@
 #   mix bench get --sizes 1000 --warmup 0.5 --time 1 --bursts 100  # quick smoke run
 #   mix bench get --scenarios get                        # skip the put runs
 #   mix bench get --scenarios put_burst                  # only the put threshold
+#   mix bench get --dev-floor                            # development machine
 #
 # Evaluates to the list of failed threshold descriptions (Mix.Tasks.Bench).
+# With --dev-floor a check that misses its threshold inside the development
+# band of specs/09 §Reference machine is a `floor`, not a failure
+# (Theine.Bench.Verdict).
 
 defmodule Theine.Bench.Get do
   import Cachex.Spec, only: [hook: 1]
 
-  alias Theine.Bench.{NebulexCache, Report, Zipf}
+  alias Theine.Bench.{NebulexCache, Report, Verdict, Zipf}
 
   @sizes [1_000, 100_000, 1_000_000]
   @values [:tuple3, :binary_1kb]
@@ -27,7 +31,8 @@ defmodule Theine.Bench.Get do
   # `cachex`/`nebulex` the A2 comparison (specs/09 §mix bench get).
   # `theine_nostats` is reported for information only.
   @theine_subjects ["theine", "theine_unbounded"]
-  @rivals ["cachex", "nebulex"]
+  # Each with its check kind: only `cachex` has a development band.
+  @rivals [{"cachex", :ips_cachex}, {"nebulex", :ips_nebulex}]
   # The sustained put scenario's subjects (specs/09: theine vs ets insert vs
   # Cachex vs Nebulex), reported against `ets` and `cachex` with no threshold.
   @put_subjects ["ets", "theine", "cachex", "nebulex"]
@@ -50,10 +55,12 @@ defmodule Theine.Bench.Get do
           time: :float,
           sizes: :string,
           scenarios: :string,
-          bursts: :integer
+          bursts: :integer,
+          dev_floor: :boolean
         ]
       )
 
+    dev_floor = Keyword.get(opts, :dev_floor, false)
     warmup = Keyword.get(opts, :warmup, 2.0)
     time = Keyword.get(opts, :time, 10.0)
     bursts = Keyword.get(opts, :bursts, @bursts)
@@ -81,12 +88,13 @@ defmodule Theine.Bench.Get do
           do: row
 
     rows = add_ratios(rows)
-    thresholds = thresholds(rows, full)
+    thresholds = thresholds(rows, full, dev_floor)
 
     path =
       Report.write_json("get", %{
         system:
           Report.system(%{
+            dev_floor: dev_floor,
             warmup_s: warmup,
             time_s: time,
             burst_size: @burst,
@@ -102,9 +110,9 @@ defmodule Theine.Bench.Get do
         thresholds: thresholds
       })
 
-    IO.puts(summary(rows, thresholds, path))
+    IO.puts(summary(rows, thresholds, dev_floor, path))
 
-    thresholds |> Enum.reject(& &1.passed) |> Enum.map(& &1.description)
+    Verdict.failures(thresholds)
   end
 
   defp parse_csv(nil, default), do: Enum.map(default, &to_string/1)
@@ -457,12 +465,13 @@ defmodule Theine.Bench.Get do
 
   defp put_cachex_ratio(r, _cachex), do: r
 
-  defp thresholds(rows, full) do
+  # The thresholds and the development band are Theine.Bench.Verdict's.
+  defp thresholds(rows, full, dev_floor) do
     gets = Enum.filter(rows, &(&1.scenario == "get"))
     by_key = Map.new(gets, fn r -> {{r.subject, r.n, r.value, r.parallel}, r} end)
 
     get_checks =
-      for r <- gets, r.subject in @theine_subjects, check <- checks(r, by_key, full) do
+      for r <- gets, r.subject in @theine_subjects, check <- checks(r, by_key, full, dev_floor) do
         check
       end
 
@@ -471,35 +480,46 @@ defmodule Theine.Bench.Get do
     # `pending` increment and a message send) against an ETS insert.
     put_checks =
       for %{scenario: "put_burst", subject: "theine"} = r <- rows do
-        check(
-          "put",
+        Verdict.check(
+          :put_burst,
           "theine burst cost per put / ets burst cost per insert, n=#{r.n} #{r.value}",
           r.ratio_to_ets.average,
-          :<=,
-          10
+          dev_floor
         )
       end
 
     get_checks ++ put_checks
   end
 
-  defp checks(r, by_key, full) do
+  defp checks(r, by_key, full, dev_floor) do
     shape = "n=#{r.n} #{r.value} parallel=#{r.parallel}"
 
-    a1 = [
-      check("A1", "#{r.subject} p50 / ets p50, #{shape}", r.ratio_to_ets.p50, :<=, 1.5),
-      check("A1", "#{r.subject} p99 / ets p99, #{shape}", r.ratio_to_ets.p99, :<=, 1.5)
-    ]
+    a1 =
+      for p <- [:p50, :p99] do
+        description = "#{r.subject} #{p} / ets #{p}, #{shape}"
+        Verdict.check(:latency, description, Map.fetch!(r.ratio_to_ets, p), dev_floor)
+      end
 
     a2 =
       if r.parallel == full do
         vs_ets =
-          check("A2", "#{r.subject} ips / ets ips, #{shape}", r.ratio_to_ets.ips, :>=, 0.65)
+          Verdict.check(
+            :ips_ets,
+            "#{r.subject} ips / ets ips, #{shape}",
+            r.ratio_to_ets.ips,
+            dev_floor
+          )
 
         vs_rivals =
-          for rival <- @rivals, Map.has_key?(by_key, {rival, r.n, r.value, r.parallel}) do
+          for {rival, kind} <- @rivals, Map.has_key?(by_key, {rival, r.n, r.value, r.parallel}) do
             other = Map.fetch!(by_key, {rival, r.n, r.value, r.parallel})
-            check("A2", "#{r.subject} ips / #{rival} ips, #{shape}", r.ips / other.ips, :>=, 2.0)
+
+            Verdict.check(
+              kind,
+              "#{r.subject} ips / #{rival} ips, #{shape}",
+              r.ips / other.ips,
+              dev_floor
+            )
           end
 
         [vs_ets | vs_rivals]
@@ -510,19 +530,7 @@ defmodule Theine.Bench.Get do
     a1 ++ a2
   end
 
-  defp check(id, description, actual, op, limit) do
-    passed = if op == :<=, do: actual <= limit, else: actual >= limit
-
-    %{
-      id: id,
-      description: description,
-      actual: actual,
-      limit: "#{op} #{limit}",
-      passed: passed
-    }
-  end
-
-  defp summary(rows, thresholds, path) do
+  defp summary(rows, thresholds, dev_floor, path) do
     tables =
       [
         summary_table("get", rows, &get_table/1),
@@ -535,12 +543,54 @@ defmodule Theine.Bench.Get do
     """
     ## mix bench get (#{Report.git_sha()})
 
+    #{machine()}
+
     #{tables}
 
-    #{Report.thresholds_markdown(thresholds, "none evaluated (no theine subject yet)")}
+    #{thresholds_markdown(thresholds, dev_floor)}
 
     Result: #{path}
     """
+  end
+
+  # The machine record specs/09 asks the final gate to keep with each run.
+  defp machine do
+    system = Report.system()
+
+    "Machine: #{system.cpu_model}; #{system.os}; OTP #{system.otp}; " <>
+      "schedulers_online #{system.schedulers_online}; ERL_FLAGS \"#{system.erl_flags}\""
+  end
+
+  # The strict count first, then (with --dev-floor) the verdict counts, then
+  # every check that missed its threshold with its band and verdict.
+  defp thresholds_markdown([], _dev_floor),
+    do: "Thresholds: none evaluated (no theine subject yet)"
+
+  defp thresholds_markdown(thresholds, dev_floor) do
+    missed = Enum.reject(thresholds, & &1.passed)
+    strict = "Thresholds: #{length(thresholds) - length(missed)}/#{length(thresholds)} passed"
+
+    counts =
+      if dev_floor do
+        by_verdict = Enum.frequencies_by(thresholds, & &1.verdict)
+
+        "\nDevelopment band (--dev-floor): " <>
+          Enum.map_join(~w(pass floor fail), ", ", &"#{Map.get(by_verdict, &1, 0)} #{&1}")
+      else
+        ""
+      end
+
+    if missed == [] do
+      strict <> counts
+    else
+      rows =
+        Enum.map(missed, fn t -> [t.id, t.description, t.actual, t.limit, t.band, t.verdict] end)
+
+      strict <>
+        counts <>
+        "\n\nMissed thresholds:\n\n" <>
+        Report.table(~w(id check actual limit band verdict), rows)
+    end
   end
 
   defp summary_table(scenario, rows, render) do

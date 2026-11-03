@@ -80,7 +80,9 @@ test/                         mirrors lib/; test/support for shared helpers
 - `mix bench` and its helpers live in `bench/lib`, compiled in `:dev` only. Use
   `mix bench get --sizes 1000 --warmup 0.2 --time 0.5` for a quick smoke run.
 - Run the gating `mix bench get` as
-  `mise exec -- env ERL_FLAGS="+sbt db +sbwt very_long" mix bench get`. The
+  `mise exec -- env ERL_FLAGS="+sbt db +sbwt very_long" mix bench get --dev-floor`
+  (the flag turns an A1/A2 miss inside specs/09's development band into
+  `floor`; the band and thresholds are `Theine.Bench.Verdict`). The
   p99 at n=1000 tuple3 parallel=1 wanders by ±0.1× between runs of the same
   tree, flags or not, and has crossed the A1 limit three times (M1.5, M1.6).
   If that is the only failed check, re-run `--sizes 1000` on the same tree;

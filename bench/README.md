@@ -6,6 +6,7 @@ measured on the same machine in the same run.
 
 ```bash
 ERL_FLAGS="+sbt db +sbwt very_long" mix bench get
+ERL_FLAGS="+sbt db +sbwt very_long" mix bench get --dev-floor   # on the development machine
 mix bench get --sizes 1000 --warmup 0.5 --time 1 --bursts 100   # quick smoke run, not a gate
 ```
 
@@ -39,7 +40,9 @@ whenever a field is renamed, removed or changes meaning.
 
 `system` always has `otp`, `elixir`, `schedulers_online`, `erl_flags` (the
 raw environment variable), `scheduler_bind_type` (as inspected by
-`:erlang.system_info/1`). Benches add their own parameters.
+`:erlang.system_info/1`), `cpu_model` (`/proc/cpuinfo`'s model name on
+Linux, `sysctl machdep.cpu.brand_string` on macOS) and `os` (`uname -sr`,
+plus the macOS product version). Benches add their own parameters.
 
 Each `thresholds` entry:
 
@@ -49,7 +52,13 @@ Each `thresholds` entry:
 | `description` | string | what was compared, including the shape |
 | `actual` | number | the measured ratio or value |
 | `limit` | string | operator and bound, e.g. `"<= 1.5"` |
-| `passed` | boolean | |
+| `passed` | boolean | the strict verdict, against `limit` |
+
+`get` entries add `kind` (`"latency"`, `"ips_ets"`, `"ips_cachex"`,
+`"ips_nebulex"`, `"put_burst"`), `band` (the development band as
+operator and bound, `null` where the check has none) and `verdict`
+(`"pass"`, `"floor"` or `"fail"`; see §Development band below). The
+envelope's `passed` is always the strict one.
 
 ## `get` (A1, A2)
 
@@ -67,9 +76,9 @@ readers from contending on one refcount.
 Shapes: `n` in 1 000, 100 000, 1 000 000; both value kinds; `parallel` 1 and
 `System.schedulers_online()`. Warm-up 2 s, measurement 10 s per scenario.
 
-Extra `system` fields: `warmup_s`, `time_s`, `burst_size`, `bursts`,
-`warmup_bursts`, `sizes`, `scenarios` (list), `parallel` (list), `zipf_s`,
-`missing_erl_flags` (list).
+Extra `system` fields: `dev_floor` (boolean, the `--dev-floor` flag),
+`warmup_s`, `time_s`, `burst_size`, `bursts`, `warmup_bursts`, `sizes`,
+`scenarios` (list), `parallel` (list), `zipf_s`, `missing_erl_flags` (list).
 
 Each `results` row:
 
@@ -133,6 +142,80 @@ Thresholds (specs/09). The `get` ones are evaluated for `theine` and
   `ips / nebulex ips >= 2` at full parallelism.
 - put (id `"put"`): `theine` `put_burst` `average_ns` / `ets` `put_burst`
   `average_ns` `<= 10`, every shape.
+
+The thresholds and the development band live in one place,
+`Theine.Bench.Verdict` (`bench/lib/theine/bench/verdict.ex`), and
+test/theine/bench_verdict_test.exs pins both to the table in specs/09
+§Reference machine.
+
+The summary starts with a machine line (CPU model, OS, OTP release,
+`schedulers_online`, `ERL_FLAGS`) and ends with the strict count, then a
+table of every check that missed its threshold, with its band and verdict.
+
+### Development band (`--dev-floor`)
+
+The A1 and A2 verdicts belong to the reference machine (specs/09
+§Reference machine). On the development laptop, a dual-core i5 with SMT,
+the bounded hit sits at a floor at or just past the A1 and A2 limits
+(specs/09 §Decisions M2.8d). There, run
+
+```bash
+mise exec -- env ERL_FLAGS="+sbt db +sbwt very_long" mix bench get --dev-floor
+```
+
+Each check keeps its strict `passed`. With the flag its `verdict` is
+`pass`, `floor` (missed the threshold but inside the band) or `fail`, and
+only a `fail` makes the run exit non-zero. The summary adds a line with the
+three counts. Without the flag `verdict` is `pass` or `fail` and the exit
+status is the strict one.
+
+| check | threshold | development band |
+|---|---|---|
+| A1 p50 and p99 / `ets` | `<= 1.5` | `<= 1.65` |
+| A2 ips / `ets` | `>= 0.65` | `>= 0.52` |
+| A2 ips / `cachex` | `>= 2` | `>= 1.7` |
+| A2 ips / `nebulex` | `>= 2` | none |
+| put burst / `ets` insert | `<= 10` | none |
+
+The band applies to `theine` and `theine_unbounded`. It changes only the
+exit status, and it is not a threshold: the build loop may not widen it.
+The hot-path regression rule (a check that passed before and fails now) is
+read from the strict verdicts. The p99 at `n=1000 parallel=1` can land past
+the band with no regression (IMPLEMENTATION_PLAN.md discovered issue 4);
+rerun `--sizes 1000` on the same tree, as for the strict check.
+
+### Reference machine run
+
+The A1/A2 gate is one full run on the reference machine: the owner's Mac,
+with at least four physical cores. It is a human step of the final gate,
+like the Caffeine simulator cross-check, and it runs **without**
+`--dev-floor`.
+
+1. Check out the commit under test with a clean tree, then `mise install`
+   and `mix deps.get`.
+2. Plug the machine into AC power, turn off Low Power Mode, and quit every
+   other application (browsers, sync clients, Spotlight indexing if it is
+   running). The run takes about 15 minutes.
+3. Run, from the repository root:
+
+   ```bash
+   caffeinate -i mise exec -- env ERL_FLAGS="+sbt db +sbwt very_long" mix bench get
+   ```
+
+   `caffeinate -i` keeps the machine from idling to sleep. Keep the
+   `ERL_FLAGS` as specs/09 gives them, even though macOS ignores scheduler
+   binding (`+sbt db`); `+sbwt very_long` still applies, and leaving the
+   flags out only adds a warning. The result's `scheduler_bind_type` shows
+   what the VM did.
+4. The exit status is the gate: 0 means every A1, A2 and put threshold
+   passed. If any fails, that is a new open question for a human in
+   IMPLEMENTATION_PLAN.md, not a reason to rerun until it passes or to
+   widen the band (specs/09 §Decisions 2026-11-02).
+5. Paste the whole stdout summary, machine line included, under
+   IMPLEMENTATION_PLAN.md §Final gate §Reference machine run, and replace
+   that subsection's "human gate pending" cell. Keep
+   `bench/results/get-<sha>.json`, whose `system` object records the CPU
+   model, OS, OTP release and `schedulers_online`.
 
 ## `hitrate` (A3)
 

@@ -3,7 +3,8 @@
 One topic: time-based expiry of entries. v1 supports expire-after-write, as a
 cache-wide default and as a per-entry TTL, with lazy enforcement on read
 (specs/01) and proactive removal by the maintenance process. Refresh-after-
-write is a loading concern and lives in specs/07.
+write is a loading concern and lives in specs/07. Expire-after-access is not
+in v1. specs/11 drafts it for v2.
 
 ## Semantics
 

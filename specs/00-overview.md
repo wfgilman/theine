@@ -71,8 +71,9 @@ list is the contract.
 
 ## Non-goals for v1
 
-- Expire-after-access (needs the policy's view of access time on the read
-  path; planned for v2 via the read buffer).
+- Expire-after-access (needs the reader's view of access time on the read
+  path; planned for v2 with a per-entry access word beside the read buffer,
+  drafted in specs/11).
 - Removal/eviction listeners and bulk `fetch_all`. These are M6 optional
   tasks, after the gate above is green. M6.2 added the opt-in
   `[:theine, :eviction]` event (specs/08) and M6.3 `fetch_all` over the
@@ -225,3 +226,12 @@ list is the contract.
   a fixed band without failing. The thresholds themselves are unchanged
   (specs/09 §Reference machine, §Decisions 2026-11-02). The license is
   MIT.
+- 2026-11-03 (M6.4): the expire-after-access non-goal now points to the
+  design note specs/11, and it no longer says "via the read buffer". The
+  note found that the ring cannot carry access time safely. It drops reads
+  by design, and M2.8c sampled about 0.5% of them under four saturating
+  readers. A lost read is harmless to a frequency sample, but in a deadline
+  it becomes an early expiry of a key in use. The note recommends a signed
+  `:atomics` word per entry, stamped by every hit with `exchange`. That is
+  one more op on the hit of a cache with the option, which needs a human
+  decision on goal 1 (specs/11 open question 1). It stays a v1 non-goal.

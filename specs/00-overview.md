@@ -49,7 +49,8 @@ list is the contract.
   value shapes, at 1 scheduler and at all schedulers.
 - **A2 Throughput.** Aggregate `get` hit throughput at all schedulers is at
   least 0.65× raw ETS, and at least 2× both Cachex and Nebulex local `get` on
-  the same harness.
+  the same harness. A1 and A2 are judged on the reference machine of
+  specs/09 §Reference machine.
 - **A3 Hit rate.** On every trace in the hit-rate suite, theine's hit rate
   with its default policy (W-TinyLFU with the adaptive window) is at least
   that of the reference LRU, and on the looping trace it is at least 10
@@ -202,7 +203,21 @@ list is the contract.
   without one, so the package is MIT with a `LICENSE` file. That choice is
   a placeholder until the owner confirms it: Caffeine itself is
   Apache-2.0, and changing it before the first publish costs only the
-  `licenses:` entry and the file. test/theine/package_test.exs pins the
+  `licenses:` entry and the file (the owner confirmed MIT on 2026-11-02).
+  test/theine/package_test.exs pins the
   file list, the metadata and A6: no native file packaged, no compiler
   beyond Mix's own, `telemetry` the only runtime dependency, and no
   `load_nif`, `@on_load`, port or `System.cmd` in `lib/`.
+- 2026-11-02 (after M5.1, human decision): the put threshold of specs/09 is
+  restated. It was `theine` put ips ≥ 0.5 × an ETS insert, which the
+  one-message-per-write design of specs/03 cannot meet: one `send/2` costs
+  more than the insert on the development machine. It is now a check on
+  the caller's cost in bursts below `write_hwm` (≤ 10 × an insert). Sustained
+  put throughput is reported, not gated, and the README states the cap that
+  the single maintenance process puts on it. A1 and A2 are judged on a
+  reference machine with at least four physical cores (the owner's Mac),
+  not on the dual-core development laptop. There the bounded hit's floor
+  sits at the limits, and `mix bench get --dev-floor` reports misses inside
+  a fixed band without failing. The thresholds themselves are unchanged
+  (specs/09 §Reference machine, §Decisions 2026-11-02). The license is
+  MIT.

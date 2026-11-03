@@ -7,7 +7,38 @@ thresholds here are the contract; the build prompt forbids relaxing them.
 ## Reference machine
 
 Numbers are compared on the same machine in the same run; absolute values
-are not the gate, ratios are. Every bench writes a JSON result to
+are not the gate, ratios are.
+
+Two machines matter. The **development machine** is the laptop the build
+loop runs on: an i5-5257U with two cores and two threads each, so
+`parallel: 4` runs two readers per physical core. The **reference machine**
+is the owner's Mac, with at least four physical cores. The A1 and A2
+verdicts are the reference machine's. Every threshold below must pass in a
+full `mix bench get` there. That run is a human step of the final gate, like
+the Caffeine simulator cross-check.
+
+On the development machine the bounded hit sits at the floor recorded in
+§Decisions M2.8d, at or slightly past the A1 and A2 limits. There
+`mix bench get --dev-floor` marks a check that misses its threshold but
+stays inside the **development band** as `floor`, not as a failure, and
+exits non-zero only when a check falls outside the band:
+
+| check | threshold | development band |
+|---|---|---|
+| A1 p50 and p99 / `ets` | ≤ 1.5 | ≤ 1.65 |
+| A2 ips / `ets` | ≥ 0.65 | ≥ 0.52 |
+| A2 ips / `cachex` | ≥ 2 | ≥ 1.7 |
+| A2 ips / `nebulex` | ≥ 2 | none (≥ 2) |
+| put burst cost / `ets` insert | ≤ 10 | none (≤ 10) |
+
+The band applies to every theine subject. It changes only the exit status.
+The strict verdict of every check is still reported, and the hot-path
+regression rule below is read from the strict verdicts. The band is not a
+threshold. The loop may not widen it, just as it may not relax a threshold.
+The final gate records both runs, each with its CPU model, OS, OTP version
+and `schedulers_online`.
+
+Every bench writes a JSON result to
 `bench/results/<name>-<git-sha>.json` plus a markdown summary to stdout.
 `bench/results/` is gitignored; the summary table goes into commit bodies
 for hot-path changes (AGENTS.md) and the final gate goes into
@@ -55,10 +86,25 @@ Until M2 adds the bounded subject, the same three thresholds apply to
 (specs/00 M1 says A1 and A2 hold "with policy disabled"). After M2 they
 apply to both.
 
-Also report a `put` scenario (`theine` vs `ets` insert vs Cachex vs Nebulex)
-for information; its only threshold is that `theine` put ips is at least
-0.5 × `ets` insert ips (a write is an insert, an id allocation and a message
-send).
+Also run a `put` scenario (`theine` vs `ets` insert vs Cachex vs Nebulex).
+It has two parts:
+
+- **Sustained**: every subject puts for the whole measurement. Its ips is
+  reported with ratios to `ets` and to `cachex`, with no threshold. A
+  sustained writer runs above `write_hwm` and is paced by the one
+  maintenance process (specs/03 §Delivery with backpressure). So a cache's
+  sustained write throughput is bounded by that process's cost per write
+  event. The README states the measured figure as a limit of the design.
+- **Burst** (the threshold): at `parallel: 1` on every shape, the cost of
+  one `Theine.put/3`, averaged over bursts of 1_000 overwrites of present
+  keys. Each burst stays below the default `write_hwm`, so no write takes
+  the backpressure path. The maintenance process is running, and the cache
+  is drained between bursts outside the clock. The `ets` subject's table
+  is timed the same way with `:ets.insert/2`. Threshold: `theine` burst cost
+  per put ≤ 10 × `ets` burst cost per insert. A write is an insert, an id
+  allocation, a `pending` increment and a message send. On the development
+  machine the send alone costs more than the insert, and the M5.1 probe
+  measured these bursts at 5.8–8.5×.
 
 ## `mix bench hitrate` (A3)
 
@@ -425,4 +471,30 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
     id allocation and a message send") prices the send near zero; on this
     machine it is more than the insert. Meeting 0.5× would need writes that
     do not send a message each, which specs/03 rules out. Open for a
-    human to settle: IMPLEMENTATION_PLAN.md open question 2.
+    human to settle: IMPLEMENTATION_PLAN.md open question 2 (settled
+    2026-11-02, next entry).
+- 2026-11-02 (after M5.1, human decision on open question 2 and on the
+  bounded floor):
+  - **The put threshold is restated** as the burst cost check of §`mix
+    bench get` (≤ 10 × an insert), and sustained put ips is reported
+    without a threshold. The 0.5× figure came from a cost model that
+    priced the send near zero, and that was the spec's error. A redesign
+    with writes that do not send a message each was rejected. `:atomics`
+    holds only integers, so a lossless write buffer has to be an ETS
+    table. Writing to it costs about what the send saves, and it would
+    reopen A5's bound. Gating against Cachex's put was rejected too:
+    Cachex sends no message per write, so matching it would need the same
+    redesign. The burst check measures the caller's cost, which the
+    design controls, and it fails on a regression in the put path: the
+    measured 5.8–8.5× leaves headroom below 10. The cap on sustained
+    writes per cache is real. It is reported and documented, not gated.
+  - **The A1/A2 verdicts move to the reference machine.** The bounded
+    floor of the M2.8d entry belongs to the development laptop. At
+    `parallel: 4` it runs two readers per core, and a locked
+    read-modify-write there costs about 65 ns, not 23. The thresholds were
+    reset once already (2026-10-27) and are not relaxed again from a
+    dual-core 2015 laptop's numbers. They are judged on a machine with
+    four physical cores. The development band lets the loop finish the
+    gate on its own machine and still fails a real regression. If the
+    reference run misses a threshold, that is a new open question for a
+    human, not a reason to widen the band.

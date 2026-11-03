@@ -50,7 +50,10 @@ removed.
 5. For hot-path tasks: `mix bench get` thresholds (specs/09)
 6. For maintenance/policy tasks: `mix bench maintenance`, `mix bench hitrate`
 7. Final gate: `mix test --include stress`, all three benches, `mix docs`
-   without warnings, `mix hex.build` clean.
+   without warnings, `mix hex.build` clean. On the development machine
+   `mix bench get` runs with `--dev-floor`. A person runs it without the
+   flag on the reference machine, and every threshold must pass there
+   (specs/09 §Reference machine).
 
 `mix.exs` defines the alias `gate` running 1–4 so an iteration has one
 command to run before committing.

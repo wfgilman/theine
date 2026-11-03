@@ -58,6 +58,7 @@ All take the cache `name` as first argument. `key` and `value` are any term.
 | `fetch(cache, key)` | `{:ok, value} \| {:error, reason}` using the cache loader | 07 |
 | `fetch(cache, key, loader, opts \\ [])` | same, per-call loader; `opts`: `timeout:` | 07 |
 | `fetch_async(cache, key, loader \\ nil, opts \\ [])` | `Task.t()` | 07 |
+| `fetch_all(cache, keys, loader \\ nil, opts \\ [])` | `%{key => {:ok, value} \| {:error, reason}}` | 07 |
 | `put(cache, key, value, opts \\ [])` | `:ok`; `opts`: `ttl:`, `weight:` | 01 |
 | `put_new(cache, key, value, opts \\ [])` | `:ok \| {:error, :exists}` | 01 |
 | `delete(cache, key)` | `:ok` (idempotent) | 01 |

@@ -772,6 +772,148 @@ defmodule Theine.LoaderTest do
     end
   end
 
+  # A loader that counts its calls per key in `calls` (index = the key) and
+  # announces each; keys in `gate` wait for `:go` first. `outcome.(key)`
+  # is evaluated last, so it may raise, throw or exit.
+  defp per_key(calls, gate, outcome) do
+    test = self()
+
+    fn key ->
+      :counters.add(calls, key, 1)
+      send(test, {:loading, self(), key})
+      if key in gate, do: receive(do: (:go -> :ok))
+      outcome.(key)
+    end
+  end
+
+  defp waiter_rows(cache), do: :ets.info(Config.get(cache).waiters, :size)
+
+  describe "fetch_all" do
+    test "fetch_all returns a map of every key with hits served from the cache and misses loaded once each",
+         %{cache: cache} do
+      :ok = Theine.put(cache, 1, :cached)
+      :ok = Theine.put(cache, 2, :cached)
+      calls = :counters.new(4, [])
+      loader = per_key(calls, [3], &{:commit, {:loaded, &1}})
+
+      # Another process holds key 3's claim, so fetch_all waits for its
+      # load instead of loading 3 again.
+      [other] = fetchers(cache, 3, loader, 1)
+      assert_receive {:loading, ^other, 3}, 5000
+      all = Task.async(fn -> Theine.fetch_all(cache, [1, 3, 4, 1, 2, 4], loader) end)
+      assert_eventually(fn -> waiter_rows(cache) == 1 end, 5000)
+      send(other, :go)
+
+      expected = %{1 => {:ok, :cached}, 2 => {:ok, :cached}, 3 => {:ok, {:loaded, 3}}}
+      expected = Map.put(expected, 4, {:ok, {:loaded, 4}})
+      assert Task.await(all, 5000) == expected
+      assert collect([other]) == %{other => {:ok, {:loaded, 3}}}
+      pid = all.pid
+      assert_received {:loading, ^pid, 4}
+      refute_received {:loading, _, _}
+      assert for(k <- 1..4, do: :counters.get(calls, k)) == [0, 0, 1, 1]
+
+      # The other fetcher missed 3; fetch_all hit 1 and 2 and missed 3 and
+      # 4, each once despite the duplicates.
+      assert %Stats{hits: 2, misses: 3, loads: 2} = Theine.stats(cache)
+      assert_loader_tables_empty(cache)
+
+      # Everything loaded is now a hit.
+      assert Theine.fetch_all(cache, 1..4, loader) == expected
+      assert %Stats{hits: 6, misses: 3, loads: 2} = Theine.stats(cache)
+      assert Theine.fetch_all(cache, [], loader) == %{}
+    end
+
+    test "a loader failure for one key does not lose the other keys' results",
+         %{cache: cache} do
+      calls = :counters.new(6, [])
+
+      loader =
+        per_key(calls, [2], fn
+          2 -> raise "boom"
+          3 -> throw(:thrown)
+          4 -> exit(:gone)
+          5 -> {:ignore, :none}
+          k -> {:commit, k}
+        end)
+
+      all = Task.async(fn -> Theine.fetch_all(cache, [1, 2, 3, 4, 5, 6], loader) end)
+      claimant = all.pid
+      assert_receive {:loading, ^claimant, 2}, 5000
+
+      # A fetcher that waits on fetch_all's claim of 2 gets the failure too.
+      [waiter] = fetchers(cache, 2, loader, 1)
+      assert_eventually(fn -> waiter_rows(cache) == 1 end, 5000)
+      send(claimant, :go)
+
+      assert Task.await(all, 5000) == %{
+               1 => {:ok, 1},
+               2 => {:error, {:load_failed, %RuntimeError{message: "boom"}}},
+               3 => {:error, {:load_failed, {:nocatch, :thrown}}},
+               4 => {:error, {:load_failed, :gone}},
+               5 => {:ok, :none},
+               6 => {:ok, 6}
+             }
+
+      assert collect([waiter]) ==
+               %{waiter => {:error, {:load_failed, %RuntimeError{message: "boom"}}}}
+
+      assert for(k <- 1..6, do: :counters.get(calls, k)) == [1, 1, 1, 1, 1, 1]
+
+      assert for(k <- 1..6, do: Theine.get(cache, k)) == [
+               {:ok, 1},
+               :error,
+               :error,
+               :error,
+               :error,
+               {:ok, 6}
+             ]
+
+      assert %Stats{loads: 6, load_failures: 3} = Theine.stats(cache)
+      assert_loader_tables_empty(cache)
+
+      # The failed keys are not stuck.
+      ok = fn k -> {:commit, k} end
+      assert Theine.fetch_all(cache, [2, 3], ok) == %{2 => {:ok, 2}, 3 => {:ok, 3}}
+    end
+
+    test "timeout: limits each key's wait and the other keys are still fetched",
+         %{cache: cache} do
+      calls = :counters.new(2, [])
+      loader = per_key(calls, [1], &{:commit, &1})
+      [other] = fetchers(cache, 1, loader, 1)
+      assert_receive {:loading, ^other, 1}, 5000
+
+      assert Theine.fetch_all(cache, [1, 2], loader, timeout: 10) ==
+               %{1 => {:error, :timeout}, 2 => {:ok, 2}}
+
+      send(other, :go)
+      assert collect([other]) == %{other => {:ok, 1}}
+      assert_loader_tables_empty(cache)
+    end
+
+    test "fetch_all/2 uses the cache loader; a missing loader or an invalid option raises before any lookup",
+         %{cache: cache} do
+      assert_raise ArgumentError, ~r/has no loader/, fn -> Theine.fetch_all(cache, [1]) end
+      assert_raise ArgumentError, ~r/has no loader/, fn -> Theine.fetch_all(cache, []) end
+
+      assert_raise ArgumentError, ~r/timeout/, fn ->
+        Theine.fetch_all(cache, [1], fn _ -> {:commit, 1} end, timeout: -1)
+      end
+
+      assert_raise ArgumentError, fn ->
+        Theine.fetch_all(cache, [1], fn _ -> {:commit, 1} end, bogus: 1)
+      end
+
+      assert_raise ArgumentError, fn -> Theine.fetch_all(cache, [1], :not_a_fun) end
+      assert %Stats{hits: 0, misses: 0} = Theine.stats(cache)
+
+      loading = unique_cache()
+      start_supervised!({Theine, name: loading, max_size: :infinity, loader: &{:commit, -&1}})
+      assert Theine.fetch_all(loading, [1, 2]) == %{1 => {:ok, -1}, 2 => {:ok, -2}}
+    end
+  end
+
   # Only the attached cache's loads: the async tests' caches emit the same
   # events.
   def handle_load(event, measurements, %{cache: cache} = metadata, %{cache: cache, test: test}) do

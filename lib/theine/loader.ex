@@ -34,6 +34,7 @@ defmodule Theine.Loader do
 
   `fetch_async/4` runs the same algorithm in a task under the cache's
   `Task.Supervisor`, so the task is the claimant or a waiter.
+  `fetch_all/4` runs it for one key after another in the caller.
 
   Refreshes (specs/07 §Refresh-after-write) do not go through the claim. A
   reader whose hit is at least `refresh_after_write` old, or a call to
@@ -148,6 +149,46 @@ defmodule Theine.Loader do
           claim_or_wait(config, key, loader, timeout, 0)
         end)
     end
+  end
+
+  @doc """
+  `Theine.fetch_all/4`: `fetch/4` for each distinct key of `keys`, in
+  order, in the calling process, collected into a map of each key to what
+  `fetch/4` would return (specs/07 §Bulk). A key whose load this process
+  claimed and failed maps to `{:error, {:load_failed, reason}}`, the reply
+  its waiters got, instead of raising, so the keys after it are still
+  fetched.
+
+  Raises `ArgumentError` when neither loader is given, or for an invalid
+  `timeout:`, before any key is looked up.
+  """
+  @spec fetch_all(Config.cache(), Enumerable.t(), loader() | nil, keyword()) ::
+          %{optional(key()) => {:ok, value()} | {:error, error()}}
+  def fetch_all(cache, keys, loader, opts) when is_list(opts) do
+    config = :persistent_term.get(cache)
+    loader = resolve!(config, loader)
+    timeout = timeout!(opts)
+
+    Enum.reduce(keys, %{}, fn
+      key, results when is_map_key(results, key) -> results
+      key, results -> Map.put(results, key, fetch_one(config, key, loader, timeout))
+    end)
+  end
+
+  # One key of `fetch_all/4`: `fetch/4`'s lookup and single-flight. The
+  # claimant has released its claim and notified its waiters by the time a
+  # failure reaches the `catch`.
+  defp fetch_one(config, key, loader, timeout) do
+    case lookup(config, key, loader) do
+      {:ok, _} = hit -> hit
+      :error -> load_one(config, key, loader, timeout)
+    end
+  end
+
+  defp load_one(config, key, loader, timeout) do
+    claim_or_wait(config, key, loader, timeout, 0)
+  catch
+    kind, reason -> {:error, {:load_failed, failure_reason(kind, reason, __STACKTRACE__)}}
   end
 
   @doc """

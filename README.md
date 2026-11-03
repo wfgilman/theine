@@ -35,6 +35,7 @@ every call with an example.
 | `fetch(cache, key)` | `{:ok, value} \| {:error, reason}` with the cache's `:loader` |
 | `fetch(cache, key, loader, opts \\ [])` | the same with a per-call loader; `timeout:` |
 | `fetch_async(cache, key, loader \\ nil, opts \\ [])` | `Task.t()` |
+| `fetch_all(cache, keys, loader \\ nil, opts \\ [])` | `%{key => {:ok, value} \| {:error, reason}}` |
 | `put(cache, key, value, opts \\ [])` | `:ok`; `ttl:`, `weight:` |
 | `put_new(cache, key, value, opts \\ [])` | `:ok \| {:error, :exists}` |
 | `delete(cache, key)` | `:ok` |
@@ -53,6 +54,7 @@ every call with an example.
 | `Cache.get(key, mappingFn)` | `Theine.fetch/3` |
 | `LoadingCache.get` with `CacheLoader` | `Theine.fetch/2` with the cache-level `:loader` |
 | `AsyncLoadingCache.get` returning a future | `Theine.fetch_async/3` returning a `Task` |
+| `LoadingCache.getAll` without `loadAll` | `Theine.fetch_all/2`, a per-key result map |
 | `LoadingCache.refresh` | `Theine.refresh/2` |
 | `refreshAfterWrite` | `:refresh_after_write` |
 | `expireAfterWrite` | `:expire_after_write` and per-entry `ttl:` |
@@ -69,8 +71,8 @@ every call with an example.
 Caffeine's `evictionListener` is the `[:theine, :eviction]` telemetry event,
 emitted only with `eviction_listener: true` (see `Theine.start_link/1`).
 
-Not in v1: expire-after-access, explicit-removal listeners, bulk loads,
-distribution.
+Not in v1: expire-after-access, explicit-removal listeners, a bulk loader
+(`fetch_all/4` calls the loader once per missing key), distribution.
 
 ## Benchmarks
 

@@ -465,6 +465,47 @@ defmodule Theine do
   end
 
   @doc """
+  `fetch/4` for every key of `keys`, Caffeine's `LoadingCache.getAll`
+  (specs/07 §Bulk). Returns a map from each key to what `fetch/4` would
+  return for it: `{:ok, value}`, or `{:error, reason}` for that key alone.
+
+  Each distinct key is looked up once, in the order given, and a duplicate
+  is skipped. Hits are served from the cache. Each miss is loaded in the
+  calling process through the same single-flight as `fetch/4`, so a key
+  that another process is already loading is waited for rather than loaded
+  again, and a key loaded here is never loaded twice by concurrent
+  fetchers. Misses load one after another; for loads that overlap, start a
+  `fetch_async/4` per key instead.
+
+  `loader` is called with one key at a time; there is no bulk loader. When
+  it raises, throws or exits for a key, that key maps to `{:error,
+  {:load_failed, reason}}` with the `reason` described in `fetch/4`, as a
+  waiter's would, nothing is stored for it and the remaining keys are still
+  fetched. `timeout:` limits each key's wait for another process's load,
+  not the whole call; a key past it maps to `{:error, :timeout}`.
+
+  Raises `ArgumentError` when neither `loader` nor the cache's `loader:` is
+  set, or for an unknown option, before any key is looked up.
+
+      iex> {:ok, _} = Theine.start_link(name: :fetch_all_doc, max_size: :infinity,
+      ...>   loader: fn key -> {:commit, key * 2} end)
+      iex> Theine.put(:fetch_all_doc, 1, :cached)
+      :ok
+      iex> Theine.fetch_all(:fetch_all_doc, [1, 2, 2])
+      %{1 => {:ok, :cached}, 2 => {:ok, 4}}
+      iex> Theine.fetch_all(:fetch_all_doc, [3, 4], fn
+      ...>   3 -> {:commit, :three}
+      ...>   4 -> raise "unavailable"
+      ...> end)
+      %{3 => {:ok, :three}, 4 => {:error, {:load_failed, %RuntimeError{message: "unavailable"}}}}
+  """
+  @spec fetch_all(cache(), Enumerable.t(), Loader.loader() | nil, keyword()) ::
+          %{optional(key()) => {:ok, value()} | {:error, Loader.error()}}
+  def fetch_all(cache, keys, loader \\ nil, opts \\ []) when is_list(opts) do
+    Loader.fetch_all(cache, keys, loader, opts)
+  end
+
+  @doc """
   Reloads `key` in the background with the cache's `loader:`, whatever the
   age of its entry, Caffeine's `LoadingCache.refresh` (specs/07
   §Refresh-after-write). Returns `:ok` once the refresh has started,

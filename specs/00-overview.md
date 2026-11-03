@@ -74,7 +74,10 @@ list is the contract.
 - Expire-after-access (needs the policy's view of access time on the read
   path; planned for v2 via the read buffer).
 - Removal/eviction listeners and bulk `fetch_all`. These are M6 optional
-  tasks, after the gate above is green.
+  tasks, after the gate above is green. M6.2 added the opt-in
+  `[:theine, :eviction]` event (specs/08) and M6.3 `fetch_all` over the
+  per-key loader (specs/07 §Bulk); explicit-removal listeners and a bulk
+  loader stay out of v1.
 - Distribution, replication, persistence, or an L2 adapter library. The
   loader is a function; what it calls is the user's business.
 - Weak/soft references, cache-wide locks, transactions.
@@ -87,6 +90,7 @@ list is the contract.
 | `Cache.get(key, mappingFn)` | `Theine.fetch/3` |
 | `LoadingCache.get` with `CacheLoader` | `Theine.fetch/2` with the cache-level `:loader` |
 | `AsyncLoadingCache.get` returning a future | `Theine.fetch_async/3` returning a `Task` |
+| `LoadingCache.getAll` without `loadAll` | `Theine.fetch_all/2`, a per-key result map |
 | `LoadingCache.refresh` | `Theine.refresh/2` |
 | `refreshAfterWrite` | `:refresh_after_write` |
 | `expireAfterWrite` | `:expire_after_write` and per-entry `ttl:` |

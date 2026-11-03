@@ -146,6 +146,35 @@ crash of the caller.
 An optimization is allowed but not required: if `get/2` hits, return an
 already-completed task (`Task.completed/1`) and spawn nothing.
 
+## Bulk: `fetch_all/4`
+
+```elixir
+@spec fetch_all(cache, Enumerable.t(key), loader | nil, opts) ::
+        %{key => {:ok, value} | {:error, reason}}
+```
+
+Caffeine's `LoadingCache.getAll` for a loader without `loadAll`: each
+distinct key of `keys`, in order, goes through `fetch/3`'s algorithm in the
+calling process (the lookup, then claim or wait), and the result is a map
+from each key to what `fetch/3` would return for it. A duplicate key is
+skipped, so it is looked up and counted once. Misses load one after
+another, as Caffeine's `loadSequentially` does; overlapping loads are a
+`fetch_async/3` per key.
+
+The loader is the per-key loader of §The loader function. There is no bulk
+loader: one that loads many keys in one call would need every key claimed
+before the call and the claims released after it, which is a different
+protocol from the per-key claim above.
+
+A key whose load this process claims and fails maps to `{:error,
+{:load_failed, reason}}`, the reply its waiters receive, with `reason`
+shaped as in §The loader function. It does not raise: the claimant has
+released the claim and notified its waiters before the failure reaches
+`fetch_all`, and the remaining keys are still fetched. `timeout:` applies
+to each key's wait, so one key past it maps to `{:error, :timeout}`. A
+missing loader or an invalid option raises `ArgumentError` before any key
+is looked up, as in `fetch/3`.
+
 ## Refresh-after-write
 
 `refresh_after_write: ms` on `start_link` (default `:infinity`). On a *hit*
@@ -198,6 +227,9 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
 - `fetch_async`: ten concurrent tasks for one key run the loader once; a
   loader crash surfaces through `Task.yield` as `{:exit, _}`, not as a caller
   crash.
+- `fetch_all`: every key maps to its result, hits come from the cache, a
+  key another process is loading is waited for and not loaded again, and
+  a loader failure on one key leaves the other keys' results in the map.
 - Refresh: with `refresh_after_write: 20`, a value written at t=0 is served
   as-is at t=25 (no wait, same value), a refresh runs once even under 100
   concurrent readers, and at t=25+load the new value is served. A refresh
@@ -365,3 +397,20 @@ the loaded value (Caffeine stores it too; the value is fresh by definition).
   `Theine.Test.LoaderHook` points, `:refresh_started` (in the starter,
   before its write) and `:refresh_task` (in the task, before its own,
   armed in the starter and found through `$callers`).
+- 2026-11-03 (M6.3): `fetch_all/4` (§Bulk) loads misses one after another
+  in the caller through the per-key single-flight, with the per-key
+  loader, rather than claiming every missing key up front or taking a
+  bulk loader. Claiming up front would hold claims that other fetchers
+  wait on while this process loads earlier keys, and a process that held
+  claims and then waited on another's claim could be waiting on a process
+  that waits on it. Loading in order holds one claim at a time and never
+  waits while holding one. A bulk loader (Caffeine's `loadAll`) needs a
+  protocol for claiming a set of keys, which this spec does not have, so
+  it stays out of v1. Two details differ from `fetch/3`. A claimant's
+  failure is returned in the map as `{:error, {:load_failed, reason}}`,
+  the reply its waiters got, instead of being raised, because a raise
+  would lose the results of the keys already fetched and skip the rest
+  (Caffeine's `getAll` throws and loses them). And `timeout:` limits each
+  key's wait, not the call: a deadline over the whole call would have to
+  be split across waits and loads, and a load in the caller has no limit
+  in `fetch/3` either.

@@ -86,7 +86,7 @@ Done: M4.1, M4.2, M4.3, M4.4, M4.4b, M4.5. M4 complete.
 
 ## M5 Gate
 
-Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5.1c, M5.2, M5.3, M5.4, M5.5.
+Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5.1c, M5.2, M5.3, M5.4, M5.5, M5.6a.
 
 **Unblocked 2026-11-02:** open question 2 is settled (specs/09 §Decisions 2026-11-02). The put threshold is now a burst cost check, and A1/A2 are judged on the reference machine, with `--dev-floor` on the development machine. Order: M5.1b, M5.1c, M5.6.
 
@@ -97,9 +97,10 @@ Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5
 - [x] M5.3 Documentation (specs/08 §Documentation; specs/00 §Mapping to Caffeine): `@doc` with an example on every public function, every option documented in `start_link/1`, module doc noting the per-start `persistent_term` write, `ex_doc` as a dev-only dep (allowed by AGENTS.md), README with the Caffeine mapping table — outcome: `mix docs` runs without warnings and every function in the specs/08 §Calls table has a doctest or unit test for each return shape. Met: `mix docs` (ex_doc 0.40.4, dev-only) is silent. Most of the docs were already written task by task. This task moved the option reference from the module doc into `start_link/1`, as specs/08 asks. It also added the missing `drain_backoff` row and a description of every option the table only listed (`name`, `expire_after_write`, `loader` and the tuning knobs). theine_test "every option has a table row and a description in the start_link/1 doc" checks this against `Config.options/0`, and "every public function of Theine has a doc with an iex> example" checks the docs chunk. The bench modules compiled in `:dev` are filtered out of the docs, and the internal modules are grouped under "Internals". A sweep for return shapes found two that no test asserted: `fetch/2` returning `{:error, {:load_failed, _}}` through the cache loader, and a `fetch_async` waiter completing with `{:nocatch, _}`, an exit reason or `:killed`. loader_test now covers both. The README is now user-facing: usage, the calls table, the Caffeine mapping and a benchmark summary from the latest log entries (get M5.1, hitrate M2.13, maintenance M3.2), with the bounded floor and the put gap stated as they are. M5.6 replaces those tables with the final gate's.
 - [x] M5.4 Package hygiene and hex build (specs/00 A6; specs/10 §Gates step 7): package metadata, `files:` excluding `bench/`, `test/`, `specs/` and the dev-only Mix task — outcome: `mix hex.build` succeeds and the tarball listing contains no `.so`, no bench or test files, and no NIF/port/make dependency in `mix.exs`. Met: `mix hex.build` (Hex 2.6.0) builds `theine-0.1.0.tar`, and the package holds `lib/` (15 files), `mix.exs`, `README.md` and `LICENSE`. The only dependency is `telemetry ~> 1.3`. Before this task the build failed on missing `description`, `licenses` and `links`. Its default file list would also have shipped `priv/plts`, the 8 MB of dialyzer PLTs, so `files:` is now an explicit list (specs/00 §Decisions M5.4). The package was unpacked with `mix hex.build --unpack` into `bench/results/hex-m54`. A path-dependency consumer (`bench/results/consumer-m54`) compiled it in `:prod` with `--warnings-as-errors` and ran a put, get and fetch. test/theine/package_test.exs pins the file list, the metadata and A6: no native file or native build script packaged, no extra compiler, telemetry the only runtime dep, and no `load_nif`, `@on_load`, port or `System.cmd` in `lib/`. The license is MIT, a placeholder the owner should confirm before publishing (open question 3).
 - [x] M5.5 Caffeine simulator cross-check instructions (specs/09 §`mix bench hitrate` human gate): `bench/README.md` section with the exact `./gradlew simulator:run` configuration per trace and size, the trace path mapping, and a comparison-table template — outcome: a human following `bench/README.md` can produce the `HillClimberWindowTinyLfu` (`simple` strategy, for `theine`) and `WindowTinyLfu` (for `theine_static`) columns for every hit-rate row; the table template is present under §Final gate below. Met; `lib/` unchanged. `bench/README.md` §Caffeine simulator cross-check has a shell loop that runs `./gradlew simulator:run` once per manifest row with `linked.Lru`, `sketch.WindowTinyLfu` and `sketch.HillClimberWindowTinyLfu`. Every setting is a `-Dcaffeine.simulator.…` flag, because the `run` task forwards only `caffeine.*` properties. The section also has a table from each theine parameter (specs/02, 05) to its simulator key. `arc` traces map to the simulator's `arc` format and `keys` traces to `lirs`, read from `bench/traces/`. It ends with three known differences to check first when a row misses: 32 accesses per pass, the sketch layout and the guard's random source. The loop had no network access, so the key names were written from knowledge of `reference.conf`, not checked against it. The README says so and tells the person to check each key at the tag they build, since the simulator ignores unknown keys. To catch a misread trace or size, the section has a self-check: `linked.Lru` must reproduce the harness's `lru` row to the hundredth. The rows' requests and hits come from `hitrate-408f736.json` and `hitrate-8d5d705.json`, which agree. §Final gate now holds the 12-row template: `lru` filled, `theine`/`theine_static` marked for M5.6, and the Caffeine columns "human gate pending". test/theine/bench_docs_test.exs checks that the script's rows, the self-check table and the template each name every (trace, size) of `bench/traces.exs` in order, each trace in its simulator format, and that the template's `lru` column matches the self-check. The stale "no URL or hash recorded" line about the ARC traces in `bench/README.md` is gone.
-- [ ] M5.6 Final gate (specs/10 §Gates step 7; specs/09 §Acceptance; open question 1 was settled on 2026-10-29 and M2.13 made the OLTP rows pass; the full `mix bench hitrate` outlasts the 2-hour background limit, so run it as `--traces OLTP,S3,P3,loop,zipf` and `--traces DS1`, as M2.13 did): run `mix test --include stress`, `mix bench get --dev-floor`, `mix bench hitrate`, `mix bench maintenance`, `mix docs`, `mix hex.build`; record all three bench summaries and the gate results under §Final gate, and replace the README's §Benchmarks tables (M5.3, from the log) with them; the simulator column stays marked "human gate pending" until a person fills it. The same goes for the reference machine's `mix bench get` (specs/09 §Reference machine): add a §Reference machine run subsection under §Final gate with a table template and the cell "human gate pending". The README states the measured sustained put throughput of one cache as a limit of the design (specs/09 put paragraph). It also says that the A1/A2 figures are the reference machine's once that run is filled, and the development machine's until then — outcome: §Final gate filled with numbers for A1 and A2 (pass or `floor` on the development machine; reference machine pending a human), the put burst check passing, and A3 (LRU and `theine_static` parts), A4, A5 and A6 passing.
+- [x] M5.6a Final gate (specs/10 §Gates step 7; specs/09 §Acceptance; open question 1 was settled on 2026-10-29 and M2.13 made the OLTP rows pass; the full `mix bench hitrate` outlasts the 2-hour background limit, so run it as `--traces OLTP,S3,P3,loop,zipf` and `--traces DS1`, as M2.13 did): run `mix test --include stress`, `mix bench get --dev-floor`, `mix bench hitrate`, `mix bench maintenance`, `mix docs`, `mix hex.build`; record all three bench summaries and the gate results under §Final gate, and replace the README's §Benchmarks tables (M5.3, from the log) with them; the simulator column stays marked "human gate pending" until a person fills it. The same goes for the reference machine's `mix bench get` (specs/09 §Reference machine): add a §Reference machine run subsection under §Final gate with a table template and the cell "human gate pending". The README states the measured sustained put throughput of one cache as a limit of the design (specs/09 put paragraph). It also says that the A1/A2 figures are the reference machine's once that run is filled, and the development machine's until then — outcome: §Final gate filled with numbers for A1 and A2 (pass or `floor` on the development machine; reference machine pending a human), the put burst check passing, and A3 (LRU and `theine_static` parts), A4, A5 and A6 passing. Met except for one row, which is now M5.6b; `lib/` unchanged (it has not changed since M5.3). Everything ran on the tree of 7e8712e, so every result file is `*-7e8712e.json`. `mix test --include stress --cover` passed 410 tests in 72.7 s with Loader and Policy at 100.00%. Dialyzer, `mix docs` and `mix hex.build` were clean. `mix bench hitrate` passed 25/25 in two runs (19/19, then DS1 6/6). Every row matches M2.13's and M5.2's results to the hit (`compare-hits.exs`: 12/12 shared rows against `hitrate-8d5d705.json`, 9/9 against `hitrate-7bbe3b6.json`). `mix bench maintenance` passed 4/4. `mix bench get --dev-floor` passed the put burst check on all six shapes (5.58–7.36×). Every A2 check and every other A1 check was `pass` or `floor`. The exception is A1 p99 at n=1000 parallel 1. That row was outside the development band in the full run (tuple3 2.02) and in both `--sizes 1000` reruns (tuple3 1.91 and binary_1kb 1.92, then tuple3 1.67), so every run exited 1. Two reruns is where M5.1c stopped; running again until one passed would be picking the sample, and the band may not be widened. §Final gate has every table, the §Reference machine run template, and the simulator template with the theine columns filled. The README's §Benchmarks now carries the gate's figures. The A1/A2 verdicts there are given as the development machine's until the reference machine's run is filled, and the README states the sustained put limit.
+- [ ] M5.6b The A1 p99 at n=1000 parallel 1 inside the development band (discovered issue 4; open question 4): find out what puts the bounded `theine` p99 at 1.67–2.02× `ets` on this row while `ets` p99 holds at 363–367 ns. A compiled probe at n=1000 with one pinned reader should record each read's latency and, from a pass telemetry handler, each pass's start, end and `scheduler_id`. Report how many reads above the `theine` p99 overlap a pass on the reader's scheduler, and how much `drain_backoff` and `read_buffer` sizing move the row. Change `lib/` only for a lever that stays inside specs/03 and specs/04, and record it in their §Decisions. Never touch the band or the threshold — outcome: either a full `mix bench get --dev-floor` exits 0, or its `--sizes 1000` rerun does (specs/09 §Decisions M1.6), and the run is recorded under §Final gate. Or, if no lever exists, the measurement is recorded under §Benchmark log, and open question 4 states what it showed for the human. M6 stays blocked until this is checked or open question 4 is answered.
 
-## M6 Optional (only after M5.6 is checked)
+## M6 Optional (only after M5.6b is checked)
 
 Done: nothing yet.
 
@@ -115,7 +116,7 @@ Done: nothing yet.
 2. **Concurrent writes to one key can leave the policy with the wrong id** (found in M1.2, resolved in M1.5). `put/4` allocates the id before the insert, and the write event is sent after it, so two writers racing on one key can produce any interleaving of (insert, send) pairs: the entries table may end with the lower id while the policy applies the higher id's event last, or vice versa. The spec's rules (last `:put` event wins; `on_remove` ignores a stale id) then left a policy row whose id never matched the table; in an unbounded cache `size/1` drifted by one and `delete/2` could not clear the row. Resolved as recommended (specs/05 §Decisions 2026-10-27 M1.5): `on_remove(key, id)` with a non-matching id does one `:ets.member/2` on the entries table and drops the row when the key is absent; when the key is present with a third id, the row stays and that id's `:put` corrects it. Tested in policy_test, maintenance_test and the 200-round race in theine_test. Since M3.2 a lower id's `:put` arriving after a higher id's is applied only while the table holds it, so one direction of the reorder no longer leaves the row on a stale id (specs/05 §Decisions M3.2).
 3. **A write that straddles `clear/1` can leave a policy row with no entry** (noted in M1.5, not fixed). A writer that inserted before `:ets.delete_all_objects/1` and whose `:put` event is consumed after `Maintenance.reset/1` re-adds a policy row for a key the table no longer holds. No later event for that key arrives on its own (a `delete/2` of an absent key sends nothing), so in an unbounded cache the row lives until a `put` of the same key or a Maintenance restart rebuild (M2.9). In a bounded cache the eviction re-lookup drops it. The window is a few microseconds per `clear/1` and the cost is one phantom entry in `size/1`; the spec accepts it (specs/01 §Write path `clear/1`). If it matters later, `reset/1` could record the `ids` high-water mark and `on_write` ignore `:put` events with a lower id until the table confirms the key.
 
-4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6, M2.3). Four crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression (M2.3 did not touch `get/2` at all and crossed at 1.51× over a 362 ns floor), each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry. M5.1b (2026-11-03, `lib/` unchanged) saw the bounded `theine` p99 at n=1000 parallel 1 past the 1.65 development band of specs/09 §Reference machine in two runs of the same tree. The full run had binary_1kb at 1.98 and tuple3 at 1.47. The `--sizes 1000` rerun had binary_1kb at 1.44 and tuple3 at 1.73. `theine_nostats` moved with it (1.76, then 1.73). So M5.1c's `--dev-floor` run can report `fail` on this row with no regression. The M1.6 rerun procedure still applies, and the band is not widened. M5.1c bore it out. It made three `--dev-floor` runs of one tree, and the row left the band in two of them, on one value kind each time: tuple3 1.90 (binary_1kb 1.46), then binary_1kb 1.66 (tuple3 1.39), then neither (1.46, 1.37). Counting M5.1b, the bounded p99 at n=1000 parallel 1 was past 1.65 in three of five runs. Both sides of the ratio move: `ets` p99 at tuple3 was 361, 460 and 420 ns, and `theine`'s binary_1kb p99 was 618, 692 and 646 ns. M5.6 should expect a rerun. The bench-only lever above (the `ets` floor measured beside each theine subject, or the p99 checks taken over several runs) would need a specs/09 §Decisions entry. It must not loosen the check. Nothing else in the band is close: in the full run the next-worst floor row was 1.61 on a p50.
+4. **The `ets` p99 floor at n=1000 tuple3 parallel=1 is noisy enough to fail A1 on its own** (M1.5, M1.6, M2.3). Four crossings of the 1.5× p99 limit by `theine_unbounded` at that one shape with no hit-path regression (M2.3 did not touch `get/2` at all and crossed at 1.51× over a 362 ns floor), each cleared by a rerun of the same tree. The procedure (rerun `--sizes 1000`, pass there clears it) is in specs/09 §Decisions M1.6 and AGENTS.md; the thresholds are unchanged. If a later hot-path task (M2.8, M4.4) keeps hitting it, a bench-only task could measure the `ets` floor twice per shape, before and after the theine subjects, and report the shape's ratios against the floor measured closest in time; that changes the harness, not the limit, and would need a specs/09 Decisions entry. M5.1b (2026-11-03, `lib/` unchanged) saw the bounded `theine` p99 at n=1000 parallel 1 past the 1.65 development band of specs/09 §Reference machine in two runs of the same tree. The full run had binary_1kb at 1.98 and tuple3 at 1.47. The `--sizes 1000` rerun had binary_1kb at 1.44 and tuple3 at 1.73. `theine_nostats` moved with it (1.76, then 1.73). So M5.1c's `--dev-floor` run can report `fail` on this row with no regression. The M1.6 rerun procedure still applies, and the band is not widened. M5.1c bore it out. It made three `--dev-floor` runs of one tree, and the row left the band in two of them, on one value kind each time: tuple3 1.90 (binary_1kb 1.46), then binary_1kb 1.66 (tuple3 1.39), then neither (1.46, 1.37). Counting M5.1b, the bounded p99 at n=1000 parallel 1 was past 1.65 in three of five runs. Both sides of the ratio move: `ets` p99 at tuple3 was 361, 460 and 420 ns, and `theine`'s binary_1kb p99 was 618, 692 and 646 ns. M5.6 should expect a rerun. The bench-only lever above (the `ets` floor measured beside each theine subject, or the p99 checks taken over several runs) would need a specs/09 §Decisions entry. It must not loosen the check. Nothing else in the band is close: in the full run the next-worst floor row was 1.61 on a p50. M5.6 (2026-11-03, `lib/` unchanged since M5.3) had the row outside the band in all three of its runs: tuple3 2.02 in the full run (binary_1kb 1.51), then 1.91 and 1.92, then 1.67 and 1.46. `ets` p99 was 363, 366 and 367 ns, and `theine`'s tuple3 p99 was 733, 699 and 613 ns. So the lever above, an `ets` floor measured closer in time, would not help here. The `ets` side is steady and the `theine` tail moves. Counting M5.1b and M5.1c, the row was past 1.65 on at least one value kind in 7 of 8 runs of one `lib/`. It is the gate's one unmet row (M5.6b, open question 4). `theine_nostats` is not checked, but it shows the same tail (1.57–1.91).
 
 5. **A heavier rewrite of a protected key left `protected_weight` above `protected_max`** (found by M2.6's eviction property at run 158 of 3_000, resolved in M2.6). `on_write` of a known key adjusted the segment weight by the delta and moved the key to its segment's MRU, but only `on_access` demoted; a 7-weight protected key rewritten at weight 9 beside another protected key exceeded the 15-weight limit of `max_size` 20. Caffeine's `demoteFromMainProtected` runs at the end of every maintenance; here `on_write` applies the `on_access` rule after a weight increase (demote the protected LRU until it fits, or move a key heavier than `protected_max` to the probation MRU), so the specs/05 §Acceptance invariant now says "after every event" (specs/05 §Events `on_write`, §Decisions M2.6). The M2.5 property had the same exposure at 100 runs and never hit it; the eviction property keeps `max_runs: 1000` (about a second).
 
@@ -150,6 +151,11 @@ Done: nothing yet.
 
 3. **Resolved 2026-11-02 by a human: MIT confirmed** (specs/00 §Decisions M5.4). The question as raised: **the package license (2026-10-29, M5.4).** No spec names one, and `mix hex.build` refuses to build without `licenses:`. The package is MIT with a `LICENSE` naming Will Gilman (specs/00 §Decisions M5.4). **Recommended:** confirm MIT, or switch to Apache-2.0 (Caffeine's license). Switching changes only `licenses:` in `mix.exs` and the `LICENSE` file, and must happen before the first `mix hex.publish`.
 
+4. **Raised 2026-11-03 in M5.6: the bounded A1 p99 at n=1000 parallel 1 lies outside the development band in most runs.** The band of specs/09 §Reference machine is ≤ 1.65 for A1. On this row, M5.6's three `mix bench get --dev-floor` runs measured 2.02, 1.91/1.92 and 1.67, and the row was past 1.65 in 7 of the 8 runs since M5.1b, all with the same `lib/`. Every other A1/A2 row of the gate is `pass` or `floor`. The row is not a regression: M5.1c's last rerun had it at 1.46, and the M1.6 procedure ("a second failure in the targeted run is a regression") was written before the bounded subject existed. The loop may not widen the band. A1 itself is judged on the reference machine, whose run is pending. Choices:
+   - (a) Keep the band as it is. M5.6b looks for a lever: the pass running on the reader's own scheduler (specs/04 §Decisions M2.11b) is the likely source of the tail at parallel 1. M6 waits until a `--dev-floor` run exits 0.
+   - (b) **Recommended:** let the reference machine's run settle this one row. If the Mac run passes A1 p99 at n=1000 parallel 1, the development machine's `fail` there is recorded as the laptop's floor, as M2.8d recorded the others, and M5.6b is checked with its measurement attached. This needs a specs/09 §Decisions entry by a human, because it changes what the development run's exit status means for one row. The thresholds stay as they are.
+   - (c) Widen the A1 band for p99 at parallel 1. This is a human decision about the band. The data puts the row's spread at 1.39–2.02.
+
 Earlier: M0.4b was done by hand on 2026-10-27, so `mix bench hitrate`
 runs every trace and policy tasks must run it in full, not with
 `--traces loop,zipf`.
@@ -164,6 +170,10 @@ needs the answer (PROMPT_build.md step 5).
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)
+
+### M5.6a — the final gate's three benches, tree of 7e8712e (2026-11-03; hitrate 25/25, maintenance 4/4, get exit 1 on the A1 p99 row at n=1000 parallel 1 in all three runs; `lib/` unchanged)
+
+The tables are under §Final gate, not repeated here.
 
 ### M5.1c — `mix bench get --dev-floor`, tree of the M5.1c commit (2026-11-03; full run 74 pass, 15 floor, 1 fail; `--sizes 1000` reruns 25/2/1 and 22/6/0, the last exiting 0; `lib/` unchanged)
 
@@ -1877,28 +1887,306 @@ M0.5 `lru` baseline (`mix bench hitrate --traces loop,zipf`, parent a06d881):
 
 ## Final gate
 
-(Filled by M5.6.)
+M5.6a, 2026-11-03, on the tree of 7e8712e (`lib/` last changed in M5.3).
+The development machine: Intel(R) Core(TM) i5-5257U CPU @ 2.70GHz;
+Linux 7.2.5-3-omarchy; OTP 28; `schedulers_online` 4; Elixir 1.20.4. The
+benches ran one at a time on a quiet machine with
+`ERL_FLAGS="+sbt db +sbwt very_long"`, except `mix bench hitrate`, whose
+replays are deterministic. The test suite ran beside its first half.
+
+| step | result |
+| --- | --- |
+| `mix format --check-formatted` | clean |
+| `mix compile --warnings-as-errors` | clean |
+| `mix test --include stress --cover` | 410 passed (35 doctests, 13 properties, 362 tests), 0 failures, 72.7 s, seed 302928; `Theine.Loader` 100.00%, `Theine.Policy` 100.00%, total 98.11% |
+| `MIX_ENV=test mix dialyzer` | 0 errors |
+| `mix docs` | no warnings |
+| `mix hex.build` (`--unpack --output bench/results/hex-m56`) | theine 0.1.0: `lib` (15 files), `mix.exs`, `README.md`, `LICENSE`; one dependency, `telemetry ~> 1.3`; MIT |
+| `mix bench hitrate` | exit 0: 19/19 (`--traces OLTP,S3,P3,loop,zipf`, 44 min) and 6/6 (`--traces DS1`, 79 min) |
+| `mix bench maintenance` | exit 0: 4/4 |
+| `mix bench get --dev-floor` | exit 1 in each run: full run 72 pass, 17 floor, 1 fail; `--sizes 1000 --scenarios get` reruns 17/9/2 and 25/2/1. Every `fail` is A1 p99 at n=1000 parallel 1 (M5.6b, open question 4) |
+
+| criterion | development machine | reference machine |
+| --- | --- | --- |
+| A1 latency | `pass` or `floor` on every row except p99 at n=1000 parallel 1: `fail` in all three runs (tuple3 2.02, 1.91, 1.67; binary_1kb 1.51, 1.92, 1.46) | human gate pending |
+| A2 throughput | `floor` (full run; the reruns' n=1000 rows were 0.57–0.59 and 1.91–1.93): ips/ets 0.59–0.63 on tuple3 at parallel 4 (binary_1kb 0.69–0.73 pass); ips/cachex 1.81–1.94 (bounded) and 1.98 (unbounded, n=1000000 binary_1kb); ips/nebulex 5.24–6.20, pass | human gate pending |
+| put burst | pass on all six shapes, 5.58–7.36× an ETS insert (limit 10) | human gate pending |
+| A3 hit rate | `theine ≥ lru` on 12/12 rows, `loop` +58.67 points (limit +10), `theine ≥ theine_static − 1` on 12/12 (worst −0.71, P3) | Caffeine simulator: human gate pending |
+| A4 single-flight | pass: the stress tier's exactly-once loader soak and the loader suite | — |
+| A5 bounded | pass: worst sample 1_001_028 = limit, 1_000_000 after 1 s | — |
+| A6 no native code | pass: test/theine/package_test.exs and the package listing above | — |
+
+### `mix bench get --dev-floor` (development machine)
+
+Full run, 72 pass, 17 floor, 1 fail, about 15 minutes:
+
+| scenario | n | value | parallel | subject | p50 ns | p99 ns | ips | p50/ets | p99/ets | ips/ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| get | 1000 | tuple3 | 1 | ets | 251.00 | 363.00 | 3856716 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | tuple3 | 4 | ets | 409.00 | 600.00 | 2348318 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | tuple3 | 1 | theine | 383.00 | 733.00 | 2191210 | 1.53 | 2.02 | 0.57 |
+| get | 1000 | tuple3 | 4 | theine | 624.00 | 917.00 | 1377750 | 1.53 | 1.53 | 0.59 |
+| get | 1000 | tuple3 | 1 | theine_unbounded | 326.00 | 523.00 | 2775435 | 1.30 | 1.44 | 0.72 |
+| get | 1000 | tuple3 | 4 | theine_unbounded | 549.00 | 792.00 | 1661204 | 1.34 | 1.32 | 0.71 |
+| get | 1000 | tuple3 | 1 | theine_nostats | 381.00 | 569.00 | 2280985 | 1.52 | 1.57 | 0.59 |
+| get | 1000 | tuple3 | 4 | theine_nostats | 619.00 | 901.00 | 1368538 | 1.51 | 1.50 | 0.58 |
+| get | 1000 | tuple3 | 1 | cachex | 814.00 | 1248.00 | 1171497 | 3.24 | 3.44 | 0.30 |
+| get | 1000 | tuple3 | 4 | cachex | 1327.00 | 2058.00 | 710821 | 3.24 | 3.43 | 0.30 |
+| get | 1000 | tuple3 | 1 | nebulex | 2073.00 | 4338.00 | 428669 | 8.26 | 11.95 | 0.11 |
+| get | 1000 | tuple3 | 4 | nebulex | 3753.00 | 49077.00 | 222197 | 9.18 | 81.80 | 0.09 |
+| get | 1000 | binary_1kb | 1 | ets | 270.00 | 412.00 | 3058089 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | binary_1kb | 4 | ets | 439.00 | 710.00 | 1857096 | 1.00 | 1.00 | 1.00 |
+| get | 1000 | binary_1kb | 1 | theine | 395.00 | 622.00 | 2113885 | 1.46 | 1.51 | 0.69 |
+| get | 1000 | binary_1kb | 4 | theine | 656.00 | 1057.00 | 1272758 | 1.49 | 1.49 | 0.69 |
+| get | 1000 | binary_1kb | 1 | theine_unbounded | 339.00 | 523.00 | 2455846 | 1.26 | 1.27 | 0.80 |
+| get | 1000 | binary_1kb | 4 | theine_unbounded | 591.00 | 861.00 | 1425955 | 1.35 | 1.21 | 0.77 |
+| get | 1000 | binary_1kb | 1 | theine_nostats | 393.00 | 658.00 | 2090689 | 1.46 | 1.60 | 0.68 |
+| get | 1000 | binary_1kb | 4 | theine_nostats | 657.00 | 1044.00 | 1283772 | 1.50 | 1.47 | 0.69 |
+| get | 1000 | binary_1kb | 1 | cachex | 825.00 | 1302.00 | 1114657 | 3.06 | 3.16 | 0.36 |
+| get | 1000 | binary_1kb | 4 | cachex | 1372.00 | 2345.99 | 660563 | 3.13 | 3.30 | 0.36 |
+| get | 1000 | binary_1kb | 1 | nebulex | 2097.00 | 3922.00 | 435400 | 7.77 | 9.52 | 0.14 |
+| get | 1000 | binary_1kb | 4 | nebulex | 3907.00 | 6197.00 | 229506 | 8.90 | 8.73 | 0.12 |
+| get | 100000 | tuple3 | 1 | ets | 289.00 | 608.00 | 2988829 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | tuple3 | 4 | ets | 440.00 | 816.00 | 2011721 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | tuple3 | 1 | theine | 436.00 | 799.00 | 1944404 | 1.51 | 1.31 | 0.65 |
+| get | 100000 | tuple3 | 4 | theine | 666.00 | 1094.00 | 1254967 | 1.51 | 1.34 | 0.62 |
+| get | 100000 | tuple3 | 1 | theine_unbounded | 347.00 | 669.00 | 2413136 | 1.20 | 1.10 | 0.81 |
+| get | 100000 | tuple3 | 4 | theine_unbounded | 588.00 | 993.00 | 1457094 | 1.34 | 1.22 | 0.72 |
+| get | 100000 | tuple3 | 1 | theine_nostats | 442.00 | 839.00 | 1911147 | 1.53 | 1.38 | 0.64 |
+| get | 100000 | tuple3 | 4 | theine_nostats | 666.00 | 1088.00 | 1230910 | 1.51 | 1.33 | 0.61 |
+| get | 100000 | tuple3 | 1 | cachex | 852.00 | 1565.00 | 1086152 | 2.95 | 2.57 | 0.36 |
+| get | 100000 | tuple3 | 4 | cachex | 1351.00 | 2150.00 | 687083 | 3.07 | 2.63 | 0.34 |
+| get | 100000 | tuple3 | 1 | nebulex | 2147.00 | 4231.00 | 416831 | 7.43 | 6.96 | 0.14 |
+| get | 100000 | tuple3 | 4 | nebulex | 3940.00 | 6998.00 | 217568 | 8.95 | 8.58 | 0.11 |
+| get | 100000 | binary_1kb | 1 | ets | 291.00 | 618.00 | 2604536 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | binary_1kb | 4 | ets | 475.00 | 906.00 | 1670744 | 1.00 | 1.00 | 1.00 |
+| get | 100000 | binary_1kb | 1 | theine | 456.00 | 911.00 | 1756908 | 1.57 | 1.47 | 0.67 |
+| get | 100000 | binary_1kb | 4 | theine | 710.00 | 1220.00 | 1168285 | 1.49 | 1.35 | 0.70 |
+| get | 100000 | binary_1kb | 1 | theine_unbounded | 361.00 | 685.00 | 2176163 | 1.24 | 1.11 | 0.84 |
+| get | 100000 | binary_1kb | 4 | theine_unbounded | 628.00 | 1064.00 | 1326522 | 1.32 | 1.17 | 0.79 |
+| get | 100000 | binary_1kb | 1 | theine_nostats | 420.00 | 829.00 | 1820960 | 1.44 | 1.34 | 0.70 |
+| get | 100000 | binary_1kb | 4 | theine_nostats | 693.00 | 1206.00 | 1184944 | 1.46 | 1.33 | 0.71 |
+| get | 100000 | binary_1kb | 1 | cachex | 840.00 | 1523.00 | 1046796 | 2.89 | 2.46 | 0.40 |
+| get | 100000 | binary_1kb | 4 | cachex | 1400.00 | 2599.00 | 630516 | 2.95 | 2.87 | 0.38 |
+| get | 100000 | binary_1kb | 1 | nebulex | 2187.00 | 3541.00 | 424589 | 7.52 | 5.73 | 0.16 |
+| get | 100000 | binary_1kb | 4 | nebulex | 3998.00 | 7098.00 | 222806 | 8.42 | 7.83 | 0.13 |
+| get | 1000000 | tuple3 | 1 | ets | 342.00 | 600.00 | 2829446 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | tuple3 | 4 | ets | 489.00 | 831.00 | 1958004 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | tuple3 | 1 | theine | 495.00 | 803.00 | 1854371 | 1.45 | 1.34 | 0.66 |
+| get | 1000000 | tuple3 | 4 | theine | 716.00 | 1128.00 | 1225719 | 1.46 | 1.36 | 0.63 |
+| get | 1000000 | tuple3 | 1 | theine_unbounded | 407.00 | 727.00 | 2288988 | 1.19 | 1.21 | 0.81 |
+| get | 1000000 | tuple3 | 4 | theine_unbounded | 639.00 | 998.00 | 1412441 | 1.31 | 1.20 | 0.72 |
+| get | 1000000 | tuple3 | 1 | theine_nostats | 515.00 | 1092.00 | 1496823 | 1.51 | 1.82 | 0.53 |
+| get | 1000000 | tuple3 | 4 | theine_nostats | 703.00 | 1110.00 | 1227999 | 1.44 | 1.34 | 0.63 |
+| get | 1000000 | tuple3 | 1 | cachex | 903.00 | 1592.00 | 1068643 | 2.64 | 2.65 | 0.38 |
+| get | 1000000 | tuple3 | 4 | cachex | 1389.00 | 2200.00 | 667357 | 2.84 | 2.65 | 0.34 |
+| get | 1000000 | tuple3 | 1 | nebulex | 2188.00 | 4446.00 | 408646 | 6.40 | 7.41 | 0.14 |
+| get | 1000000 | tuple3 | 4 | nebulex | 3800.00 | 82804.99 | 204150 | 7.77 | 99.64 | 0.10 |
+| get | 1000000 | binary_1kb | 1 | ets | 350.00 | 632.00 | 2411900 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | binary_1kb | 4 | ets | 524.00 | 923.00 | 1587318 | 1.00 | 1.00 | 1.00 |
+| get | 1000000 | binary_1kb | 1 | theine | 505.00 | 824.00 | 1753201 | 1.44 | 1.30 | 0.73 |
+| get | 1000000 | binary_1kb | 4 | theine | 741.00 | 1234.00 | 1157027 | 1.41 | 1.34 | 0.73 |
+| get | 1000000 | binary_1kb | 1 | theine_unbounded | 412.00 | 708.00 | 2071299 | 1.18 | 1.12 | 0.86 |
+| get | 1000000 | binary_1kb | 4 | theine_unbounded | 673.00 | 1081.00 | 1263772 | 1.28 | 1.17 | 0.80 |
+| get | 1000000 | binary_1kb | 1 | theine_nostats | 517.00 | 839.00 | 1715853 | 1.48 | 1.33 | 0.71 |
+| get | 1000000 | binary_1kb | 4 | theine_nostats | 742.00 | 1245.00 | 1151396 | 1.42 | 1.35 | 0.73 |
+| get | 1000000 | binary_1kb | 1 | cachex | 902.00 | 1396.00 | 1024519 | 2.58 | 2.21 | 0.42 |
+| get | 1000000 | binary_1kb | 4 | cachex | 1426.00 | 2413.00 | 638000 | 2.72 | 2.61 | 0.40 |
+| get | 1000000 | binary_1kb | 1 | nebulex | 2213.00 | 3547.00 | 421982 | 6.32 | 5.61 | 0.17 |
+| get | 1000000 | binary_1kb | 4 | nebulex | 4010.00 | 7937.00 | 201481 | 7.65 | 8.60 | 0.13 |
+
+| scenario | n | value | subject | ns/put | burst p50 ns/put | burst p99 ns/put | bursts | ns/put / ets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| put_burst | 1000 | tuple3 | ets | 193.97 | 192.78 | 205.20 | 1000 | 1.00 |
+| put_burst | 1000 | tuple3 | theine | 1204.61 | 1334.38 | 2229.95 | 1000 | 6.21 |
+| put_burst | 1000 | binary_1kb | ets | 226.80 | 212.85 | 777.20 | 1000 | 1.00 |
+| put_burst | 1000 | binary_1kb | theine | 1650.09 | 1456.65 | 4881.35 | 1000 | 7.28 |
+| put_burst | 100000 | tuple3 | ets | 248.45 | 234.72 | 799.24 | 1000 | 1.00 |
+| put_burst | 100000 | tuple3 | theine | 1829.57 | 1656.63 | 4593.84 | 1000 | 7.36 |
+| put_burst | 100000 | binary_1kb | ets | 279.95 | 262.67 | 731.12 | 1000 | 1.00 |
+| put_burst | 100000 | binary_1kb | theine | 1582.65 | 1649.51 | 4311.43 | 1000 | 5.65 |
+| put_burst | 1000000 | tuple3 | ets | 267.01 | 266.07 | 289.54 | 1000 | 1.00 |
+| put_burst | 1000000 | tuple3 | theine | 1651.92 | 1619.51 | 3390.64 | 1000 | 6.19 |
+| put_burst | 1000000 | binary_1kb | ets | 293.97 | 292.88 | 335.10 | 1000 | 1.00 |
+| put_burst | 1000000 | binary_1kb | theine | 1639.84 | 1709.20 | 4622.04 | 1000 | 5.58 |
+
+Sustained put (no threshold). `ips` is per process (bench/README.md), so a
+parallel-4 row's aggregate is four times its `ips`:
+
+| scenario | n | value | parallel | subject | p50 ns | p99 ns | ips | ips/ets | ips/cachex |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| put | 1000 | tuple3 | 1 | ets | 356.00 | 560.00 | 2793136 | 1.00 | 3.28 |
+| put | 1000 | tuple3 | 4 | ets | 590.00 | 1047.00 | 1462237 | 1.00 | 2.97 |
+| put | 1000 | tuple3 | 1 | theine | 1119.00 | 2442.00 | 451782 | 0.16 | 0.53 |
+| put | 1000 | tuple3 | 4 | theine | 1919.00 | 5524.00 | 60615 | 0.04 | 0.12 |
+| put | 1000 | tuple3 | 1 | cachex | 1053.00 | 1709.00 | 852078 | 0.31 | 1.00 |
+| put | 1000 | tuple3 | 4 | cachex | 1691.00 | 3038.00 | 492685 | 0.34 | 1.00 |
+| put | 1000 | tuple3 | 1 | nebulex | 3016.00 | 5890.00 | 297271 | 0.11 | 0.35 |
+| put | 1000 | tuple3 | 4 | nebulex | 5359.00 | 12677.00 | 157526 | 0.11 | 0.32 |
+| put | 1000 | binary_1kb | 1 | ets | 444.00 | 702.00 | 2223453 | 1.00 | 2.77 |
+| put | 1000 | binary_1kb | 4 | ets | 702.00 | 1539.00 | 1039207 | 1.00 | 3.06 |
+| put | 1000 | binary_1kb | 1 | theine | 1278.00 | 2365.99 | 468610 | 0.21 | 0.58 |
+| put | 1000 | binary_1kb | 4 | theine | 2074.00 | 6882.00 | 60061 | 0.06 | 0.18 |
+| put | 1000 | binary_1kb | 1 | cachex | 1138.00 | 2064.00 | 801245 | 0.36 | 1.00 |
+| put | 1000 | binary_1kb | 4 | cachex | 1863.00 | 4191.00 | 339943 | 0.33 | 1.00 |
+| put | 1000 | binary_1kb | 1 | nebulex | 3169.00 | 8245.00 | 141026 | 0.06 | 0.18 |
+| put | 1000 | binary_1kb | 4 | nebulex | 5544.00 | 15377.00 | 107228 | 0.10 | 0.32 |
+| put | 100000 | tuple3 | 1 | ets | 416.00 | 726.00 | 2340276 | 1.00 | 2.97 |
+| put | 100000 | tuple3 | 4 | ets | 633.00 | 1082.00 | 1470573 | 1.00 | 2.96 |
+| put | 100000 | tuple3 | 1 | theine | 1204.00 | 2816.00 | 244908 | 0.10 | 0.31 |
+| put | 100000 | tuple3 | 4 | theine | 1957.00 | 5197.00 | 51408 | 0.03 | 0.10 |
+| put | 100000 | tuple3 | 1 | cachex | 1148.00 | 2115.00 | 788574 | 0.34 | 1.00 |
+| put | 100000 | tuple3 | 4 | cachex | 1738.00 | 3197.00 | 497211 | 0.34 | 1.00 |
+| put | 100000 | tuple3 | 1 | nebulex | 3224.00 | 7712.00 | 247698 | 0.11 | 0.31 |
+| put | 100000 | tuple3 | 4 | nebulex | 5413.00 | 12611.00 | 156830 | 0.11 | 0.32 |
+| put | 100000 | binary_1kb | 1 | ets | 493.00 | 822.00 | 1931381 | 1.00 | 2.50 |
+| put | 100000 | binary_1kb | 4 | ets | 764.00 | 1604.00 | 1138698 | 1.00 | 3.40 |
+| put | 100000 | binary_1kb | 1 | theine | 1304.00 | 3055.00 | 366333 | 0.19 | 0.47 |
+| put | 100000 | binary_1kb | 4 | theine | 2142.00 | 6242.78 | 49876 | 0.04 | 0.15 |
+| put | 100000 | binary_1kb | 1 | cachex | 1187.00 | 1787.00 | 772438 | 0.40 | 1.00 |
+| put | 100000 | binary_1kb | 4 | cachex | 1901.00 | 4244.00 | 334529 | 0.29 | 1.00 |
+| put | 100000 | binary_1kb | 1 | nebulex | 3625.00 | 10853.00 | 126895 | 0.07 | 0.16 |
+| put | 100000 | binary_1kb | 4 | nebulex | 5677.00 | 16978.00 | 100920 | 0.09 | 0.30 |
+| put | 1000000 | tuple3 | 1 | ets | 425.00 | 696.00 | 2361642 | 1.00 | 2.98 |
+| put | 1000000 | tuple3 | 4 | ets | 653.00 | 1100.00 | 1443598 | 1.00 | 3.03 |
+| put | 1000000 | tuple3 | 1 | theine | 1167.00 | 2631.00 | 335908 | 0.14 | 0.42 |
+| put | 1000000 | tuple3 | 4 | theine | 1981.00 | 5217.00 | 49986 | 0.03 | 0.11 |
+| put | 1000000 | tuple3 | 1 | cachex | 1156.00 | 1799.00 | 791696 | 0.34 | 1.00 |
+| put | 1000000 | tuple3 | 4 | cachex | 1751.00 | 3287.00 | 475966 | 0.33 | 1.00 |
+| put | 1000000 | tuple3 | 1 | nebulex | 3189.00 | 9014.99 | 271900 | 0.12 | 0.34 |
+| put | 1000000 | tuple3 | 4 | nebulex | 5255.00 | 70032.99 | 148363 | 0.10 | 0.31 |
+| put | 1000000 | binary_1kb | 1 | ets | 481.00 | 809.00 | 1993356 | 1.00 | 2.79 |
+| put | 1000000 | binary_1kb | 4 | ets | 777.00 | 1621.00 | 1144020 | 1.00 | 3.82 |
+| put | 1000000 | binary_1kb | 1 | theine | 1295.00 | 2968.00 | 334673 | 0.17 | 0.47 |
+| put | 1000000 | binary_1kb | 4 | theine | 2163.00 | 7194.07 | 47457 | 0.04 | 0.16 |
+| put | 1000000 | binary_1kb | 1 | cachex | 1217.00 | 1992.00 | 714969 | 0.36 | 1.00 |
+| put | 1000000 | binary_1kb | 4 | cachex | 1908.00 | 4399.99 | 299387 | 0.26 | 1.00 |
+| put | 1000000 | binary_1kb | 1 | nebulex | 3356.00 | 7643.99 | 201906 | 0.10 | 0.28 |
+| put | 1000000 | binary_1kb | 4 | nebulex | 5713.00 | 17350.19 | 99782 | 0.09 | 0.33 |
+
+So one cache sustained 245_000–469_000 puts/s from one writer, and
+190_000–242_000 in total from four writers, on this machine.
+
+Missed thresholds of the full run (`Thresholds: 72/90 passed`):
+
+| id | check | actual | limit | band | verdict |
+| --- | --- | --- | --- | --- | --- |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=1 | 1.53 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=1 | 2.02 | <= 1.5 | <= 1.65 | fail |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=4 | 1.53 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=4 | 1.53 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=1000 tuple3 parallel=4 | 0.59 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=1000 tuple3 parallel=4 | 1.94 | >= 2.0 | >= 1.7 | floor |
+| A1 | theine p99 / ets p99, n=1000 binary_1kb parallel=1 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / cachex ips, n=1000 binary_1kb parallel=4 | 1.93 | >= 2.0 | >= 1.7 | floor |
+| A1 | theine p50 / ets p50, n=100000 tuple3 parallel=1 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p50 / ets p50, n=100000 tuple3 parallel=4 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=100000 tuple3 parallel=4 | 0.62 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=100000 tuple3 parallel=4 | 1.83 | >= 2.0 | >= 1.7 | floor |
+| A1 | theine p50 / ets p50, n=100000 binary_1kb parallel=1 | 1.57 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / cachex ips, n=100000 binary_1kb parallel=4 | 1.85 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine ips / ets ips, n=1000000 tuple3 parallel=4 | 0.63 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=1000000 tuple3 parallel=4 | 1.84 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine ips / cachex ips, n=1000000 binary_1kb parallel=4 | 1.81 | >= 2.0 | >= 1.7 | floor |
+| A2 | theine_unbounded ips / cachex ips, n=1000000 binary_1kb parallel=4 | 1.98 | >= 2.0 | >= 1.7 | floor |
+
+The first `--sizes 1000 --scenarios get --dev-floor` rerun, 17 pass, 9
+floor, 2 fail. The `fail` rows were `theine` p99 at parallel 1 on both
+value kinds (tuple3 699 against 366 ns, binary_1kb 842 against 439):
+
+| id | check | actual | limit | band | verdict |
+| --- | --- | --- | --- | --- | --- |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=1 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=1 | 1.91 | <= 1.5 | <= 1.65 | fail |
+| A1 | theine p50 / ets p50, n=1000 tuple3 parallel=4 | 1.58 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=4 | 1.55 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=1000 tuple3 parallel=4 | 0.57 | >= 0.65 | >= 0.52 | floor |
+| A2 | theine ips / cachex ips, n=1000 tuple3 parallel=4 | 1.93 | >= 2.0 | >= 1.7 | floor |
+| A1 | theine_unbounded p99 / ets p99, n=1000 tuple3 parallel=1 | 1.59 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 binary_1kb parallel=1 | 1.92 | <= 1.5 | <= 1.65 | fail |
+| A1 | theine p50 / ets p50, n=1000 binary_1kb parallel=4 | 1.53 | <= 1.5 | <= 1.65 | floor |
+| A1 | theine p99 / ets p99, n=1000 binary_1kb parallel=4 | 1.52 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / cachex ips, n=1000 binary_1kb parallel=4 | 1.91 | >= 2.0 | >= 1.7 | floor |
+
+The second rerun, 25 pass, 2 floor, 1 fail (tuple3 p99 at parallel 1, 613
+against 367 ns):
+
+| id | check | actual | limit | band | verdict |
+| --- | --- | --- | --- | --- | --- |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=1 | 1.67 | <= 1.5 | <= 1.65 | fail |
+| A1 | theine p99 / ets p99, n=1000 tuple3 parallel=4 | 1.51 | <= 1.5 | <= 1.65 | floor |
+| A2 | theine ips / ets ips, n=1000 tuple3 parallel=4 | 0.59 | >= 0.65 | >= 0.52 | floor |
+
+### `mix bench hitrate`
+
+Two runs on one tree: `--traces OLTP,S3,P3,loop,zipf` (exit 0, 19/19) and
+`--traces DS1` (exit 0, 6/6, four replay passes). Default flags, 32
+accesses per pass. Every hit count matches M2.13's (`hitrate-7bbe3b6.json`,
+DS1) and M5.2's (`hitrate-8d5d705.json`, OLTP and loop), and every rate
+matches M2.13's table to the hundredth:
+
+| trace | size | requests | lru | theine | theine_static | theine − lru | theine − theine_static |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| OLTP | 1000 | 914145 | 32.83 | 39.77 | 35.50 | +6.94 | +4.27 |
+| OLTP | 2000 | 914145 | 42.47 | 45.44 | 41.89 | +2.97 | +3.55 |
+| OLTP | 5000 | 914145 | 53.65 | 55.16 | 52.40 | +1.51 | +2.76 |
+| DS1 | 1000000 | 43704979 | 3.09 | 14.14 | 14.59 | +11.05 | −0.45 |
+| DS1 | 4000000 | 43704979 | 20.24 | 45.88 | 45.91 | +25.64 | −0.03 |
+| DS1 | 8000000 | 43704979 | 43.03 | 70.45 | 70.45 | +27.42 | −0.00 (176 hits) |
+| S3 | 100000 | 16407702 | 2.33 | 11.73 | 11.99 | +9.40 | −0.26 |
+| S3 | 400000 | 16407702 | 12.04 | 42.60 | 42.32 | +30.56 | +0.28 |
+| P3 | 50000 | 3912296 | 6.86 | 25.73 | 26.44 | +18.87 | −0.71 |
+| loop | 1000 | 150000 | 0.00 | 58.67 | 59.29 | +58.67 | −0.62 |
+| zipf | 10000 | 10000000 | 56.61 | 64.03 | 64.46 | +7.42 | −0.43 |
+| zipf | 100000 | 10000000 | 76.41 | 79.71 | 79.74 | +3.30 | −0.03 |
+
+### `mix bench maintenance`
+
+Exit 0, 4/4, `max_size` 1_000_000, four writers, `ERL_FLAGS` as above:
+
+| max sample (limit 1001028) | samples | writes (write run) | settled size | passes | p50 us | p99 us | max us | reads (mixed) | writes (mixed) | call-path writes | fraction |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1001028 | 2626 | 2879496 | 1000000 | 8714 | 2065.47 | 3958.48 | 11703.85 | 11824992 | 3940378 | 12407 | 0.00 |
+
+The pass p99 is 3.96 ms against the 5 ms `pass_budget` (M3.1 had
+3.99–4.17, M3.2 3.74; discovered issue 10), and the max, 11.7 ms, is
+under 4× the budget. The write run's distinct-key puts, each of which
+evicts, ran at about 96_000/s for the whole cache.
+
+### Reference machine run (A1/A2, specs/09 §Reference machine)
+
+A person runs this from `bench/README.md` §Reference machine run, without
+`--dev-floor`, and pastes the whole stdout summary below. The exit status
+is the gate.
+
+| field | value |
+| --- | --- |
+| commit | human gate pending |
+| CPU model, OS, OTP, `schedulers_online` (summary machine line) | human gate pending |
+| thresholds passed | human gate pending |
+| exit status | human gate pending |
+| summary tables (get, put_burst, put, missed thresholds) | human gate pending |
 
 ### Caffeine simulator cross-check (A3 human gate, specs/09)
 
 Filled by hand following `bench/README.md` §Caffeine simulator cross-check.
-M5.6 fills the `theine` and `theine_static` columns from its `mix bench
-hitrate` run; a person fills the Caffeine columns. The `lru` column is the
+M5.6a filled the `theine` and `theine_static` columns from its `mix bench
+hitrate` run (above); a person fills the Caffeine columns and the Δs. The `lru` column is the
 harness's, which is deterministic and which `linked.Lru` must reproduce
 before the row counts. Δ is theine minus Caffeine in points; the gate is
 |Δ| ≤ 1.00 in both Δ columns on every row.
 
 | trace | size | lru | Caffeine `linked.Lru` | theine | Caffeine `HillClimberWindowTinyLfu` (simple) | Δ | theine_static | Caffeine `WindowTinyLfu` (1%) | Δ |
 |---|---|---|---|---|---|---|---|---|---|
-| OLTP | 1000 | 32.83 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| OLTP | 2000 | 42.47 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| OLTP | 5000 | 53.65 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| DS1 | 1000000 | 3.09 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| DS1 | 4000000 | 20.24 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| DS1 | 8000000 | 43.03 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| S3 | 100000 | 2.33 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| S3 | 400000 | 12.04 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| P3 | 50000 | 6.86 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| loop | 1000 | 0.00 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| zipf | 10000 | 56.61 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
-| zipf | 100000 | 76.41 | human gate pending | M5.6 | human gate pending | | M5.6 | human gate pending | |
+| OLTP | 1000 | 32.83 | human gate pending | 39.77 | human gate pending | | 35.50 | human gate pending | |
+| OLTP | 2000 | 42.47 | human gate pending | 45.44 | human gate pending | | 41.89 | human gate pending | |
+| OLTP | 5000 | 53.65 | human gate pending | 55.16 | human gate pending | | 52.40 | human gate pending | |
+| DS1 | 1000000 | 3.09 | human gate pending | 14.14 | human gate pending | | 14.59 | human gate pending | |
+| DS1 | 4000000 | 20.24 | human gate pending | 45.88 | human gate pending | | 45.91 | human gate pending | |
+| DS1 | 8000000 | 43.03 | human gate pending | 70.45 | human gate pending | | 70.45 | human gate pending | |
+| S3 | 100000 | 2.33 | human gate pending | 11.73 | human gate pending | | 11.99 | human gate pending | |
+| S3 | 400000 | 12.04 | human gate pending | 42.60 | human gate pending | | 42.32 | human gate pending | |
+| P3 | 50000 | 6.86 | human gate pending | 25.73 | human gate pending | | 26.44 | human gate pending | |
+| loop | 1000 | 0.00 | human gate pending | 58.67 | human gate pending | | 59.29 | human gate pending | |
+| zipf | 10000 | 56.61 | human gate pending | 64.03 | human gate pending | | 64.46 | human gate pending | |
+| zipf | 100000 | 76.41 | human gate pending | 79.71 | human gate pending | | 79.74 | human gate pending | |

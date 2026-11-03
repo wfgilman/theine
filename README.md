@@ -72,68 +72,85 @@ Not in v1: expire-after-access, removal listeners, bulk loads, distribution.
 
 Three bench tasks, `mix bench get`, `mix bench hitrate` and
 `mix bench maintenance`, turn the acceptance criteria into ratios measured in
-one run on one machine (a 2-core, 4-thread i5-5257U, `ERL_FLAGS="+sbt db
-+sbwt very_long"`). The thresholds and their history are in
-`specs/09-benchmarks.md`; every recorded run is in `IMPLEMENTATION_PLAN.md`
-§Benchmark log, and the final gate replaces the tables below.
+one run on one machine. The thresholds and their history are in
+`specs/09-benchmarks.md`. The figures below are the final gate's
+(2026-11-03), recorded in full under `IMPLEMENTATION_PLAN.md` §Final gate.
+They come from the development machine: an Intel i5-5257U with two cores
+and two threads each, Linux, OTP 28, four schedulers,
+`ERL_FLAGS="+sbt db +sbwt very_long"`.
 
-**`mix bench get`** (2026-10-29, M5.1): Zipf(1.0) reads of integer keys with
-3-tuple values, against `:ets.lookup/2` on a table with the same options.
-`theine` is bounded at `max_size: n`, `theine_unbounded` runs with
+The latency and throughput targets (A1, A2) are judged on a reference
+machine with at least four physical cores. Its run is still pending, so
+the A1/A2 figures here are the development machine's. They will be
+replaced by the reference machine's once that run is recorded. On the
+development machine the bounded cache sits at a recorded floor, just past
+the targets. At `parallel: 4` that machine runs two readers per physical
+core.
+
+**`mix bench get`**: Zipf(1.0) reads of integer keys with 3-tuple values,
+against `:ets.lookup/2` on a table with the same options. `theine` is
+bounded at `max_size: n`, `theine_unbounded` runs with
 `max_size: :infinity`.
 
 | n | parallel | subject | p50 ns | p99 ns | ips | p50/ets | ips/ets |
 |---|---|---|---|---|---|---|---|
-| 1_000 | 4 | ets | 398 | 600 | 2_410_180 | 1.00 | 1.00 |
-| 1_000 | 4 | theine | 628 | 905 | 1_327_624 | 1.58 | 0.55 |
-| 1_000 | 4 | theine_unbounded | 568 | 804 | 1_554_386 | 1.43 | 0.64 |
-| 1_000 | 4 | cachex | 1_308 | 2_088 | 697_310 | 3.29 | 0.29 |
-| 1_000 | 4 | nebulex | 3_885 | 6_204 | 224_294 | 9.76 | 0.09 |
-| 1_000_000 | 4 | ets | 475 | 825 | 1_977_693 | 1.00 | 1.00 |
-| 1_000_000 | 4 | theine | 718 | 1_125 | 1_182_504 | 1.51 | 0.60 |
-| 1_000_000 | 4 | theine_unbounded | 634 | 1_004 | 1_393_513 | 1.33 | 0.70 |
-| 1_000_000 | 4 | cachex | 1_370 | 2_237 | 665_327 | 2.88 | 0.34 |
-| 1_000_000 | 4 | nebulex | 3_960 | 6_931 | 216_884 | 8.34 | 0.11 |
+| 1_000 | 4 | ets | 409 | 600 | 2_348_318 | 1.00 | 1.00 |
+| 1_000 | 4 | theine | 624 | 917 | 1_377_750 | 1.53 | 0.59 |
+| 1_000 | 4 | theine_unbounded | 549 | 792 | 1_661_204 | 1.34 | 0.71 |
+| 1_000 | 4 | cachex | 1_327 | 2_058 | 710_821 | 3.24 | 0.30 |
+| 1_000 | 4 | nebulex | 3_753 | 49_077 | 222_197 | 9.18 | 0.09 |
+| 1_000_000 | 4 | ets | 489 | 831 | 1_958_004 | 1.00 | 1.00 |
+| 1_000_000 | 4 | theine | 716 | 1_128 | 1_225_719 | 1.46 | 0.63 |
+| 1_000_000 | 4 | theine_unbounded | 639 | 998 | 1_412_441 | 1.31 | 0.72 |
+| 1_000_000 | 4 | cachex | 1_389 | 2_200 | 667_357 | 2.84 | 0.34 |
+| 1_000_000 | 4 | nebulex | 3_800 | 82_805 | 204_150 | 7.77 | 0.10 |
 
-At four readers a bounded hit has 1.8–1.9× Cachex's throughput and 5–7×
-Nebulex's. The targets of 1.5× `ets` latency, 0.65× `ets` throughput and 2×
-Cachex are met by the unbounded cache on most shapes. A bounded hit also
-records its read in an `:atomics` ring for the policy, which costs 60–85 ns
-more here, and that puts the bounded cache just past the targets on
-several shapes. Each write sends one message to the maintenance process.
-In bursts of 1_000 a `put` costs 5.6–6.2× an ETS insert (2026-11-03,
-M5.1b; the target is at most 10×). Sustained writers are paced by that one
-process: they run at 0.03–0.21× an ETS insert's throughput.
+At four readers a bounded hit has 1.8–1.9× Cachex's throughput and
+5.2–6.2× Nebulex's. The targets of 1.5× `ets` latency, 0.65× `ets`
+throughput and 2× Cachex are met by the unbounded cache on most shapes. A
+bounded hit also records its read in an `:atomics` ring for the policy.
+That puts the bounded cache at 1.4–1.6× `ets` latency at p50 and at
+0.57–0.73× its throughput. At one reader on 1_000 keys, the bounded p99
+was 1.5–2.0× `ets`'s over three runs.
 
-**`mix bench hitrate`** (2026-10-29, M2.13): hit rate (%) on the ARC traces
-and two synthetic ones. `theine_static` is the same cache with `adaptive:
-false`.
+Writes: each `put` sends one message to the cache's maintenance process.
+In bursts of 1_000 a `put` costs 5.6–7.4× an ETS insert (the target is at
+most 10×). Sustained writes are a limit of the design. A writer that
+outruns that one process waits for it (backpressure keeps the table
+bounded), so one cache absorbs about as many writes per second as its
+maintenance process can apply. Measured here, one cache sustained
+245_000–469_000 overwrites/s from one writer, 190_000–242_000/s in total
+from four writers, and about 96_000/s of new keys that each evict an
+entry. That is 0.03–0.21× the rate of an ETS insert. If you need more
+write throughput than that, shard across several caches.
 
-| trace | size | lru | theine | theine_static |
-|---|---|---|---|---|
-| OLTP | 1_000 | 32.83 | 39.77 | 35.50 |
-| OLTP | 2_000 | 42.47 | 45.44 | 41.89 |
-| OLTP | 5_000 | 53.65 | 55.16 | 52.40 |
-| S3 | 100_000 | 2.33 | 11.73 | 11.99 |
-| S3 | 400_000 | 12.04 | 42.60 | 42.32 |
-| P3 | 50_000 | 6.86 | 25.73 | 26.44 |
-| loop | 1_000 | 0.00 | 58.67 | 59.29 |
-| zipf | 10_000 | 56.61 | 64.03 | 64.46 |
-| zipf | 100_000 | 76.41 | 79.71 | 79.74 |
-| DS1 | 1_000_000 | 3.09 | 14.14 | 14.59 |
-| DS1 | 4_000_000 | 20.24 | 45.88 | 45.91 |
-| DS1 | 8_000_000 | 43.03 | 70.45 | 70.45 |
+**`mix bench hitrate`**: hit rate (%) on the ARC traces and two synthetic
+ones. `theine_static` is the same cache with `adaptive: false`. Caffeine's
+columns come from its own simulator on the same traces. That comparison is
+a human step of the final gate, still pending.
 
-The comparison with Caffeine's own simulator on the same traces is a human
-gate, still pending.
+| trace | size | lru | theine | Caffeine `HillClimberWindowTinyLfu` | theine_static | Caffeine `WindowTinyLfu` |
+|---|---|---|---|---|---|---|
+| OLTP | 1_000 | 32.83 | 39.77 | pending | 35.50 | pending |
+| OLTP | 2_000 | 42.47 | 45.44 | pending | 41.89 | pending |
+| OLTP | 5_000 | 53.65 | 55.16 | pending | 52.40 | pending |
+| DS1 | 1_000_000 | 3.09 | 14.14 | pending | 14.59 | pending |
+| DS1 | 4_000_000 | 20.24 | 45.88 | pending | 45.91 | pending |
+| DS1 | 8_000_000 | 43.03 | 70.45 | pending | 70.45 | pending |
+| S3 | 100_000 | 2.33 | 11.73 | pending | 11.99 | pending |
+| S3 | 400_000 | 12.04 | 42.60 | pending | 42.32 | pending |
+| P3 | 50_000 | 6.86 | 25.73 | pending | 26.44 | pending |
+| loop | 1_000 | 0.00 | 58.67 | pending | 59.29 | pending |
+| zipf | 10_000 | 56.61 | 64.03 | pending | 64.46 | pending |
+| zipf | 100_000 | 76.41 | 79.71 | pending | 79.74 | pending |
 
-**`mix bench maintenance`** (2026-10-29, M3.2): a cache bounded at 1_000_000
-entries under one writer per scheduler. In a 30 s run of distinct-key
-writes the table never held more than 1_001_028 entries, the
-`max_size + write_hwm + schedulers` bound, and it was back at 1_000_000 a
-second after the writers stopped. In the mixed run (75% Zipf reads, 25%
-writes, half of them with a 100 ms TTL) a maintenance pass took 1.7 ms at
-p50, 3.7 ms at p99 and 10.8 ms at most, against a 5 ms budget for the p99.
+**`mix bench maintenance`**: a cache bounded at 1_000_000 entries under one
+writer per scheduler. In a 30 s run of distinct-key writes the table never
+held more than 1_001_028 entries, the `max_size + write_hwm + schedulers`
+bound, and it was back at 1_000_000 a second after the writers stopped. In
+the mixed run (75% Zipf reads, 25% writes, half of them with a 100 ms TTL)
+a maintenance pass took 2.1 ms at p50, 4.0 ms at p99 and 11.7 ms at most,
+against a 5 ms budget for the p99.
 
 ## Developing
 

@@ -149,6 +149,13 @@ test/                         mirrors lib/; test/support for shared helpers
   20-field `%Theine.Policy{}` costs 55–145 ns, so fold updates into one;
   and integer arithmetic past 2^59 allocates bignums (a 32×32-bit product
   does).
+- Benchee stops a row at its default `max_sample_size` (1_000_000), about
+  0.5 s of hits at n=1000, so `mix bench get`'s p99 is over that window
+  whatever `--time` says. A probe that times single reads in a fresh process
+  must spawn it with a large `min_heap_size` (`bench/results/tail-m56b.exs`
+  uses 1_000_000 words). At the default heap a theine hit, which copies a
+  6-field entry, triggers a collection every ~15 calls, and the p99 measures
+  that collection (M5.6b).
 - `Theine.Test.Trace.calls/2` counts one extra `:persistent_term.get` when
   the traced fun is the first in the VM to call a module (lazy code loading
   reads it), so a multiset depends on test order. Run the path once before

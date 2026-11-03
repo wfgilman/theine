@@ -86,7 +86,7 @@ Done: M4.1, M4.2, M4.3, M4.4, M4.4b, M4.5. M4 complete.
 
 ## M5 Gate
 
-Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5.1c, M5.2, M5.3, M5.4, M5.5, M5.6a, M5.6b (no lever; open question 4 holds the measurement for the human). M5 complete except for the human gates under §Final gate.
+Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5.1c, M5.2, M5.3, M5.4, M5.5, M5.6a, M5.6b (no lever; open question 4, settled 2026-11-03: the reference machine decides that row). M5 complete except for the human gates under §Final gate.
 
 **Unblocked 2026-11-02:** open question 2 is settled (specs/09 §Decisions 2026-11-02). The put threshold is now a burst cost check, and A1/A2 are judged on the reference machine, with `--dev-floor` on the development machine. Order: M5.1b, M5.1c, M5.6.
 
@@ -151,7 +151,9 @@ Done: M6.2, M6.3, M6.4. M6 complete.
 
 3. **Resolved 2026-11-02 by a human: MIT confirmed** (specs/00 §Decisions M5.4). The question as raised: **the package license (2026-10-29, M5.4).** No spec names one, and `mix hex.build` refuses to build without `licenses:`. The package is MIT with a `LICENSE` naming Will Gilman (specs/00 §Decisions M5.4). **Recommended:** confirm MIT, or switch to Apache-2.0 (Caffeine's license). Switching changes only `licenses:` in `mix.exs` and the `LICENSE` file, and must happen before the first `mix hex.publish`.
 
-4. **Raised 2026-11-03 in M5.6: the bounded A1 p99 at n=1000 parallel 1 lies outside the development band in most runs.** The band of specs/09 §Reference machine is ≤ 1.65 for A1. On this row, M5.6's three `mix bench get --dev-floor` runs measured 2.02, 1.91/1.92 and 1.67, and the row was past 1.65 in 7 of the 8 runs since M5.1b, all with the same `lib/`. Every other A1/A2 row of the gate is `pass` or `floor`. The row is not a regression: M5.1c's last rerun had it at 1.46, and the M1.6 procedure ("a second failure in the targeted run is a regression") was written before the bounded subject existed. The loop may not widen the band. A1 itself is judged on the reference machine, whose run is pending. Choices:
+4. **Resolved 2026-11-03 by a human: option (b)** (specs/09 §Decisions 2026-11-03). The reference machine decides the bounded A1 p99 at n=1000 parallel 1. The band stays at 1.65, and the development gate's `fail` on that row alone is recorded as "deferred to the reference machine". If the Mac run passes the row, it is the laptop's floor. If it misses, that is a new open question. The question as raised:
+
+   **Raised 2026-11-03 in M5.6: the bounded A1 p99 at n=1000 parallel 1 lies outside the development band in most runs.** The band of specs/09 §Reference machine is ≤ 1.65 for A1. On this row, M5.6's three `mix bench get --dev-floor` runs measured 2.02, 1.91/1.92 and 1.67, and the row was past 1.65 in 7 of the 8 runs since M5.1b, all with the same `lib/`. Every other A1/A2 row of the gate is `pass` or `floor`. The row is not a regression: M5.1c's last rerun had it at 1.46, and the M1.6 procedure ("a second failure in the targeted run is a regression") was written before the bounded subject existed. The loop may not widen the band. A1 itself is judged on the reference machine, whose run is pending. Choices:
    - (a) Keep the band as it is. M5.6b looks for a lever: the pass running on the reader's own scheduler (specs/04 §Decisions M2.11b) is the likely source of the tail at parallel 1. M6 waits until a `--dev-floor` run exits 0.
    - (b) **Recommended:** let the reference machine's run settle this one row. If the Mac run passes A1 p99 at n=1000 parallel 1, the development machine's `fail` there is recorded as the laptop's floor, as M2.8d recorded the others, and M5.6b is checked with its measurement attached. This needs a specs/09 §Decisions entry by a human, because it changes what the development run's exit status means for one row. The thresholds stay as they are.
    - (c) Widen the A1 band for p99 at parallel 1. This is a human decision about the band. The data puts the row's spread at 1.39–2.02.
@@ -1980,7 +1982,7 @@ replays are deterministic. The test suite ran beside its first half.
 
 | criterion | development machine | reference machine |
 | --- | --- | --- |
-| A1 latency | `pass` or `floor` on every row except p99 at n=1000 parallel 1: `fail` in all three runs (tuple3 2.02, 1.91, 1.67; binary_1kb 1.51, 1.92, 1.46) | human gate pending |
+| A1 latency | `pass` or `floor` on every row except p99 at n=1000 parallel 1: `fail` in all three runs (tuple3 2.02, 1.91, 1.67; binary_1kb 1.51, 1.92, 1.46), deferred to the reference machine (open question 4, specs/09 §Decisions 2026-11-03) | human gate pending, this row included |
 | A2 throughput | `floor` (full run; the reruns' n=1000 rows were 0.57–0.59 and 1.91–1.93): ips/ets 0.59–0.63 on tuple3 at parallel 4 (binary_1kb 0.69–0.73 pass); ips/cachex 1.81–1.94 (bounded) and 1.98 (unbounded, n=1000000 binary_1kb); ips/nebulex 5.24–6.20, pass | human gate pending |
 | put burst | pass on all six shapes, 5.58–7.36× an ETS insert (limit 10) | human gate pending |
 | A3 hit rate | `theine ≥ lru` on 12/12 rows, `loop` +58.67 points (limit +10), `theine ≥ theine_static − 1` on 12/12 (worst −0.71, P3) | Caffeine simulator: human gate pending |

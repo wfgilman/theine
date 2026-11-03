@@ -498,3 +498,20 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
     gate on its own machine and still fails a real regression. If the
     reference run misses a threshold, that is a new open question for a
     human, not a reason to widen the band.
+- 2026-11-03 (after M5.6b, human decision on open question 4): the
+  reference machine decides the bounded A1 p99 at n=1_000 `parallel: 1`.
+  On the development machine that row lands on both sides of the 1.65
+  band from run to run, with the same `lib/`: 1.37–2.02, median 1.70, in
+  ten rounds with maintenance paused. M5.6b showed that the passes are not
+  the cause. It is the bounded hit itself, a p50 at 1.46–1.53 with a tail
+  slightly wider than the `ets` floor's 363 ns. The band stays at 1.65, and
+  neither the band nor the threshold changes for this row. Instead, a
+  development-machine final gate whose only `fail` verdicts are A1 p99 at
+  n=1_000 `parallel: 1` on the bounded subjects counts as complete for
+  that run. Those rows are recorded as "deferred to the reference machine"
+  with their measured ratios. If the reference run passes them, they are
+  the laptop's floor, as the M2.8d entry records the others. If it misses
+  them, that is a new open question for a human. Any other `fail`, and
+  this row on any other shape, still fails the gate. `bench/get.exs` is
+  unchanged: its exit status still reports the miss, and the gate reads the
+  verdicts.

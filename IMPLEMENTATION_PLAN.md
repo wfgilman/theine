@@ -102,10 +102,10 @@ Done: M5.1 (harness; the put threshold is M5.1b, restated 2026-11-02), M5.1b, M5
 
 ## M6 Optional (only after M5.6b is checked)
 
-Done: nothing yet.
+Done: M6.2.
 
 - M6.1 (adaptive window) moved to M2.13 on 2026-10-29; it is now the default policy.
-- [ ] M6.2 Opt-in eviction listener (specs/00 §Non-goals; specs/08 §Telemetry `[:theine, :eviction]`): `[:theine, :eviction]` telemetry per removal only when `eviction_listener: true` — tests: maintenance_test "no eviction event is emitted by default", "with the listener enabled one event per eviction and expiration carries the cause"; `mix bench maintenance` pass p99 still under `pass_budget` with the listener off.
+- [x] M6.2 Opt-in eviction listener (specs/00 §Non-goals; specs/08 §Telemetry `[:theine, :eviction]`): `[:theine, :eviction]` telemetry per removal only when `eviction_listener: true` — tests: maintenance_test "no eviction event is emitted by default", "with the listener enabled one event per eviction and expiration carries the cause"; `mix bench maintenance` pass p99 still under `pass_budget` with the listener off. Met. `eviction_listener` is a boolean `start_link` option (default false; specs/08 options table, `start_link/1` doc, config_test). The event has `%{weight: w}` as measurements and `%{cache, key, value, cause}` as metadata. `cause` is `:size` or `:expired`, the removals Caffeine's `evictionListener` sees. `delete/2`, `clear/1` and overwrites emit nothing, so every event has exactly one `evictions` or `expirations` count (specs/08 §Decisions M6.2). It fires at the four places those counters are added. Two are in the maintenance process, through `Policy.remove/2` (`:size`) and `Policy.expire_key/5` (the sweep). The other two are in the caller, through `Entry.expired/2` (the reader's expired read) and `put_new`'s expired branch, so an expiry that a read finds first is not lost. Neither is the hit path. With the option off, a removal costs one field match on the policy struct (its new `listener` field: the cache name, or nil) or one config field read. No call is added, so the tracing multisets are unchanged. Unlike the load events, the metadata carries the key and value, since naming the entry is what a listener is for. The handler runs in the process that removed the entry, and the `start_link/1` doc tells users to keep it fast. The two tests share one scenario at `max_size` 100. Keys 1..60 are written with a TTL and the clock passes it. Key 1 is read and key 2 is `put_new`'d, so the caller deletes each. A pass sweeps 3..60, and 150 more keys evict 51. With the listener on there are 60 `:expired` and 51 `:size` events, equal to `stats/1`. Each carries its entry's key, value and weight. Keys 1 and 2 are emitted by the test process, 3..60 and every size eviction by the maintenance process. The evicted keys plus the table's keys are exactly the keys written. The default cache runs the same scenario and gets no events. `mix bench maintenance` (listener off) passes 4/4 with p99 4.03 ms, against the final gate's 3.96. `Theine.Entry` is a hot-path module, so `mix bench get` ran too, though `get/2`'s hit is unchanged (§Benchmark log M6.2). The config struct had 36 keys before the new field and was already a hashed map, so the hit's one-key lookup did not change shape.
 - [ ] M6.3 `fetch_all/3` (specs/00 §Non-goals): bulk fetch coalescing per key through the existing single-flight — tests: loader_test "fetch_all returns a map of every key with hits served from the cache and misses loaded once each", "a loader failure for one key does not lose the other keys' results".
 - [ ] M6.4 Expire-after-access design note (specs/00 §Non-goals): `specs/11-expire-after-access.md` draft describing how the read buffer would carry access time to the policy and what it costs the hot-path budget — outcome: the note exists, cross-references specs/01, 03 and 06, and adds no code.
 
@@ -169,6 +169,42 @@ resolution, and are settled by editing the spec in the build commit that
 needs the answer (PROMPT_build.md step 5).
 
 ## Benchmark log
+
+### M6.2 — `mix bench maintenance` and `mix bench get --dev-floor --scenarios get`, eviction listener off, tree of the M6.2 commit (2026-11-03; maintenance 4/4; get full run 72 pass, 11 floor, 1 fail, `--sizes 100000` rerun 21/7/0, exit 0)
+
+`mix bench maintenance`, `ERL_FLAGS="+sbt db +sbwt very_long"`, listener off:
+
+| max sample (limit 1001028) | samples | writes (write run) | settled size | passes | p50 us | p99 us | max us | reads (mixed) | writes (mixed) | call-path writes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1001028 | 2643 | 3124847 | 1000000 | 8850 | 2053.01 | 4026.61 | 5668.09 | 11970514 | 3988688 | 12603 |
+
+The final gate had p99 3958 and max 11704 µs on the tree of 7e8712e.
+
+`mix bench get --dev-floor --scenarios get`, full run. Only the misses are shown; the result file was overwritten by the rerun on the same sha:
+
+| id | check | actual | band | verdict |
+| --- | --- | --- | --- | --- |
+| A1 | theine p50, n=1000 tuple3 parallel=1 | 1.56 | ≤ 1.65 | floor |
+| A1 | theine p99, n=1000 tuple3 parallel=4 | 1.50 | ≤ 1.65 | floor |
+| A2 | theine ips / ets, n=1000 tuple3 parallel=4 | 0.59 | ≥ 0.52 | floor |
+| A1 | theine p99, n=1000 binary_1kb parallel=1 | 1.59 | ≤ 1.65 | floor |
+| A1 | theine p50, n=100000 tuple3 parallel=1 | 1.66 | ≤ 1.65 | fail |
+| A2 | theine ips / ets, n=100000 tuple3 parallel=4 | 0.65 | ≥ 0.52 | floor |
+| A2 | theine ips / cachex, n=100000 tuple3 parallel=4 | 1.98 | ≥ 1.7 | floor |
+| A1 | theine p50, n=100000 binary_1kb parallel=1 | 1.56 | ≤ 1.65 | floor |
+| A2 | theine ips / cachex, n=100000 binary_1kb parallel=4 | 1.95 | ≥ 1.7 | floor |
+| A2 | theine ips / ets, n=1000000 tuple3 parallel=4 | 0.63 | ≥ 0.52 | floor |
+| A2 | theine ips / cachex, n=1000000 tuple3 parallel=4 | 1.86 | ≥ 1.7 | floor |
+| A2 | theine ips / cachex, n=1000000 binary_1kb parallel=4 | 1.94 | ≥ 1.7 | floor |
+
+The one `fail` was a slow run, not the change. `get/2`'s hit is unchanged, and the subjects the change cannot reach were slower in this run than in the final gate too, by 3–10%: `theine_unbounded` 363 against 347 ns, cachex 923 against 852, nebulex 2233 against 2147 at that shape. The rerun with `--sizes 100000` (specs/09 §Decisions M1.6) exited 0:
+
+| shape | ets p50 | theine p50 | ratio | theine_unbounded p50 | verdict |
+| --- | --- | --- | --- | --- | --- |
+| tuple3 parallel=1 | 284 | 437 | 1.54 | 345 | floor |
+| binary_1kb parallel=1 | 293 | 450 | 1.54 | 363 | floor |
+
+The final gate had theine p50 at 436 and 456 ns on these two rows. The A1 p99 row at n=1000 parallel 1 (discovered issue 4, open question 4) was inside the band in this full run, at 1.59 on binary_1kb and 1.38 on tuple3. In this run's `ets` row at that shape, p99 was 491 ns, against 363–367 in M5.6a.
 
 (Hot-path, policy and maintenance tasks paste their summary tables here with
 the commit sha, newest first.)

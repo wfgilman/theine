@@ -66,7 +66,11 @@ every call with an example.
 | window + probation + protected LRUs | `Theine.Policy` |
 | `TimerWheel` | `Theine.Expiry` ordered index |
 
-Not in v1: expire-after-access, removal listeners, bulk loads, distribution.
+Caffeine's `evictionListener` is the `[:theine, :eviction]` telemetry event,
+emitted only with `eviction_listener: true` (see `Theine.start_link/1`).
+
+Not in v1: expire-after-access, explicit-removal listeners, bulk loads,
+distribution.
 
 ## Benchmarks
 

@@ -59,6 +59,7 @@ defmodule Theine.Config do
           maintenance_interval: pos_integer(),
           drain_backoff: non_neg_integer(),
           stats: boolean(),
+          eviction_listener: boolean(),
           test_hooks: boolean(),
           policy_module: module(),
           table: cache(),
@@ -106,6 +107,7 @@ defmodule Theine.Config do
             maintenance_interval: 1000,
             drain_backoff: 3,
             stats: true,
+            eviction_listener: false,
             test_hooks: false,
             policy_module: Theine.Policy,
             table: nil,
@@ -143,6 +145,7 @@ defmodule Theine.Config do
     :maintenance_interval,
     :drain_backoff,
     :stats,
+    :eviction_listener,
     :test_hooks,
     :policy_module
   ]
@@ -318,8 +321,9 @@ defmodule Theine.Config do
 
   defp validate!(:window_percent, n) when is_integer(n) and n in 1..80, do: n
 
-  defp validate!(key, bool) when key in [:adaptive, :stats, :test_hooks] and is_boolean(bool),
-    do: bool
+  defp validate!(key, bool)
+       when key in [:adaptive, :stats, :eviction_listener, :test_hooks] and is_boolean(bool),
+       do: bool
 
   defp validate!(:policy_module, module) when is_atom(module) and not is_nil(module), do: module
 
@@ -353,7 +357,10 @@ defmodule Theine.Config do
   defp expected(:weigher), do: "expected a function of arity 2 or nil"
   defp expected(:loader), do: "expected a function of arity 1 or nil"
   defp expected(:window_percent), do: "expected an integer in 1..80"
-  defp expected(key) when key in [:adaptive, :stats, :test_hooks], do: "expected a boolean"
+
+  defp expected(key) when key in [:adaptive, :stats, :eviction_listener, :test_hooks],
+    do: "expected a boolean"
+
   defp expected(:policy_module), do: "expected a module"
 
   defp expected(key) when key in [:expire_after_write, :refresh_after_write],

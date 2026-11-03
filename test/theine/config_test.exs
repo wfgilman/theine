@@ -29,6 +29,7 @@ defmodule Theine.ConfigTest do
     assert config.maintenance_interval == 1000
     assert config.drain_backoff == 3
     assert config.stats == true
+    assert config.eviction_listener == false
     assert config.test_hooks == false
     assert config.policy_module == Theine.Policy
   end
@@ -76,6 +77,7 @@ defmodule Theine.ConfigTest do
         maintenance_interval: 50,
         drain_backoff: 0,
         stats: false,
+        eviction_listener: true,
         test_hooks: true,
         policy_module: Theine.Test.Policy
       )
@@ -96,6 +98,7 @@ defmodule Theine.ConfigTest do
     assert config.maintenance_interval == 50
     assert config.drain_backoff == 0
     refute config.stats
+    assert config.eviction_listener
     assert config.test_hooks
     assert config.policy_module == Theine.Test.Policy
   end
@@ -139,6 +142,7 @@ defmodule Theine.ConfigTest do
       drain_backoff: -1,
       drain_backoff: 1.5,
       stats: :yes,
+      eviction_listener: nil,
       test_hooks: 1,
       policy_module: "Theine.Policy",
       policy_module: nil

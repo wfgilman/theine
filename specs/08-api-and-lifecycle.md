@@ -34,6 +34,7 @@ children = [
 | `maintenance_interval` | ms | 1000 | 04 |
 | `drain_backoff` | non_neg_integer | 3 | 04 (a drain-triggered pass waits this multiple of the last pass's duration; 0 disables) |
 | `stats` | boolean | true | this file |
+| `eviction_listener` | boolean | false | this file (§Telemetry `[:theine, :eviction]`) |
 | `test_hooks` | boolean | false | 04 (`pause/1`, `resume/1`; tests only) |
 | `policy_module` | module | `Theine.Policy` | 04, 10 (needs `test_hooks: true`; tests only) |
 
@@ -135,9 +136,16 @@ Emitted off the hot path only:
   loader raises, throws or exits, with `%{system_time: _}` and
   `%{cache: name, kind: _, reason: _, stacktrace: _}`, the key omitted
   (specs/07 §Decisions M4.4).
-- `[:theine, :eviction]` is **not** emitted per entry in v1 (would be a
-  per-eviction cost in the maintenance budget); M6 may add an opt-in
-  listener.
+- `[:theine, :eviction]` per entry the cache removes on its own, only when
+  the cache is started with `eviction_listener: true` (M6.2; off by
+  default, because it is a per-removal cost in the maintenance budget).
+  Measurements `%{weight: w}`, metadata `%{cache: name, key: k, value: v,
+  cause: :size | :expired}`. `:size` is an eviction by the policy
+  (specs/05), `:expired` an expiration by the sweep (specs/06) or by the
+  reader or `put_new` caller that deleted an expired entry it found
+  (specs/01 §Expired read). One event per `evictions` or `expirations`
+  count; `delete/2`, `clear/1` and overwrites emit nothing (§Decisions
+  M6.2).
 
 ## Documentation
 
@@ -244,3 +252,26 @@ specs/09.
 - 2026-10-29 (after M2.10, human decision): `adaptive` defaults to true, as in
   Caffeine; `adaptive: false` is the fixed-window policy (specs/05
   §Adaptive window, specs/00 §Decisions).
+- 2026-11-03 (M6.2): the opt-in eviction listener is the
+  `[:theine, :eviction]` telemetry event behind the boolean
+  `eviction_listener` option, not a callback option. telemetry is already
+  the one runtime dependency, its handlers are detached when they raise,
+  so a broken handler cannot crash the maintenance process, and any
+  number of handlers can attach. The event covers what Caffeine's
+  `evictionListener` covers (`RemovalCause.wasEvicted()`: `SIZE` and
+  `EXPIRED`; there is no `COLLECTED` here), not explicit removals or
+  replacements. That way every event has exactly one `evictions` or
+  `expirations` count, and the tests check the two against each other.
+  Unlike the load and refresh events, the metadata carries the key and
+  the value. A listener exists to learn which entry left, and the value is
+  already in hand where the entry is deleted, so passing it costs nothing.
+  The handler runs where the deletion happens. The maintenance process
+  handles evictions and swept expirations. The reader's expired-read
+  branch (specs/01) and `put_new`'s expired branch emit in the caller,
+  so the event is not lost when a read gets to an expired entry before
+  the sweep. Neither of those is the hit path. With the option off, a
+  removal costs one struct field match in the maintenance process and
+  one config field read on the two caller-side expired branches. No call
+  is made, so the tracing multisets of specs/01 are unchanged. The config
+  struct already had 36 keys and was a hashed map before the new field,
+  so the field does not change the hit's one-key lookup.

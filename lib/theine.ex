@@ -80,6 +80,7 @@ defmodule Theine do
   | `maintenance_interval` | ms | 1000 |
   | `drain_backoff` | non_neg_integer | 3 |
   | `stats` | boolean | `true` |
+  | `eviction_listener` | boolean | `false` |
   | `test_hooks` | boolean | `false` |
   | `policy_module` | module | `Theine.Policy` (tests only, needs `test_hooks`) |
 
@@ -117,6 +118,23 @@ defmodule Theine do
   The `weigher` is called on every write without a `weight:` option and
   must return a positive integer; an entry heavier than `max_size` is never
   stored (see `put/4`).
+
+  `eviction_listener: true` emits a `[:theine, :eviction]` telemetry event
+  for every entry the cache removes on its own, with `%{weight: weight}` as
+  measurements and `%{cache: name, key: key, value: value, cause: cause}`
+  as metadata. `cause` is `:size` for an eviction by the policy and
+  `:expired` for an expired entry, so the events match the `evictions` and
+  `expirations` counts of `stats/1` one for one. `delete/2`, `clear/1` and
+  overwrites emit nothing. The handler runs in the process that removed the
+  entry: the maintenance process for evictions and for expired entries
+  nobody read, the caller for an expired entry that `get/2` or `put_new/4`
+  found. A slow handler therefore slows maintenance, and through
+  `write_hwm` the writers; send the event elsewhere if it does real work.
+  Off by default, so a cache that does not ask pays nothing per removal.
+
+      :telemetry.attach("log-evictions", [:theine, :eviction], fn _event, %{weight: w}, meta, _ ->
+        IO.inspect({meta.cache, meta.key, meta.cause, w})
+      end, nil)
 
   `test_hooks: true` enables `Theine.Maintenance.pause/1` and `resume/1`,
   which stop and restart the maintenance process's consumption of write

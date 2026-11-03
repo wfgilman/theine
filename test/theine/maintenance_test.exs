@@ -56,6 +56,48 @@ defmodule Theine.MaintenanceTest do
 
   def handle_pass(_event, _measurements, _metadata, _config), do: :ok
 
+  # Forwards every `[:theine, :eviction]` event of `cache` to the test
+  # process as `{:eviction, measurements, metadata, emitter}`.
+  defp attach_eviction_handler(cache) do
+    handler = {__MODULE__, :eviction, cache}
+    config = %{test: self(), cache: cache}
+    :ok = :telemetry.attach(handler, [:theine, :eviction], &__MODULE__.handle_eviction/4, config)
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
+
+  def handle_eviction(_event, measurements, %{cache: cache} = metadata, %{cache: cache} = config),
+    do: send(config.test, {:eviction, measurements, metadata, self()})
+
+  def handle_eviction(_event, _measurements, _metadata, _config), do: :ok
+
+  defp evictions_received(cache, acc \\ []) do
+    receive do
+      {:eviction, measurements, %{cache: ^cache} = metadata, emitter} ->
+        evictions_received(cache, [{measurements, metadata, emitter} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  # Every way the cache removes an entry on its own, at `max_size` 100:
+  # keys 1..60 written with a 10 ms TTL and the clock moved past it, key 1
+  # then read (the reader deletes it), key 2 put_new'd (the caller deletes
+  # it), a pass sweeping 3..60, and 150 more keys evicting 51 by size.
+  defp remove_every_way(cache) do
+    for k <- 1..60, do: Theine.put(cache, k, {:v, k}, ttl: 10)
+    Maintenance.run(cache)
+    Theine.Test.Clock.advance(cache, 10)
+
+    assert Theine.get(cache, 1) == :error
+    assert Theine.put_new(cache, 2, {:v, 2}) == :ok
+    Maintenance.run(cache)
+
+    for k <- 1000..1149, do: Theine.put(cache, k, {:v, k})
+    Maintenance.run(cache)
+
+    assert %{expirations: 60, evictions: 51} = Theine.stats(cache)
+  end
+
   defp ms(n), do: System.convert_time_unit(n, :millisecond, :native)
 
   # Reads `key` from `cache` as fast as it can until `deadline` (monotonic ms).
@@ -1183,6 +1225,70 @@ defmodule Theine.MaintenanceTest do
       # The pass's own step 5 did the evicting here, and its measurement
       # counts them.
       assert passes_received(cache) |> Enum.map(fn {m, _} -> m.evicted end) |> Enum.sum() == 50
+    end
+  end
+
+  describe "eviction listener (specs/08 §Telemetry, §Decisions M6.2)" do
+    defp start_listened(opts) do
+      cache = unique_cache()
+      start_supervised!({Theine.Test.Clock, cache: cache, at: 0}, id: {:clock, cache})
+
+      start_supervised!(
+        {Theine, [name: cache, max_size: 100] ++ @quiet ++ opts},
+        id: {:cache, cache}
+      )
+
+      attach_eviction_handler(cache)
+      cache
+    end
+
+    test "no eviction event is emitted by default" do
+      cache = start_listened([])
+      refute Config.get(cache).eviction_listener
+
+      remove_every_way(cache)
+
+      assert evictions_received(cache) == []
+    end
+
+    test "with the listener enabled one event per eviction and expiration carries the cause" do
+      cache = start_listened(eviction_listener: true)
+      remove_every_way(cache)
+      maintenance = Process.whereis(Maintenance.name(cache))
+
+      events = evictions_received(cache)
+      {expired, sized} = Enum.split_with(events, fn {_, meta, _} -> meta.cause == :expired end)
+
+      # One event per count of stats/1, and nothing but the two causes.
+      assert length(expired) == Theine.stats(cache).expirations
+      assert length(sized) == Theine.stats(cache).evictions
+      assert Enum.all?(sized, fn {_, meta, _} -> meta.cause == :size end)
+
+      # Each carries the removed entry's key, value and weight.
+      for {measurements, meta, _emitter} <- events do
+        assert measurements == %{weight: 1}
+        assert meta.value == {:v, meta.key}
+      end
+
+      # The expired keys are exactly the 60 with a TTL. The reader's and
+      # put_new's deletions emit in the caller, the sweep's in maintenance.
+      assert expired |> Enum.map(fn {_, meta, _} -> meta.key end) |> Enum.sort() ==
+               Enum.to_list(1..60)
+
+      emitters = Map.new(expired, fn {_, meta, emitter} -> {meta.key, emitter} end)
+      assert emitters[1] == self()
+      assert emitters[2] == self()
+      assert Enum.all?(3..60, &(emitters[&1] == maintenance))
+
+      # The size evictions are 51 distinct keys the table no longer holds,
+      # all evicted by the maintenance process.
+      evicted = Enum.map(sized, fn {_, meta, _} -> meta.key end)
+      assert length(Enum.uniq(evicted)) == 51
+      assert Enum.all?(sized, fn {_, _, emitter} -> emitter == maintenance end)
+      assert Enum.all?(evicted, &(:ets.lookup(cache, &1) == []))
+
+      assert Enum.sort(evicted ++ Enum.map(:ets.tab2list(cache), &elem(&1, 0))) ==
+               Enum.sort([2 | Enum.to_list(1000..1149)])
     end
   end
 end

@@ -109,7 +109,8 @@ defmodule Theine.Policy do
           restored_id: non_neg_integer(),
           sample_hits: non_neg_integer(),
           sample_misses: non_neg_integer(),
-          climber: climber() | nil
+          climber: climber() | nil,
+          listener: Config.cache() | nil
         }
 
   @enforce_keys [:policy, :ids, :expiry, :table, :sizes, :counters, :max_size]
@@ -137,7 +138,10 @@ defmodule Theine.Policy do
     restored_id: 0,
     sample_hits: 0,
     sample_misses: 0,
-    climber: nil
+    climber: nil,
+    # The cache name with `eviction_listener: true`, else nil: who
+    # `remove/2` and `expire_key/5` report each removal for.
+    listener: nil
   ]
 
   # Caffeine's hill climber (specs/05 §Adaptive window): a sample of
@@ -224,7 +228,7 @@ defmodule Theine.Policy do
   (specs/04 §Restart semantics).
   """
   @spec new(Config.t()) :: t()
-  def new(%Config{table: table, sizes: sizes, counters: counters, max_size: :infinity}) do
+  def new(%Config{table: table, sizes: sizes, counters: counters, max_size: :infinity} = config) do
     state = %__MODULE__{
       policy: :ets.new(__MODULE__, [:set, :private]),
       ids: :ets.new(__MODULE__.Ids, [:set, :private]),
@@ -232,23 +236,26 @@ defmodule Theine.Policy do
       table: table,
       sizes: sizes,
       counters: counters,
-      max_size: :infinity
+      max_size: :infinity,
+      listener: listener(config)
     }
 
     publish(state, 0, 0)
     state
   end
 
-  def new(%Config{
-        table: table,
-        sizes: sizes,
-        counters: counters,
-        max_size: max_size,
-        window_percent: window_percent,
-        adaptive: adaptive,
-        evict_batch: evict_batch,
-        sketch: %Sketch{} = sketch
-      })
+  def new(
+        %Config{
+          table: table,
+          sizes: sizes,
+          counters: counters,
+          max_size: max_size,
+          window_percent: window_percent,
+          adaptive: adaptive,
+          evict_batch: evict_batch,
+          sketch: %Sketch{} = sketch
+        } = config
+      )
       when is_integer(max_size) do
     %{window_max: window_max, protected_max: protected_max} = limits(max_size, window_percent)
     Sketch.clear(sketch)
@@ -278,12 +285,16 @@ defmodule Theine.Policy do
       window_max: window_max,
       protected_max: protected_max,
       evict_batch: evict_batch,
-      climber: climber
+      climber: climber,
+      listener: listener(config)
     }
 
     publish(state, 0, 0)
     state
   end
+
+  defp listener(%Config{eviction_listener: true, name: name}), do: name
+  defp listener(%Config{}), do: nil
 
   @doc """
   Applies a `{:put, key, id, weight, expires_at}` event (specs/05 §Events
@@ -777,6 +788,7 @@ defmodule Theine.Policy do
         [{^key, _value, ^id, _weight, _written_at, _expires_at} = entry] ->
           true = :ets.delete_object(table, entry)
           :counters.add(counters, @evictions, 1)
+          notify(state.listener, entry, :size)
           1
 
         _replaced_or_gone ->
@@ -785,6 +797,9 @@ defmodule Theine.Policy do
 
     {drop(state, row), evicted}
   end
+
+  defp notify(nil, _entry, _cause), do: :ok
+  defp notify(cache, entry, cause), do: Entry.evicted(cache, entry, cause)
 
   @doc """
   The adaptive step of the maintenance pass (specs/05 §Adaptive window;
@@ -1052,6 +1067,7 @@ defmodule Theine.Policy do
       [{^key, _value, ^id, _weight, _written_at, at} = entry] when at <= now ->
         true = :ets.delete_object(table, entry)
         :counters.add(counters, @expirations, 1)
+        notify(state.listener, entry, :expired)
         {expired + 1, drop(state, row)}
 
       [{^key, _value, ^id, _weight, _written_at, at}] ->

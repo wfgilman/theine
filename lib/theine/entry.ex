@@ -89,7 +89,26 @@ defmodule Theine.Entry do
     end
 
     :counters.add(counters, @expirations, 1)
+    if config.eviction_listener, do: evicted(config.name, entry, :expired)
     :error
+  end
+
+  @doc """
+  Emits `[:theine, :eviction]` for `entry`, which the caller has just
+  deleted from the table because of `cause` (specs/08 §Telemetry,
+  §Decisions M6.2). Called only with `eviction_listener: true`: by the
+  maintenance process for a size eviction (`:size`) or a swept expiry
+  (`:expired`), and by the reader or `put_new/4` caller that deleted an
+  expired entry it found (`:expired`).
+  """
+  @spec evicted(Config.cache(), t(), :size | :expired) :: :ok
+  def evicted(cache, {key, value, _id, weight, _written_at, _expires_at}, cause) do
+    :telemetry.execute([:theine, :eviction], %{weight: weight}, %{
+      cache: cache,
+      key: key,
+      value: value,
+      cause: cause
+    })
   end
 
   @doc """
@@ -153,6 +172,7 @@ defmodule Theine.Entry do
           true = :ets.delete_object(table, old)
           WriteEvents.deliver(config, {:removed, key, old_id})
           :counters.add(config.counters, @expirations, 1)
+          if config.eviction_listener, do: evicted(config.name, old, :expired)
           insert_new(config, key, value, weight, opts)
 
         [_live] ->

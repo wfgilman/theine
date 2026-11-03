@@ -100,9 +100,10 @@ Nebulex's. The targets of 1.5× `ets` latency, 0.65× `ets` throughput and 2×
 Cachex are met by the unbounded cache on most shapes. A bounded hit also
 records its read in an `:atomics` ring for the policy, which costs 60–85 ns
 more here, and that puts the bounded cache just past the targets on
-several shapes. A `put` runs at
-0.03–0.19× an ETS insert, because each write sends one message to the
-maintenance process. That threshold is an open question.
+several shapes. Each write sends one message to the maintenance process.
+In bursts of 1_000 a `put` costs 5.6–6.2× an ETS insert (2026-11-03,
+M5.1b; the target is at most 10×). Sustained writers are paced by that one
+process: they run at 0.03–0.21× an ETS insert's throughput.
 
 **`mix bench hitrate`** (2026-10-29, M2.13): hit rate (%) on the ARC traces
 and two synthetic ones. `theine_static` is the same cache with `adaptive:

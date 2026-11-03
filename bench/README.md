@@ -6,7 +6,7 @@ measured on the same machine in the same run.
 
 ```bash
 ERL_FLAGS="+sbt db +sbwt very_long" mix bench get
-mix bench get --sizes 1000 --warmup 0.5 --time 1   # quick smoke run, not a gate
+mix bench get --sizes 1000 --warmup 0.5 --time 1 --bursts 100   # quick smoke run, not a gate
 ```
 
 `mix bench <name>` evaluates `bench/<name>.exs`. The task and its helpers live
@@ -67,23 +67,25 @@ readers from contending on one refcount.
 Shapes: `n` in 1 000, 100 000, 1 000 000; both value kinds; `parallel` 1 and
 `System.schedulers_online()`. Warm-up 2 s, measurement 10 s per scenario.
 
-Extra `system` fields: `warmup_s`, `time_s`, `sizes`, `scenarios` (list), `parallel` (list),
-`zipf_s`, `missing_erl_flags` (list).
+Extra `system` fields: `warmup_s`, `time_s`, `burst_size`, `bursts`,
+`warmup_bursts`, `sizes`, `scenarios` (list), `parallel` (list), `zipf_s`,
+`missing_erl_flags` (list).
 
 Each `results` row:
 
 | field | type | meaning |
 |---|---|---|
-| `scenario` | string | `"get"` or `"put"` |
+| `scenario` | string | `"get"`, `"put_burst"` or `"put"` |
 | `subject` | string | `ets`, `theine`, `theine_unbounded`, `theine_nostats`, `cachex`, `nebulex` |
 | `n` | integer | entries pre-populated |
 | `value` | string | `"tuple3"` or `"binary_1kb"` |
-| `parallel` | integer | concurrent Benchee processes |
-| `p50_ns`, `p99_ns` | number | latency percentiles over all processes' samples, ns |
-| `average_ns` | number | mean latency, ns |
+| `parallel` | integer | concurrent Benchee processes (always 1 for `put_burst`) |
+| `p50_ns`, `p99_ns` | number | latency percentiles over all processes' samples, ns; for `put_burst`, percentiles of the per-burst cost per put |
+| `average_ns` | number | mean latency, ns; for `put_burst`, the total time of the timed bursts over their puts (the threshold's figure) |
 | `ips` | number | Benchee ips: 1 / mean latency, i.e. **per process**; multiply by `parallel` for aggregate throughput. Ratios are unaffected |
-| `sample_size` | integer | samples behind the statistics (Benchee caps at 1M per process) |
-| `ratio_to_ets` | object | `p50`, `p99`, `ips` divided by the `ets` row of the same scenario and shape |
+| `sample_size` | integer | samples behind the statistics (Benchee caps at 1M per process); for `put_burst`, the timed bursts |
+| `ratio_to_ets` | object | `p50`, `p99`, `average`, `ips` divided by the `ets` row of the same scenario and shape |
+| `ratio_to_cachex` | object | `put` rows only: `ips` divided by the `cachex` row of the same shape |
 
 Subjects: `ets` is the floor; `theine` is bounded at `max_size: n` with
 the policy on (every hit records into the read buffer, which the
@@ -100,13 +102,28 @@ Each subject is populated, measured and torn down before the next one
 starts (one Benchee job per suite), so no subject's background work runs
 while another is measured; ratios still compare rows of the same run.
 
-The `put` scenario runs after the subject's `get` runs, on the same
-populated subject: `ets` (`:ets.insert/2`), `theine`, `cachex`,
-`nebulex`. `--scenarios get` (or `put`) runs one of the two. Its inputs are `{key, value}` pairs pre-drawn like the `get`
-keys, each key's value the one it already holds, so every subject stays at
-`n` entries. The puts are sustained for the whole measurement, so the
-`theine` figure includes the time writers spend blocked above `write_hwm`
-(specs/03 §Delivery with backpressure).
+Two put scenarios run after the subject's `get` runs, on the same
+populated subject, in this order. `--scenarios` takes any subset of
+`get,put_burst,put`, so `--scenarios get` skips both. Their inputs are
+`{key, value}` pairs pre-drawn like the `get` keys, each key's value the
+one it already holds, so every subject stays at `n` entries.
+
+- `put_burst` (`ets` with `:ets.insert/2`, `theine`; `parallel` 1 only):
+  bursts of 1 000 puts, each burst timed alone with
+  `:erlang.monotonic_time/1` around a compiled loop. Between bursts, outside
+  the clock, the subject is drained: `Theine.run_maintenance/1` and then a
+  wait until `Theine.Maintenance.info/1` reports `pending: 0`. The
+  maintenance process runs during the bursts and consumes their events as
+  they arrive. A burst stays below the default `write_hwm` (1 024), so it
+  measures the caller's cost of a put with no backpressure. `--bursts`
+  sets the timed bursts (default 1 000). A tenth as many run untimed
+  first, as a warm-up.
+- `put` (`ets`, `theine`, `cachex`, `nebulex`; both parallelisms): Benchee,
+  the puts sustained for the whole measurement. The `theine` figure
+  includes the time writers spend blocked above `write_hwm` (specs/03
+  §Delivery with backpressure), so it measures the one maintenance
+  process's rate, not the caller's cost. The rows report `ips/ets` and
+  `ips/cachex`, with no threshold.
 
 Thresholds (specs/09). The `get` ones are evaluated for `theine` and
 `theine_unbounded`.
@@ -114,8 +131,8 @@ Thresholds (specs/09). The `get` ones are evaluated for `theine` and
 - A1: `p50/ets <= 1.5` and `p99/ets <= 1.5`, every shape.
 - A2: `ips/ets >= 0.65` at full parallelism; `ips / cachex ips >= 2` and
   `ips / nebulex ips >= 2` at full parallelism.
-- put (id `"put"`): `theine` put `ips/ets >= 0.5`, every shape and both
-  parallelisms.
+- put (id `"put"`): `theine` `put_burst` `average_ns` / `ets` `put_burst`
+  `average_ns` `<= 10`, every shape.
 
 ## `hitrate` (A3)
 

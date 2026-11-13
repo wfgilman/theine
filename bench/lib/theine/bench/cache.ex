@@ -33,11 +33,22 @@ defmodule Theine.Bench.Cache do
   seeded from the cache name, which is derived from the trace, the size and
   the window percentage, so it draws the same numbers every run.
 
+  A partitioned cache (`partitions: n`, specs/12) replays the same way
+  (specs/09 §Decisions M8.5b). A miss's put goes to its key's partition,
+  so the round trip after it is `Theine.Maintenance.info/2` on that
+  partition (`Theine.Partition.of_key/2`). `stripes: 1` gives each
+  partition one stripe of its own, `Theine.run_maintenance/1` runs one pass
+  of each partition in order, and each partition seeds its `:rand` from the
+  cache name and its index, so a run is again reproducible to the hit.
+  `close/1` checks every partition's pass count and `pending`.
+
   The maintenance process still runs the production code: the hit path, the
   ring, the policy, the sketch and its aging are those of `lib/`.
   """
 
   import Bitwise
+
+  alias Theine.Partition
 
   # The specs/08 default `drain_threshold`: how many accesses one pass covers.
   @accesses_per_pass 32
@@ -55,14 +66,15 @@ defmodule Theine.Bench.Cache do
   # batch must stay within the ring.
   @max_accesses_per_pass 64
 
-  @enforce_keys [:name, :sup, :max_size, :batch]
-  defstruct [:name, :sup, :max_size, :batch, accesses: 0, hits: 0, passes: 0]
+  @enforce_keys [:name, :sup, :max_size, :batch, :partitions]
+  defstruct [:name, :sup, :max_size, :batch, :partitions, accesses: 0, hits: 0, passes: 0]
 
   @type t :: %__MODULE__{
           name: atom(),
           sup: pid(),
           max_size: pos_integer(),
           batch: pos_integer(),
+          partitions: pos_integer(),
           accesses: non_neg_integer(),
           hits: non_neg_integer(),
           passes: non_neg_integer()
@@ -83,21 +95,25 @@ defmodule Theine.Bench.Cache do
   @doc """
   Starts a cache bounded at `size` entries for `trace`. Options:
   `window_percent` (default 1, the specs/05 default), `adaptive` (default
-  true, the specs/08 default) and `accesses_per_pass` (default
-  `accesses_per_pass/0`, at most `max_accesses_per_pass/0`; 1 replays every
-  access synchronously, as Caffeine's simulator does).
+  true, the specs/08 default), `partitions` (default 1, the specs/08
+  default; `start_link/1` refuses a share below the minimum) and
+  `accesses_per_pass` (default `accesses_per_pass/0`, at most
+  `max_accesses_per_pass/0`; 1 replays every access synchronously, as
+  Caffeine's simulator does).
 
   The cache name seeds admission's random guard (specs/05 §Events
   `evict`). A fixed-window cache keeps the name every replay had before the
   adaptive window existed, so its hits stay comparable with the earlier
   runs in IMPLEMENTATION_PLAN.md §Benchmark log; an adaptive one adds
-  `_adaptive`.
+  `_adaptive`, and a partitioned one `_p<n>` after that, so the names of
+  the unpartitioned caches are unchanged.
   """
   @spec new(String.t(), pos_integer(), keyword()) :: %__MODULE__{
           name: atom(),
           sup: pid(),
           max_size: pos_integer(),
           batch: 1..64,
+          partitions: pos_integer(),
           accesses: 0,
           hits: 0,
           passes: 0
@@ -105,6 +121,7 @@ defmodule Theine.Bench.Cache do
   def new(trace, size, opts \\ []) when is_binary(trace) and is_integer(size) and size > 0 do
     window_percent = Keyword.get(opts, :window_percent, 1)
     adaptive = Keyword.get(opts, :adaptive, true)
+    partitions = Keyword.get(opts, :partitions, 1)
     batch = Keyword.get(opts, :accesses_per_pass, @accesses_per_pass)
 
     unless is_integer(batch) and batch in 1..@max_accesses_per_pass do
@@ -112,7 +129,8 @@ defmodule Theine.Bench.Cache do
     end
 
     suffix = if adaptive, do: "_adaptive", else: ""
-    name = :"theine_hitrate_#{trace}_#{size}_w#{window_percent}#{suffix}"
+    split = if partitions == 1, do: "", else: "_p#{partitions}"
+    name = :"theine_hitrate_#{trace}_#{size}_w#{window_percent}#{suffix}#{split}"
 
     {:ok, sup} =
       Theine.start_link(
@@ -120,17 +138,18 @@ defmodule Theine.Bench.Cache do
         max_size: size,
         window_percent: window_percent,
         adaptive: adaptive,
+        partitions: partitions,
         stripes: 1,
         drain_threshold: @drain_threshold,
         maintenance_interval: @maintenance_interval
       )
 
-    %__MODULE__{name: name, sup: sup, max_size: size, batch: batch}
+    %__MODULE__{name: name, sup: sup, max_size: size, batch: batch, partitions: partitions}
   end
 
   @doc "Records one access; returns whether it hit and the updated state."
   @spec access(t(), term()) :: {:hit | :miss, t()}
-  def access(%__MODULE__{name: name} = cache, key) do
+  def access(%__MODULE__{name: name, partitions: n} = cache, key) do
     {outcome, hits} =
       case Theine.get(name, key) do
         {:ok, _} ->
@@ -138,7 +157,9 @@ defmodule Theine.Bench.Cache do
 
         :error ->
           :ok = Theine.put(name, key, :v)
-          _ = Theine.Maintenance.info(name)
+          # The key's partition applied the put and its eviction (M2.11e).
+          # At n = 1 this is partition 0 and of_key/2 does not hash.
+          _ = Theine.Maintenance.info(name, Partition.of_key(key, n))
           {:miss, cache.hits}
       end
 
@@ -154,27 +175,36 @@ defmodule Theine.Bench.Cache do
 
   @doc """
   Runs the last pass, checks that the replay was the synchronous one this
-  module promises, and stops the cache. Raises when the maintenance process
-  ran a pass of its own, when the cache's own hit count (specs/03 §Hits from
-  the tails) differs from the replay's, or when the cache is over its bound
-  after the last pass.
+  module promises, and stops the cache. Raises when a maintenance process
+  ran a pass of its own, when one has write events pending, when the cache's
+  own hit count (specs/03 §Hits from the tails) differs from the replay's,
+  or when the cache is over its bound after the last pass.
   """
   @spec close(t()) :: :ok
-  def close(%__MODULE__{name: name, sup: sup} = cache) do
+  def close(%__MODULE__{name: name, sup: sup, partitions: n} = cache) do
     :ok = Theine.run_maintenance(name)
     passes = cache.passes + 1
 
-    %{passes: seen, pending: pending} = Theine.Maintenance.info(name)
+    per_partition =
+      Enum.flat_map(0..(n - 1), fn p ->
+        %{passes: seen, pending: pending} = Theine.Maintenance.info(name, p)
+        at = if n == 1, do: "", else: " (partition #{p})"
+
+        [
+          {seen != passes, "#{seen} maintenance passes ran#{at}, the replay called #{passes}"},
+          {pending != 0, "#{pending} write events pending after the last pass#{at}"}
+        ]
+      end)
+
     %Theine.Stats{hits: counted} = Theine.stats(name)
     size = Theine.size(name)
 
     problems =
-      [
-        {seen != passes, "#{seen} maintenance passes ran, the replay called #{passes}"},
-        {pending != 0, "#{pending} write events pending after the last pass"},
-        {counted != cache.hits, "the cache counted #{counted} hits, the replay #{cache.hits}"},
-        {size > cache.max_size, "#{size} entries resident, max_size #{cache.max_size}"}
-      ]
+      (per_partition ++
+         [
+           {counted != cache.hits, "the cache counted #{counted} hits, the replay #{cache.hits}"},
+           {size > cache.max_size, "#{size} entries resident, max_size #{cache.max_size}"}
+         ])
       |> Enum.filter(fn {bad?, _} -> bad? end)
       |> Enum.map(fn {_, message} -> message end)
 

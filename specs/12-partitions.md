@@ -9,8 +9,9 @@ and bounded partitions: the read buffer split by partition, the
 partitioned `hit` shape, capacity shares, a sketch per share and the
 minimum share (M8.4). `partitions` is a `start_link` option. `mix bench
 get` has `theine_p4` and `mix bench maintenance` has the partitioned
-overshoot run and the throughput rows (M8.5a). The `mix bench hitrate`
-subject (M8.5b) and the docs (M8.6) remain.
+overshoot run and the throughput rows (M8.5a). `mix bench hitrate` has
+`theine_p4` on the rows whose share qualifies (M8.5b). The docs (M8.6)
+remain.
 It is the follow-on to milestone M7: M7 lowers the cost of a write event
 inside one maintenance process, and this note lets one cache run several
 of them. It says how a cache splits its policy across `partitions`
@@ -452,3 +453,11 @@ except where noted.
   reader run about `n` times the passes, and the bench counts them in the
   reader's latency (open question 5 in IMPLEMENTATION_PLAN.md). M8.5 was
   split: the `mix bench hitrate` subject is M8.5b.
+- 2026-11-13 (M8.5b): `mix bench hitrate`'s `theine_p4` built (specs/09
+  §Decisions M8.5b). The hit-rate row of §Acceptance holds on the
+  development machine: on all seven qualifying rows `theine_p4` is within
+  0.36 points of `theine` (−0.24 to +0.36), with no sign of the
+  small-share breakdown §Costs warns of at the smallest qualifying share
+  (P3, 12_500 entries a partition: −0.24). Two `--traces P3` runs agree to
+  the hit, so the partitioned replay is deterministic. The margin is read
+  as two-sided, "within 1 point" either way.

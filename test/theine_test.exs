@@ -475,6 +475,105 @@ defmodule TheineTest do
       assert hits > 2_000
       assert length(first.resident) <= 500
     end
+
+    # The same for a partitioned cache, which `mix bench hitrate`'s
+    # `theine_p4` relies on (specs/09 §Decisions M8.5b): a miss's put is
+    # waited for on its key's partition, each partition drains its own
+    # stripe, run_maintenance/1 runs the partitions in order, and each
+    # partition seeds :rand from the cache name and its index.
+    test "a key sequence replayed twice through a partitioned cache, driven by run_maintenance/1 alone, gives identical hits" do
+      cache = unique_cache()
+      n = 4
+
+      # 60_000 accesses at max_size 40_000 (the least that partitions: 4
+      # allows): two in three a new key, the rest from 3_000 hot keys, so
+      # every partition admits, rejects and evicts. Each miss costs a put
+      # and a round trip, so the sequence is kept just past the bound.
+      _ = :rand.seed(:exsss, {2026, 11, 13})
+
+      keys =
+        for i <- 1..60_000 do
+          if rem(i, 3) == 0, do: {:hot, :rand.uniform(3_000)}, else: {:scan, i}
+        end
+
+      replay = fn ->
+        opts = [
+          name: cache,
+          max_size: 40_000,
+          partitions: n,
+          stripes: 1,
+          drain_threshold: 1_073_741_824,
+          maintenance_interval: 60_000
+        ]
+
+        start_supervised!({Theine, opts})
+
+        {hits, runs} =
+          keys
+          |> Enum.with_index(1)
+          |> Enum.reduce({0, 0}, fn {key, i}, {hits, runs} ->
+            hits =
+              case Theine.get(cache, key) do
+                {:ok, _} ->
+                  hits + 1
+
+                :error ->
+                  Theine.put(cache, key, i)
+                  _ = Theine.Maintenance.info(cache, Theine.Partition.of_key(key, n))
+                  hits
+              end
+
+            if rem(i, 32) == 0 do
+              Theine.run_maintenance(cache)
+              {hits, runs + 1}
+            else
+              {hits, runs}
+            end
+          end)
+
+        Theine.run_maintenance(cache)
+
+        partitions =
+          for p <- 0..(n - 1) do
+            %{passes: passes, pending: pending, size: size} = Theine.Maintenance.info(cache, p)
+            {passes, pending, size}
+          end
+
+        %Theine.Stats{hits: counted, evictions: evictions} = Theine.stats(cache)
+
+        resident =
+          cache |> :ets.select([{{:"$1", :_, :_, :_, :_, :_}, [], [:"$1"]}]) |> Enum.sort()
+
+        :ok = stop_supervised!({Theine, cache})
+
+        %{
+          hits: hits,
+          runs: runs + 1,
+          partitions: partitions,
+          counted: counted,
+          evictions: evictions,
+          resident: resident
+        }
+      end
+
+      first = replay.()
+      second = replay.()
+
+      assert first == second
+      assert %{hits: hits, runs: runs, counted: hits} = first
+      assert hits > 10_000
+
+      # Every partition ran exactly the requested passes, has nothing
+      # pending and sits at its share of 10_000.
+      for {passes, pending, size} <- first.partitions do
+        assert {passes, pending} == {runs, 0}
+        assert size == 10_000
+      end
+
+      # Every miss inserted an absent key, and all but 40_000 were evicted.
+      assert length(first.resident) == 40_000
+      assert first.evictions == length(keys) - hits - 40_000
+    end
   end
 
   describe "put_new/4, delete/2 and clear/1" do

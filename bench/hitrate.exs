@@ -5,6 +5,8 @@
 #   mix bench hitrate --window-percent 1,5,20    # sweep the window size (specs/05)
 #   mix bench hitrate --memory-gb 2              # smaller replay passes
 #   mix bench hitrate --accesses-per-pass 1      # synchronous, like Caffeine's simulator
+#   mix bench hitrate --traces DS1 --sizes 8000000 --label ds1-8m
+#                                                # one size of a trace, its own result file
 #
 # Replays every trace in bench/traces.exs at each of its sizes through every
 # policy. Traces must already be in bench/traces/ with their recorded SHA-256
@@ -27,6 +29,13 @@ defmodule Theine.Bench.Hitrate do
   @default_window_percent 1
   @static_slack 1.0
 
+  # `theine_p4` is the `theine` cache split into this many partitions
+  # (specs/12), run only where each share is at least the minimum share, and
+  # within this many points of `theine` either way (specs/12 §Settled
+  # questions 3; specs/09, A3).
+  @partitions 4
+  @partitioned_slack 1.0
+
   # Instances replayed together may hold this much ETS (estimated from each
   # policy's bytes per entry). DS1's theine instances alone would need about
   # 5 GB; the reference laptop has 8.
@@ -41,34 +50,43 @@ defmodule Theine.Bench.Hitrate do
           dir: :string,
           window_percent: :string,
           memory_gb: :float,
-          accesses_per_pass: :integer
+          accesses_per_pass: :integer,
+          sizes: :string,
+          label: :string
         ]
       )
 
     manifest = Traces.manifest(Keyword.get(opts, :manifest, Traces.default_manifest()))
     dir = Keyword.get(opts, :dir, Traces.default_dir())
-    entries = select(manifest, opts[:traces])
+    entries = manifest |> select(opts[:traces]) |> select_sizes(opts[:sizes])
     percents = window_percents(opts[:window_percent])
     budget = round(Keyword.get(opts, :memory_gb, @default_memory_gb) * 1_073_741_824)
     batch = accesses_per_pass(opts[:accesses_per_pass])
     policies = policies(percents, batch)
+    label = label(opts[:label])
 
     rows = Enum.flat_map(entries, &run_trace(&1, dir, policies, budget))
     thresholds = availability(rows) ++ comparisons(rows)
 
     path =
-      Report.write_json("hitrate", %{
-        system:
-          Report.system(%{
-            traces: Enum.map(entries, & &1.name),
-            policies: Enum.map(policies, & &1.name),
-            window_percents: percents,
-            accesses_per_pass: batch,
-            memory_budget_bytes: budget
-          }),
-        results: rows,
-        thresholds: thresholds
-      })
+      Report.write_json(
+        "hitrate",
+        %{
+          system:
+            Report.system(%{
+              traces: Enum.map(entries, & &1.name),
+              sizes: Map.new(entries, &{&1.name, &1.sizes}),
+              policies: Enum.map(policies, & &1.name),
+              window_percents: percents,
+              accesses_per_pass: batch,
+              memory_budget_bytes: budget,
+              label: label
+            }),
+          results: rows,
+          thresholds: thresholds
+        },
+        label
+      )
 
     IO.puts(summary(rows, thresholds, path))
 
@@ -84,6 +102,47 @@ defmodule Theine.Bench.Hitrate do
       [] -> Enum.filter(manifest, &(&1.name in wanted))
       unknown -> Mix.raise("mix bench hitrate: unknown trace(s) #{Enum.join(unknown, ", ")}")
     end
+  end
+
+  # Keeps only the listed sizes of each selected trace, so that one trace
+  # can be run in parts (specs/09 §Decisions M8.5b). A trace left with no
+  # size is dropped; a size that no selected trace has is an error.
+  defp select_sizes(entries, nil), do: entries
+
+  defp select_sizes(entries, csv) do
+    wanted =
+      csv
+      |> String.split(",", trim: true)
+      |> Enum.map(fn s ->
+        case s |> String.trim() |> String.replace("_", "") |> Integer.parse() do
+          {n, ""} when n > 0 -> n
+          _ -> Mix.raise("mix bench hitrate: --sizes takes positive integers, got #{inspect(s)}")
+        end
+      end)
+
+    case wanted -- Enum.flat_map(entries, & &1.sizes) do
+      [] ->
+        :ok
+
+      unknown ->
+        Mix.raise("mix bench hitrate: no selected trace has size(s) #{Enum.join(unknown, ", ")}")
+    end
+
+    for entry <- entries,
+        sizes = Enum.filter(entry.sizes, &(&1 in wanted)),
+        sizes != [] do
+      %{entry | sizes: sizes}
+    end
+  end
+
+  # A label names the result file `hitrate-<sha>-<label>.json`, so that the
+  # parts of a split run on one tree do not overwrite each other.
+  defp label(nil), do: nil
+
+  defp label(label) do
+    if label =~ ~r/\A[A-Za-z0-9_.-]+\z/,
+      do: label,
+      else: Mix.raise("mix bench hitrate: --label takes letters, digits, '_', '.' and '-'")
   end
 
   defp window_percents(nil), do: [@default_window_percent]
@@ -112,14 +171,16 @@ defmodule Theine.Bench.Hitrate do
   end
 
   # Each policy: new(trace, size) -> state, access(state, key) -> {:hit |
-  # :miss, state}, close(state), and bytes_per_entry for the memory budget.
+  # :miss, state}, close(state), bytes_per_entry for the memory budget, and
+  # runs?(size), whether it has a row at that size.
   defp policies(percents, batch) do
     lru = %{
       name: "lru",
       new: fn _trace, size -> LRU.new(size) end,
       access: &LRU.access/2,
       close: &LRU.close/1,
-      bytes_per_entry: LRU.bytes_per_entry()
+      bytes_per_entry: LRU.bytes_per_entry(),
+      runs?: fn _size -> true end
     }
 
     theine =
@@ -131,7 +192,8 @@ defmodule Theine.Bench.Hitrate do
           end,
           access: &Cache.access/2,
           close: &Cache.close/1,
-          bytes_per_entry: Cache.bytes_per_entry()
+          bytes_per_entry: Cache.bytes_per_entry(),
+          runs?: fn _size -> true end
         }
       end
 
@@ -146,10 +208,28 @@ defmodule Theine.Bench.Hitrate do
       end,
       access: &Cache.access/2,
       close: &Cache.close/1,
-      bytes_per_entry: Cache.bytes_per_entry()
+      bytes_per_entry: Cache.bytes_per_entry(),
+      runs?: fn _size -> true end
     }
 
-    [lru | theine] ++ [static]
+    # Only where a cache of that size with this many partitions can start
+    # (specs/12 §Settled questions 1): DS1, S3, P3 and zipf 100_000.
+    partitioned = %{
+      name: "theine_p#{@partitions}",
+      new: fn trace, size ->
+        Cache.new(trace, size,
+          window_percent: @default_window_percent,
+          partitions: @partitions,
+          accesses_per_pass: batch
+        )
+      end,
+      access: &Cache.access/2,
+      close: &Cache.close/1,
+      bytes_per_entry: Cache.bytes_per_entry(),
+      runs?: fn size -> div(size, @partitions) >= Theine.Config.min_share() end
+    }
+
+    [lru | theine] ++ [static, partitioned]
   end
 
   defp theine_name(@default_window_percent), do: "theine"
@@ -169,7 +249,7 @@ defmodule Theine.Bench.Hitrate do
       {:error, message} ->
         IO.puts(:stderr, "hitrate: " <> message)
 
-        for size <- entry.sizes, policy <- policies do
+        for size <- entry.sizes, policy <- policies, policy.runs?.(size) do
           row(entry.name, size, policy.name, %{status: "error", error: message})
         end
     end
@@ -179,7 +259,8 @@ defmodule Theine.Bench.Hitrate do
   # over the file whose estimated ETS footprint stays within the budget. An
   # instance over the budget by itself gets a pass of its own.
   defp passes(entry, policies, budget) do
-    instances = for policy <- policies, size <- entry.sizes, do: {size, policy}
+    instances =
+      for policy <- policies, size <- entry.sizes, policy.runs?.(size), do: {size, policy}
 
     instances
     |> Enum.reduce([], fn {size, policy} = instance, passes ->
@@ -285,7 +366,23 @@ defmodule Theine.Bench.Hitrate do
         )
       end
 
-    against_lru ++ against_static
+    partitioned = "theine_p#{@partitions}"
+
+    against_partitioned =
+      for %{policy: ^partitioned, status: "ok"} = p <- rows,
+          %{status: "ok"} = t <- [Map.get(by_key, {p.trace, p.size, "theine"})] do
+        delta = p.hit_rate - t.hit_rate
+
+        check(
+          "A3",
+          "#{partitioned} - theine hit rate (points), #{p.trace} at #{p.size}",
+          delta,
+          :within,
+          @partitioned_slack
+        )
+      end
+
+    against_lru ++ against_static ++ against_partitioned
   end
 
   defp margins(%{trace: trace, size: size}) do
@@ -298,9 +395,11 @@ defmodule Theine.Bench.Hitrate do
         :<= -> actual <= limit
         :>= -> actual >= limit
         :== -> actual == limit
+        :within -> abs(actual) <= limit
       end
 
-    %{id: id, description: description, actual: actual, limit: "#{op} #{limit}", passed: passed}
+    limit = if op == :within, do: "within ±#{limit}", else: "#{op} #{limit}"
+    %{id: id, description: description, actual: actual, limit: limit, passed: passed}
   end
 
   defp summary(rows, thresholds, path) do

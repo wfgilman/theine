@@ -17,7 +17,8 @@ task exits non-zero when that list is not empty. Without the `ERL_FLAGS`
 above the run still happens, with a warning on stderr and the missing flags
 recorded in the result.
 
-Each run writes `bench/results/<name>-<git-sha>.json` (gitignored) and prints
+Each run writes `bench/results/<name>-<git-sha>.json` (gitignored), or
+`<name>-<git-sha>-<label>.json` for a `hitrate` run with `--label`, and prints
 a markdown summary on stdout. Hot-path commits paste that summary into the
 commit body (AGENTS.md).
 
@@ -244,6 +245,22 @@ mix bench hitrate --traces loop,zipf       # a subset, by name
 mix bench hitrate --window-percent 1,5,20  # sweep the window size (specs/05)
 mix bench hitrate --memory-gb 2            # smaller replay passes
 mix bench hitrate --accesses-per-pass 1    # one access per pass, like Caffeine's simulator
+mix bench hitrate --traces DS1 --sizes 8000000 --label ds1-8m
+                                           # some sizes only, into hitrate-<sha>-ds1-8m.json
+```
+
+`--sizes` keeps the listed sizes of the selected traces and drops a trace
+left with none; a size that no selected trace has is an error. A check
+compares rows of one size, so a run split by size evaluates the same
+checks as a whole one. `--label` keeps the parts of a split run on one tree
+from overwriting each other's result file. The build loop's background
+commands stop at 2 hours, and the full run takes longer, so it runs in
+three parts (specs/09 §Decisions M8.5b):
+
+```bash
+mix bench hitrate --traces OLTP,S3,P3,loop,zipf --label main
+mix bench hitrate --traces DS1 --sizes 1000000,4000000 --label ds1-1m-4m
+mix bench hitrate --traces DS1 --sizes 8000000 --label ds1-8m
 ```
 
 A replay harness, not Benchee. Each trace in the manifest is replayed at each
@@ -292,10 +309,20 @@ Policies:
 - `theine_static`: the same cache with `adaptive: false` at `window_percent`
   1, the fixed-window W-TinyLFU, on every row whatever `--window-percent`
   says.
+- `theine_p4`: the `theine` cache with `partitions: 4` (specs/12), only on
+  rows whose share `div(size, 4)` is at least the minimum share of 10_000:
+  DS1, S3, P3 and zipf 100_000. It replays as `theine` does. A miss's
+  round trip goes to the key's partition (`Theine.Maintenance.info/2` with
+  `Theine.Partition.of_key/2`), the single stripe is per partition,
+  `run_maintenance/1` runs every partition's pass in order, and `close/1`
+  checks every partition's pass count and `pending`. Its cache name is
+  `theine`'s with `_p4` appended, and each partition seeds `:rand` from
+  the name and its index, so a run is reproducible to the hit.
 
-Extra `system` fields: `traces` (names replayed), `policies` (names),
+Extra `system` fields: `traces` (names replayed), `sizes` (an object from
+each trace replayed to the sizes it ran at), `policies` (names),
 `window_percents` (the list replayed), `accesses_per_pass` (32),
-`memory_budget_bytes`.
+`memory_budget_bytes`, `label` (`--label`, or null).
 
 Each `results` row:
 
@@ -303,7 +330,7 @@ Each `results` row:
 |---|---|---|
 | `trace` | string | manifest name |
 | `size` | integer | cache capacity in entries |
-| `policy` | string | `lru`, `theine`, `theine_w<p>`, `theine_static` |
+| `policy` | string | `lru`, `theine`, `theine_w<p>`, `theine_static`, `theine_p4` |
 | `status` | string | `"ok"`, or `"error"` when the trace could not be replayed |
 | `error` | string or null | why the trace could not be replayed |
 | `requests` | integer or null | keys replayed (an ARC line counts once per block) |
@@ -321,6 +348,10 @@ Thresholds (specs/09):
 - A3 `theine - theine_static hit rate (points), <trace> at <size>`: `>= -1.0`
   on every row where both ran: the climber may cost at most a point
   against the fixed window.
+- A3 `theine_p4 - theine hit rate (points), <trace> at <size>`: limit
+  `within ±1.0` (the absolute difference at most 1.0) on every row where
+  both ran: partitioning may move the hit rate by at most a point either
+  way (specs/12 §Settled questions 3).
 
 ## Caffeine simulator cross-check (A3 human gate)
 

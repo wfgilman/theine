@@ -127,12 +127,19 @@ test/                         mirrors lib/; test/support for shared helpers
   `--traces loop` takes seconds. `--accesses-per-pass 1` replays like
   Caffeine's simulator, `--window-percent 1,5,20` sweeps the window. The
   full run replays DS1 at 8 M entries (about 3 GB of ETS) and, with
-  `theine_static` beside `theine` (M2.13), outlasts the 2-hour cap on a
-  background command: run `--traces OLTP,S3,P3,loop,zipf` (about 44 min)
-  and then `--traces DS1` (about 79 min), one after the other, since each
-  overwrites `hitrate-<sha>.json`. Compare hits before starting the second. Two runs must agree to the hit: compare the
+  `theine_static` and `theine_p4` beside `theine` (M2.13, M8.5b), outlasts
+  the 2-hour cap on a background command. Run it in three parts, one after
+  the other, each with its own `--label` so the result files do not
+  overwrite each other (`hitrate-<sha>-<label>.json`): `--traces
+  OLTP,S3,P3,loop,zipf --label main` (about 60 min), `--traces DS1 --sizes
+  1000000,4000000 --label ds1-1m-4m` (about 91 min) and `--traces DS1
+  --sizes 8000000 --label ds1-8m` (about 21 min: each 8 M instance gets a
+  pass to itself, and one theine instance alone replays DS1 in 6 min
+  against about 15 min each when three share a pass). `--traces P3`
+  (about 4 min) is the quick partitioned check. Two runs must agree to the hit: compare the
   `hits` fields in the JSON, not the percentages (the harness raises if a
-  pass it did not request ran).
+  pass it did not request ran). `bench/results/check-m85b.exs FILE...`
+  (gitignored) checks result files against M8.4's hits.
 - The per-event write cost rows of `mix bench maintenance` (M7.1) agree to
   3% within one invocation but moved 27% between invocations, after the
   gated runs heat the laptop. To compare a `Theine.Policy` change, run

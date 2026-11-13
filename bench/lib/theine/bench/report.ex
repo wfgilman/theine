@@ -109,12 +109,13 @@ defmodule Theine.Bench.Report do
   end
 
   @doc """
-  Writes `bench/results/<bench>-<sha>.json` and returns its path. `body` holds
-  the bench-specific `results` and `thresholds`; the envelope fields are added
-  here and `passed` is derived from the thresholds.
+  Writes `bench/results/<bench>-<sha>.json`, or `<bench>-<sha>-<label>.json`
+  with a label, and returns its path. `body` holds the bench-specific
+  `results` and `thresholds`; the envelope fields are added here and
+  `passed` is derived from the thresholds.
   """
-  @spec write_json(String.t(), map()) :: Path.t()
-  def write_json(bench, %{results: _, thresholds: thresholds} = body) do
+  @spec write_json(String.t(), map(), String.t() | nil) :: Path.t()
+  def write_json(bench, %{results: _, thresholds: thresholds} = body, label \\ nil) do
     sha = git_sha()
 
     envelope =
@@ -128,7 +129,8 @@ defmodule Theine.Bench.Report do
       })
 
     File.mkdir_p!(@results_dir)
-    path = Path.join(@results_dir, "#{bench}-#{sha}.json")
+    file = if label, do: "#{bench}-#{sha}-#{label}.json", else: "#{bench}-#{sha}.json"
+    path = Path.join(@results_dir, file)
     File.write!(path, JSON.encode!(envelope))
     path
   end

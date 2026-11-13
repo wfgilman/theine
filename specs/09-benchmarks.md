@@ -130,6 +130,9 @@ Policies in the harness:
 - `theine`: a real cache, driven synchronously by calling
   `run_maintenance/1` every `drain_threshold` accesses so results are
   deterministic and independent of scheduler timing.
+- `theine_p4`: the same cache with `partitions: 4` (specs/12), driven the
+  same way, on the rows whose share `div(size, 4)` is at least the minimum
+  share: DS1, S3, P3 and zipf 100_000.
 
 Traces in `bench/traces/` (gitignored; `mix bench.traces` downloads them and
 verifies a SHA-256 recorded in `bench/traces.exs`):
@@ -156,6 +159,8 @@ the 1% window; the harness reports it on every row.
 - On every trace and size, `theine` hit rate ≥ `lru` hit rate.
 - On `loop` at 1_000, `theine` ≥ `lru` + 10 percentage points.
 - On every trace and size, `theine` ≥ `theine_static` − 1 percentage point.
+- On every row it runs, `theine_p4` within 1 percentage point of `theine`,
+  either way (specs/12 §Settled questions 3).
 - Human gate (M5, not run by the loop): run Caffeine's simulator
   (`./gradlew simulator:run` with the trace and `maximum-size` set) on the
   same traces. On every row, `theine` must be within 1 percentage point of
@@ -604,3 +609,36 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   scheduler both caches saturate and the ratio is about 1.0. The
   threshold stands. Whether the drain rate should be shared across the
   partitions is open question 5 in IMPLEMENTATION_PLAN.md.
+- 2026-11-13 (M8.5b): `theine_p4` in `mix bench hitrate`, with specs/12
+  §Settled questions 3's margin, a human decision, so writing it here
+  relaxes nothing. Four details:
+  - The check is two-sided, `|theine_p4 − theine| ≤ 1` point, as "within
+    1 point" reads and as the Caffeine cross-check above is. A partitioned
+    cache that beats the default by more than a point is as much a sign
+    that the replay differs as one that trails it.
+  - The replay stays synchronous (M2.10, M2.11e) with partitions. A
+    miss's put is followed by `Theine.Maintenance.info/2` on the key's
+    partition (`Theine.Partition.of_key/2`), so the put and its eviction
+    are applied before the next access. `stripes: 1` gives each partition
+    a stripe of its own, `run_maintenance/1` runs one pass of each
+    partition in order, and each partition seeds `:rand` from the cache
+    name and its index. `close/1` checks every partition's pass count and
+    `pending`. The cache name gains `_p4` after the existing name, so the
+    unpartitioned caches keep their names and their seeds. At `n = 1` the
+    round trip is `info/2` on partition 0, the same call as before.
+  - `--sizes` keeps the listed sizes of the selected traces and drops a
+    trace left with none; a size no selected trace has is an error. With
+    a fourth theine subject the DS1 replay (about 43.7 M requests per
+    instance, three theine instances at 79 minutes in M8.4) outlasts the
+    2-hour cap of a background command in the build loop, so DS1 runs in
+    parts, `--sizes 1000000,4000000` and `--sizes 8000000`. Each part's
+    thresholds compare rows of the same size only, so a split run
+    evaluates the same checks as a whole one.
+  - `--label L` writes the result to `hitrate-<sha>-<L>.json`, so the
+    parts of a split run on one tree no longer overwrite each other. The
+    JSON `system` records the label and the sizes run per trace.
+
+  The first run (IMPLEMENTATION_PLAN.md §Benchmark log M8.5b) passed 32/32
+  checks in three parts of 60, 91 and 21 minutes, with every `lru`,
+  `theine` and `theine_static` row identical to M8.4's and `theine_p4`
+  between −0.24 and +0.36 points of `theine`.

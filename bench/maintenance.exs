@@ -2,12 +2,14 @@
 # load (specs/09 §mix bench maintenance, A5; specs/04 §Budget).
 #
 #   mix bench maintenance
-#   mix bench maintenance --max-size 10000 --duration 1    # quick smoke run
+#   mix bench maintenance --max-size 40000 --duration 1    # quick smoke run
 #
 # Not Benchee: each subject runs the overshoot write run, then the mixed run,
-# then the per-event write cost runs (reported only), through
-# Theine.Bench.Load. Evaluates to the list of failed threshold descriptions
-# (Mix.Tasks.Bench).
+# then the per-event write cost runs and the throughput runs at 1, 2 and 4
+# partitions (reported only), then the overshoot write run again with
+# `partitions: 4` (skipped below `--max-size 40000`, the minimum share),
+# through Theine.Bench.Load. Evaluates to the list of failed threshold
+# descriptions (Mix.Tasks.Bench).
 
 defmodule Theine.Bench.Maintenance do
   alias Theine.Bench.{Load, Report}
@@ -32,6 +34,13 @@ defmodule Theine.Bench.Maintenance do
   @event_duration_s 5.0
   @event_runs 3
   @event_scenarios [:overwrite, :new]
+  # Partitioned maintenance (specs/12, specs/09 §Decisions M8.5a): the
+  # overshoot run again with `partitions: 4`, whose bound has one
+  # `write_hwm` per partition, and the per-event scenarios at each of these
+  # partition counts with one writer per scheduler (reported; the 2x gate
+  # at 4 is the reference machine's, judged by a person).
+  @overshoot_partitions 4
+  @throughput_partitions [1, 2, 4]
 
   @none "no theine subject yet"
 
@@ -48,10 +57,14 @@ defmodule Theine.Bench.Maintenance do
     missing_flags = Report.check_erl_flags()
 
     rows =
-      Enum.map(subjects(), fn subject ->
-        subject
-        |> run_subject(max_size, duration_ms, schedulers)
-        |> Map.put(:write_cost, write_cost(subject, event_ms))
+      Enum.flat_map(subjects(), fn subject ->
+        row =
+          subject
+          |> run_subject(max_size, duration_ms, schedulers)
+          |> Map.put(:write_cost, write_cost(subject, event_ms))
+          |> Map.put(:throughput, throughput(subject, event_ms, schedulers))
+
+        [row | partitioned_rows(subject, max_size, duration_ms, schedulers)]
       end)
 
     thresholds = Enum.flat_map(rows, &thresholds(&1, schedulers))
@@ -73,6 +86,8 @@ defmodule Theine.Bench.Maintenance do
             event_max_size: @event_max_size,
             event_duration_s: event_ms / 1000,
             event_runs: @event_runs,
+            overshoot_partitions: @overshoot_partitions,
+            throughput_partitions: @throughput_partitions,
             subjects: Enum.map(subjects(), & &1.name),
             missing_erl_flags: missing_flags
           }),
@@ -121,18 +136,7 @@ defmodule Theine.Bench.Maintenance do
   # write run's leftovers.
   defp run_subject(subject, max_size, duration_ms, schedulers) do
     start_opts = [max_size: max_size, write_hwm: @write_hwm]
-
-    IO.puts(:stderr, "maintenance: #{subject.name} write run, #{duration_ms} ms")
-
-    write =
-      with_subject(subject, start_opts, fn state ->
-        Load.write_run(subject, state,
-          writers: schedulers,
-          duration_ms: duration_ms,
-          sample_ms: @sample_ms,
-          settle_ms: @settle_ms
-        )
-      end)
+    overshoot = overshoot(subject, subject.name, 1, max_size, duration_ms, schedulers)
 
     IO.puts(:stderr, "maintenance: #{subject.name} mixed run, #{duration_ms} ms")
 
@@ -154,14 +158,9 @@ defmodule Theine.Bench.Maintenance do
 
     %{
       subject: subject.name,
+      partitions: 1,
       max_size: max_size,
-      overshoot: %{
-        limit: max_size + @write_hwm + schedulers,
-        max_sample: write.max_sample,
-        samples: length(write.samples),
-        writes: write.writes,
-        settled_size: write.settled_size
-      },
+      overshoot: overshoot,
       pass: %{
         count: length(passes),
         p50_us: Load.percentile(passes, 50),
@@ -175,6 +174,111 @@ defmodule Theine.Bench.Maintenance do
         fraction: if(mixed.call_writes && mixed.writes > 0, do: mixed.call_writes / mixed.writes)
       }
     }
+  end
+
+  # The overshoot write run on a fresh cache of `partitions` partitions. The
+  # bound has one `write_hwm` per partition (specs/12 §A5 with partitions);
+  # at 1 it is the A5 bound of specs/09.
+  defp overshoot(subject, label, partitions, max_size, duration_ms, schedulers) do
+    start_opts = [max_size: max_size, write_hwm: @write_hwm, partitions: partitions]
+
+    IO.puts(:stderr, "maintenance: #{label} write run, #{duration_ms} ms")
+
+    write =
+      with_subject(subject, start_opts, fn state ->
+        Load.write_run(subject, state,
+          writers: schedulers,
+          duration_ms: duration_ms,
+          sample_ms: @sample_ms,
+          settle_ms: @settle_ms
+        )
+      end)
+
+    %{
+      limit: max_size + partitions * @write_hwm + schedulers,
+      max_sample: write.max_sample,
+      samples: length(write.samples),
+      writes: write.writes,
+      settled_size: write.settled_size
+    }
+  end
+
+  # The overshoot run with `partitions: @overshoot_partitions` (specs/12
+  # §Acceptance, Bound), a row with no mixed run and no per-event costs. A
+  # `--max-size` below the minimum share of every partition cannot start
+  # such a cache, so a smoke run that small skips it.
+  defp partitioned_rows(subject, max_size, duration_ms, schedulers) do
+    n = @overshoot_partitions
+    label = "#{subject.name}_p#{n}"
+
+    if div(max_size, n) < Theine.Config.min_share() do
+      IO.puts(
+        :stderr,
+        "maintenance: #{label} skipped, partitions: #{n} needs --max-size >= " <>
+          "#{n * Theine.Config.min_share()}"
+      )
+
+      []
+    else
+      [
+        %{
+          subject: label,
+          partitions: n,
+          max_size: max_size,
+          overshoot: overshoot(subject, label, n, max_size, duration_ms, schedulers),
+          pass: nil,
+          backpressure: nil,
+          write_cost: [],
+          throughput: []
+        }
+      ]
+    end
+  end
+
+  # The per-event scenarios with one writer per scheduler, at each of
+  # @throughput_partitions (specs/12 §Acceptance, Throughput): mean puts/s
+  # over @event_runs runs, and that against the run at one partition.
+  defp throughput(subject, event_ms, schedulers) do
+    rows =
+      for partitions <- @throughput_partitions, scenario <- @event_scenarios do
+        start_opts = [max_size: @event_max_size, write_hwm: @write_hwm, partitions: partitions]
+
+        IO.puts(
+          :stderr,
+          "maintenance: #{subject.name} throughput partitions #{partitions} #{scenario}, " <>
+            "#{schedulers} writers, #{@event_runs} x #{event_ms} ms"
+        )
+
+        runs =
+          for i <- 1..@event_runs do
+            with_subject(subject, start_opts, fn state ->
+              Load.event_run(subject, state,
+                fill: @event_max_size,
+                keys: scenario,
+                writers: schedulers,
+                duration_ms: event_ms,
+                seed: @seed + i
+              )
+            end)
+          end
+
+        %{
+          partitions: partitions,
+          scenario: Atom.to_string(scenario),
+          writers: schedulers,
+          max_size: @event_max_size,
+          runs: runs,
+          writes: runs |> Enum.map(& &1.writes) |> mean() |> round(),
+          puts_per_s: mean(Enum.map(runs, & &1.puts_per_s)),
+          us_per_event: mean(Enum.map(runs, & &1.us_per_event))
+        }
+      end
+
+    base = for %{partitions: 1} = r <- rows, into: %{}, do: {r.scenario, r.puts_per_s}
+
+    Enum.map(rows, fn r ->
+      Map.put(r, :vs_one_partition, r.puts_per_s / Map.fetch!(base, r.scenario))
+    end)
   end
 
   # One row per scenario: the mean puts/s and µs per event over
@@ -231,10 +335,12 @@ defmodule Theine.Bench.Maintenance do
     budget_us = @pass_budget_ms * 1000
     on = "#{row.subject}, max_size #{row.max_size}"
 
+    hwm = if row.partitions == 1, do: "write_hwm", else: "#{row.partitions} * write_hwm"
+
     overshoot = [
       check(
         "A5",
-        "max sampled size <= max_size + write_hwm + schedulers (#{schedulers}), #{on}",
+        "max sampled size <= max_size + #{hwm} + schedulers (#{schedulers}), #{on}",
         o.max_sample,
         :<=,
         o.limit
@@ -249,14 +355,20 @@ defmodule Theine.Bench.Maintenance do
     ]
 
     # No pass events means the run measured nothing: fail rather than pass.
+    # A partitioned row has no mixed run (`pass` is nil).
     passes =
-      if p.count == 0 do
-        [check("budget", "maintenance pass events observed, #{on}", 0, :>=, 1)]
-      else
-        [
-          check("budget", "pass p99 (us), #{on}", p.p99_us, :<=, budget_us),
-          check("budget", "pass max (us), #{on}", p.max_us, :<=, 4 * budget_us)
-        ]
+      cond do
+        p == nil ->
+          []
+
+        p.count == 0 ->
+          [check("budget", "maintenance pass events observed, #{on}", 0, :>=, 1)]
+
+        true ->
+          [
+            check("budget", "pass p99 (us), #{on}", p.p99_us, :<=, budget_us),
+            check("budget", "pass max (us), #{on}", p.max_us, :<=, 4 * budget_us)
+          ]
       end
 
     overshoot ++ passes
@@ -278,19 +390,23 @@ defmodule Theine.Bench.Maintenance do
 
     ### Overshoot (A5)
 
-    #{section(rows, ["subject", "max_size", "limit", "max sample", "samples", "writes", "settled size"], fn r -> [r.subject, r.max_size, r.overshoot.limit, r.overshoot.max_sample, r.overshoot.samples, r.overshoot.writes, r.overshoot.settled_size] end)}
+    #{section(rows, ["subject", "partitions", "max_size", "limit", "max sample", "samples", "writes", "settled size"], fn r -> [r.subject, r.partitions, r.max_size, r.overshoot.limit, r.overshoot.max_sample, r.overshoot.samples, r.overshoot.writes, r.overshoot.settled_size] end)}
 
     ### Pass duration (specs/04 budget, #{@pass_budget_ms} ms)
 
-    #{section(rows, ["subject", "passes", "p50 us", "p99 us", "max us"], fn r -> [r.subject, r.pass.count, r.pass.p50_us, r.pass.p99_us, r.pass.max_us] end)}
+    #{section(mixed(rows), ["subject", "passes", "p50 us", "p99 us", "max us"], fn r -> [r.subject, r.pass.count, r.pass.p50_us, r.pass.p99_us, r.pass.max_us] end)}
 
     ### Write backpressure (reported, no threshold)
 
-    #{section(rows, ["subject", "reads", "writes", "call-path writes", "fraction"], fn r -> [r.subject, r.backpressure.reads, r.backpressure.writes, r.backpressure.call_writes, r.backpressure.fraction] end)}
+    #{section(mixed(rows), ["subject", "reads", "writes", "call-path writes", "fraction"], fn r -> [r.subject, r.backpressure.reads, r.backpressure.writes, r.backpressure.call_writes, r.backpressure.fraction] end)}
 
     ### Per-event write cost (reported, no threshold; one writer, mean of #{@event_runs} runs)
 
-    #{write_cost_section(rows)}
+    #{write_cost_section(mixed(rows))}
+
+    ### Throughput by partitions (reported, no threshold; one writer per scheduler, mean of #{@event_runs} runs)
+
+    #{throughput_section(mixed(rows))}
 
     #{Report.thresholds_markdown(thresholds, "none evaluated (#{@none})")}
 
@@ -308,6 +424,22 @@ defmodule Theine.Bench.Maintenance do
       end
     )
   end
+
+  defp throughput_section([]), do: @none
+
+  defp throughput_section(rows) do
+    Report.table(
+      ["subject", "partitions", "scenario", "writers", "max_size", "writes", "puts/s"] ++
+        ["us per put", "x partitions 1"],
+      for r <- rows, t <- r.throughput do
+        [r.subject, t.partitions, t.scenario, t.writers, t.max_size, t.writes, t.puts_per_s] ++
+          [t.us_per_event, t.vs_one_partition]
+      end
+    )
+  end
+
+  # The rows with a mixed run: the partitioned row has only the overshoot.
+  defp mixed(rows), do: Enum.reject(rows, &is_nil(&1.pass))
 
   defp section([], _header, _cells), do: @none
   defp section(rows, header, cells), do: Report.table(header, Enum.map(rows, cells))

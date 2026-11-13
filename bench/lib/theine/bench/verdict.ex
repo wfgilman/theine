@@ -1,7 +1,9 @@
 defmodule Theine.Bench.Verdict do
   @moduledoc """
   The checks of `mix bench get` and their verdicts (specs/09 §`mix bench
-  get`, §Reference machine).
+  get`, §Reference machine): A1 and A2 on the default cache, the put burst,
+  and the partitioned hit's p50 against the default cache's (specs/12
+  §Settled questions 5).
 
   Every check has a strict verdict, `passed`, against its threshold. With
   `--dev-floor` it also gets one of `"pass"`, `"floor"` (misses the
@@ -23,10 +25,13 @@ defmodule Theine.Bench.Verdict do
     ips_ets: {"A2", :>=, 0.65, 0.52},
     ips_cachex: {"A2", :>=, 2.0, 1.7},
     ips_nebulex: {"A2", :>=, 2.0, nil},
-    put_burst: {"put", :<=, 10, nil}
+    put_burst: {"put", :<=, 10, nil},
+    # specs/12 §Settled questions 5: the partitioned hit against the
+    # default cache's, both measured on the development machine.
+    partitioned_p50: {"P4", :<=, 1.10, nil}
   }
 
-  @type kind :: :latency | :ips_ets | :ips_cachex | :ips_nebulex | :put_burst
+  @type kind :: :latency | :ips_ets | :ips_cachex | :ips_nebulex | :put_burst | :partitioned_p50
   @type op :: :<= | :>=
   @type check :: %{
           id: String.t(),

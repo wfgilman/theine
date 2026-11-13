@@ -7,8 +7,10 @@ IMPLEMENTATION_PLAN.md §M8 and being built. Built so far: ids and routing
 `sizes` fields and restart (M8.2), the calls that span partitions (M8.3),
 and bounded partitions: the read buffer split by partition, the
 partitioned `hit` shape, capacity shares, a sketch per share and the
-minimum share (M8.4). `partitions` is a `start_link` option. The bench
-subjects (M8.5) and the docs (M8.6) remain.
+minimum share (M8.4). `partitions` is a `start_link` option. `mix bench
+get` has `theine_p4` and `mix bench maintenance` has the partitioned
+overshoot run and the throughput rows (M8.5a). The `mix bench hitrate`
+subject (M8.5b) and the docs (M8.6) remain.
 It is the follow-on to milestone M7: M7 lowers the cost of a write event
 inside one maintenance process, and this note lets one cache run several
 of them. It says how a cache splits its policy across `partitions`
@@ -316,7 +318,8 @@ evenly, not weight.
   only.
 - **Hot path.** `mix bench get` gains a `theine_p4` subject. Its hit is
   measured as `theine`'s is, and its p50 is at most 1.10 × `theine`'s on
-  every shape (settled question 5). tracing_test pins the partitioned
+  every shape whose share is at least the minimum, `n` 100_000 and
+  1_000_000 (settled question 5; §Decisions M8.5a). tracing_test pins the partitioned
   hit's multiset, which is the same as `theine`'s.
 
 ## Build order
@@ -437,3 +440,15 @@ except where noted.
   the key (`Theine.Partition.oversized?/4`). The minimum share is
   `Theine.Config.min_share/0`, and the error names the least `max_size`
   for the given `n`.
+- 2026-11-13 (M8.5a): `mix bench get`'s `theine_p4` and `mix bench
+  maintenance`'s partitioned overshoot and throughput rows built
+  (specs/09 §Decisions M8.5a). §Acceptance's "every shape" for the hot
+  path is read as every shape whose share is at least the minimum, as the
+  hit-rate row already says, so `n = 1_000` has no `theine_p4` row. The
+  bound and the throughput rows meet §Acceptance on the development
+  machine. The hot-path row does not at `parallel: 1`. The partitioned
+  hit costs what the default hit costs with maintenance paused, but each
+  partition rate limits its own drain passes, so `n` partitions under one
+  reader run about `n` times the passes, and the bench counts them in the
+  reader's latency (open question 5 in IMPLEMENTATION_PLAN.md). M8.5 was
+  split: the `mix bench hitrate` subject is M8.5b.

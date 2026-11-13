@@ -19,7 +19,8 @@ defmodule Theine.BenchVerdictTest do
     "A2 ips / `ets`" => :ips_ets,
     "A2 ips / `cachex`" => :ips_cachex,
     "A2 ips / `nebulex`" => :ips_nebulex,
-    "put burst cost / `ets` insert" => :put_burst
+    "put burst cost / `ets` insert" => :put_burst,
+    "`theine_p4` p50 / `theine` p50" => :partitioned_p50
   }
 
   defp spec_table do
@@ -110,8 +111,10 @@ defmodule Theine.BenchVerdictTest do
   end
 
   describe "a check with no band" do
-    test "the nebulex ratio and the put burst fail on any miss, even with the flag" do
-      for {kind, pass, miss} <- [{:ips_nebulex, 2.0, 1.99}, {:put_burst, 10, 10.01}] do
+    test "the nebulex ratio, the put burst and the partitioned hit fail on any miss, even with the flag" do
+      cases = [{:ips_nebulex, 2.0, 1.99}, {:put_burst, 10, 10.01}, {:partitioned_p50, 1.1, 1.11}]
+
+      for {kind, pass, miss} <- cases do
         for flag <- [true, false] do
           assert %{passed: true, verdict: "pass", band: nil} = verdict(kind, pass, flag)
           assert %{passed: false, verdict: "fail", band: nil} = verdict(kind, miss, flag)
@@ -120,6 +123,9 @@ defmodule Theine.BenchVerdictTest do
 
       assert %{id: "put", limit: "<= 10"} = verdict(:put_burst, 6.0, true)
       assert %{id: "A2", limit: ">= 2.0"} = verdict(:ips_nebulex, 5.0, true)
+
+      assert %{id: "P4", kind: "partitioned_p50", limit: "<= 1.1"} =
+               verdict(:partitioned_p50, 1.0, true)
     end
   end
 

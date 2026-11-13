@@ -146,8 +146,16 @@ test/                         mirrors lib/; test/support for shared helpers
   If a pass-budget miss comes with mixed-run reads well under 12 M, the
   machine was slow.
 - `mix bench maintenance` takes about 2.5 min at the default 1 M entries
-  (two 30 s runs plus 1 M puts, then six 5 s per-event runs); `--max-size 10000 --duration 1` smokes it
-  in seconds and shows the same overshoot structure. To attribute an
+  (two 30 s runs plus 1 M puts, then six 5 s per-event runs), plus about
+  2.5 min for the M8.5a throughput runs and the `partitions: 4` overshoot
+  run; `--max-size 40000 --duration 1` smokes it
+  in seconds and shows the same overshoot structure (below 40000 the
+  partitioned run is skipped: minimum share).
+- A partitioned cache's hit costs the same as the default one with
+  maintenance paused, but under one reader its `n` processes each drain at
+  the rate one process may, so the bench sees their passes as hit latency.
+  `bench/results/p4-m85.exs` (gitignored) prints ns/get, passes, duty and
+  pass schedulers for `theine` and `theine_p4`, running and paused. To attribute an
   overshoot, `bench/results/overshoot-m211.exs` (gitignored) samples the
   table size, the policy's `sizes` atomics and `pending` together: table =
   policy + pending + in flight tells which side the excess is on.

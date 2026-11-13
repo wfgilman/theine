@@ -30,6 +30,7 @@ exits non-zero only when a check falls outside the band:
 | A2 ips / `cachex` | ≥ 2 | ≥ 1.7 |
 | A2 ips / `nebulex` | ≥ 2 | none (≥ 2) |
 | put burst cost / `ets` insert | ≤ 10 | none (≤ 10) |
+| `theine_p4` p50 / `theine` p50 | ≤ 1.10 | none (≤ 1.10) |
 
 The band applies to every theine subject. It changes only the exit status.
 The strict verdict of every check is still reported, and the hot-path
@@ -37,6 +38,13 @@ regression rule below is read from the strict verdicts. The band is not a
 threshold. The loop may not widen it, just as it may not relax a threshold.
 The final gate records both runs, each with its CPU model, OS, OTP version
 and `schedulers_online`.
+
+The reference machine also judges partitioned throughput (specs/12
+§Settled questions 4). In `mix bench maintenance`'s throughput rows, one
+writer per scheduler, `partitions: 4` must reach at least 2 ×
+`partitions: 1`'s puts/s in both scenarios. A person reads the `x
+partitions 1` column of the reference run, as for A1/A2. On the
+development machine the rows are reported only.
 
 Every bench writes a JSON result to
 `bench/results/<name>-<git-sha>.json` plus a markdown summary to stdout.
@@ -61,6 +69,7 @@ cache:
 | `theine` | `Theine.get/2`, `max_size: n` (bounded, policy on) |
 | `theine_unbounded` | `Theine.get/2`, `max_size: :infinity` |
 | `theine_nostats` | bounded, `stats: false` |
+| `theine_p4` | bounded, `partitions: 4` (specs/12); only where `div(n, 4)` is at least the minimum share, so not at `n = 1_000` |
 | `cachex` | `Cachex.get/2`, limit `n`, default policy |
 | `nebulex` | `Nebulex.Adapters.Local` `get/2`, `max_size: n` |
 
@@ -77,6 +86,9 @@ ips, and the ratio to `ets`.
 - `theine` ips ≥ 0.65 × `ets` ips at full parallelism. (A2)
 - `theine` ips ≥ 2 × `cachex` ips and ≥ 2 × `nebulex` ips at full
   parallelism. (A2)
+- `theine_p4` p50 ≤ 1.10 × `theine` p50, on every shape it runs, both
+  parallelisms (id `P4`; specs/12 §Settled questions 5). A1 and A2 stay on
+  the default cache.
 
 A hot-path task fails its gate if any threshold that previously passed now
 fails.
@@ -171,6 +183,15 @@ with `schedulers_online` writer processes and reports:
   overwrites of uniformly random existing keys, (b) distinct new keys, each
   evicting one entry. Puts/s and µs per event, the mean of 3 runs on a fresh
   cache each. Reported, no threshold.
+- **Overshoot with partitions** (specs/12 §A5 with partitions): the
+  overshoot run again on a cache with `partitions: 4`. Threshold: every
+  sample ≤ `max_size + 4 * write_hwm + schedulers_online`; 1 s (the
+  default `maintenance_interval`) after writers stop, size ≤ `max_size`.
+- **Throughput by partitions**: the per-event scenarios with
+  `schedulers_online` writers, at `partitions` 1, 2 and 4, each the mean
+  of 3 runs, with puts/s and its ratio to `partitions: 1`. Reported on the
+  development machine; the reference machine's 2× at `partitions: 4` is
+  judged by a person (§Reference machine).
 
 ## Running in the loop
 
@@ -539,3 +560,47 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   these runs to `--duration`, so the smoke run stays short; the cache size
   does not follow `--max-size`, since the cost per event depends on the
   size of the policy tables.
+- 2026-11-13 (M8.5a): the partitioned subjects of `mix bench get` and
+  `mix bench maintenance`, with the thresholds specs/12 §Settled
+  questions 2, 4 and 5 fixed. Those were human decisions, so writing them
+  here relaxes nothing. The `P4` check (`theine_p4` p50 ≤ 1.10 ×
+  `theine`'s) is in `Theine.Bench.Verdict` with no development band, and
+  the overshoot bound with partitions is `max_size + 4 * write_hwm +
+  schedulers_online`. The 2× throughput at `partitions: 4` is the
+  reference machine's and read by a person (§Reference machine). Three
+  details the spec text left open:
+  - `theine_p4` runs only where `div(n, 4)` is at least the minimum share
+    (specs/12 §Settled questions 1), which excludes `n = 1_000`: no such
+    cache can start. specs/12 §Acceptance says "every shape", and its
+    hit-rate row already limits itself to rows whose share qualifies; the
+    same reading is taken here. The subject is measured right after
+    `theine`, so the two rows of the ratio are close in time, and only in
+    the `get` scenario.
+  - It is bounded at `max_size: n` like `theine`. The keys hash unevenly
+    over the four shares, so the population leaves each share overfull or
+    short by about a standard deviation of the hash, and the overfull
+    ones evict: 195 of 100_000 keys measured. Reads of those keys miss.
+    The subject keeps `theine`'s configuration rather than a larger
+    `max_size` that would hide the shares.
+  - The throughput rows reuse the per-event scenarios (M7.1) with
+    `schedulers_online` writers. With several writers `us_per_event` is
+    elapsed time over puts, not one process's cost. The one-writer rows
+    of M7.1 are unchanged; at one writer the key streams are the same as
+    before.
+
+  The first runs of the development machine (IMPLEMENTATION_PLAN.md
+  §Benchmark log M8.5a): `mix bench maintenance` exits 0 at 6/6, with
+  the partitioned overshoot at most 1_003_999 against 1_004_100 and
+  `partitions: 4` at 2.24× (overwrite) and 2.11× (new) the puts/s of
+  `partitions: 1` with four writers. `mix bench get` fails `P4` at
+  `parallel: 1`. The partitioned hit itself costs what `theine`'s does.
+  With maintenance paused a compiled probe measured 353.7 ns against
+  355.0. The excess is the maintenance processes. Each partition rate
+  limits its own drain passes (specs/04 §Decisions M2.8c), and a pass
+  waits at least a millisecond timer, so four partitions under one reader
+  run about five times the passes of one process (2_110 against 375 over
+  2 M hits, duty 37.6% against 7.3%). Many of those passes run on the
+  reader's scheduler or on its SMT sibling. Under a reader on every
+  scheduler both caches saturate and the ratio is about 1.0. The
+  threshold stands. Whether the drain rate should be shared across the
+  partitions is open question 5 in IMPLEMENTATION_PLAN.md.

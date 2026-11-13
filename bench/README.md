@@ -85,7 +85,7 @@ Each `results` row:
 | field | type | meaning |
 |---|---|---|
 | `scenario` | string | `"get"`, `"put_burst"` or `"put"` |
-| `subject` | string | `ets`, `theine`, `theine_unbounded`, `theine_nostats`, `cachex`, `nebulex` |
+| `subject` | string | `ets`, `theine`, `theine_p4`, `theine_unbounded`, `theine_nostats`, `cachex`, `nebulex` |
 | `n` | integer | entries pre-populated |
 | `value` | string | `"tuple3"` or `"binary_1kb"` |
 | `parallel` | integer | concurrent Benchee processes (always 1 for `put_burst`) |
@@ -95,10 +95,17 @@ Each `results` row:
 | `sample_size` | integer | samples behind the statistics (Benchee caps at 1M per process); for `put_burst`, the timed bursts |
 | `ratio_to_ets` | object | `p50`, `p99`, `average`, `ips` divided by the `ets` row of the same scenario and shape |
 | `ratio_to_cachex` | object | `put` rows only: `ips` divided by the `cachex` row of the same shape |
+| `ratio_to_theine` | object | `theine_p4` `get` rows only: `p50`, `p99`, `ips` divided by the `theine` row of the same shape and `parallel` |
 
 Subjects: `ets` is the floor; `theine` is bounded at `max_size: n` with
 the policy on (every hit records into the read buffer, which the
-maintenance process drains while the readers run); `theine_unbounded` is
+maintenance process drains while the readers run); `theine_p4` is
+`theine` with `partitions: 4` (specs/12), run right after `theine` and
+`get` only. It needs `div(n, 4)` of at least the minimum share (10 000),
+so it skips `n = 1_000` with a `skipped:` line on stderr. Its keys hash
+unevenly over the four shares, so a share overfull after the population
+evicts its excess, about 0.2% of the keys (each theine subject prints a
+`resident:` line on stderr), and reads of those keys miss. `theine_unbounded` is
 `max_size: :infinity`; `theine_nostats` is bounded with `stats: false` and
 is reported for information only. `cachex` is Cachex 4 bounded by the
 `Cachex.Limit.Scheduled` hook at `n` with default options (least recently
@@ -142,6 +149,10 @@ Thresholds (specs/09). The `get` ones are evaluated for `theine` and
   `ips / nebulex ips >= 2` at full parallelism.
 - put (id `"put"`): `theine` `put_burst` `average_ns` / `ets` `put_burst`
   `average_ns` `<= 10`, every shape.
+- P4 (id `"P4"`, specs/12 §Settled questions 5): `theine_p4` `p50_ns` /
+  `theine` `p50_ns` `<= 1.10`, every shape `theine_p4` runs, both
+  parallelisms. A1 and A2 are not evaluated for `theine_p4`. The summary
+  has a table of the `theine_p4` rows against `theine`.
 
 The thresholds and the development band live in one place,
 `Theine.Bench.Verdict` (`bench/lib/theine/bench/verdict.ex`), and
@@ -176,6 +187,7 @@ status is the strict one.
 | A2 ips / `cachex` | `>= 2` | `>= 1.7` |
 | A2 ips / `nebulex` | `>= 2` | none |
 | put burst / `ets` insert | `<= 10` | none |
+| `theine_p4` p50 / `theine` p50 | `<= 1.10` | none |
 
 The band applies to `theine` and `theine_unbounded`. It changes only the
 exit status, and it is not a threshold: the build loop may not widen it.
@@ -207,7 +219,7 @@ like the Caffeine simulator cross-check, and it runs **without**
    binding (`+sbt db`); `+sbwt very_long` still applies, and leaving the
    flags out only adds a warning. The result's `scheduler_bind_type` shows
    what the VM did.
-4. The exit status is the gate: 0 means every A1, A2 and put threshold
+4. The exit status is the gate: 0 means every A1, A2, put and P4 threshold
    passed. If any fails, that is a new open question for a human in
    IMPLEMENTATION_PLAN.md, not a reason to rerun until it passes or to
    widen the band (specs/09 §Decisions 2026-11-02).
@@ -216,6 +228,13 @@ like the Caffeine simulator cross-check, and it runs **without**
    that subsection's "human gate pending" cell. Keep
    `bench/results/get-<sha>.json`, whose `system` object records the CPU
    model, OS, OTP release and `schedulers_online`.
+6. Partitioned throughput (specs/12 §Settled questions 4): on the same
+   machine, run `mix bench maintenance` the same way (about 7 minutes).
+   Its exit status covers A5 and the pass budget. The partitions gate is
+   read by hand: in the "Throughput by partitions" table both
+   `partitions: 4` rows must show `x partitions 1` of at least 2. Paste
+   the table under IMPLEMENTATION_PLAN.md §Final gate §Reference machine
+   run (partitioned throughput).
 
 ## `hitrate` (A3)
 
@@ -442,8 +461,11 @@ Three differences are known and are what to look at first when a row misses:
 
 ```bash
 ERL_FLAGS="+sbt db +sbwt very_long" mix bench maintenance
-mix bench maintenance --max-size 10000 --duration 1   # quick smoke run, not a gate
+mix bench maintenance --max-size 40000 --duration 1   # quick smoke run, not a gate
 ```
+
+Below `--max-size 40000` the `partitions: 4` overshoot run is skipped,
+since such a cache cannot start (the minimum share, specs/12).
 
 Not Benchee. The drivers are in `Theine.Bench.Load` (`bench/lib`) and know
 nothing about theine. A subject is a map of callbacks (`start`, `put`, `get`,
@@ -478,6 +500,23 @@ every event sent. One writer outruns the maintenance process and blocks on
 backpressure, so `us_per_event` (elapsed µs over puts) is what one write
 event costs the maintenance process. Both figures are the mean of the runs.
 
+Then the throughput by partitions, reported with no threshold on the
+development machine (specs/12 §Acceptance, Throughput; specs/09
+§Reference machine): the same two scenarios on the same 100 000-entry
+cache, with `partitions` 1, 2 and 4 and `schedulers_online` writers.
+Writer `i` of `w` seeds its overwrite keys with `seed + 1_000 * (i - 1)`,
+and its new keys are `100_000 + i`, `100_000 + i + w`, .... Each is the
+mean of 3 runs, and `x partitions 1` is its puts/s over the same
+scenario's at `partitions: 1`. With several writers `us_per_event` is the
+elapsed time over the puts, the inverse of the throughput. The reference
+machine's gate is `x partitions 1 >= 2` at `partitions: 4`, read by a
+person.
+
+Last, the overshoot write run again on a fresh cache with `partitions: 4`
+(row `theine_p4`), with the bound `max_size + 4 * write_hwm +
+schedulers_online` (specs/12 §A5 with partitions). It has no mixed run
+and no per-event rows.
+
 `--max-size` defaults to 1 000 000. The one subject is `theine`: a real
 cache started with `max_size`, `write_hwm` and otherwise the specs/08
 defaults, whose `size` is the entries table's count and whose
@@ -488,26 +527,31 @@ M2.11), read before and after the mixed run. Its `sync` is
 
 Extra `system` fields: `max_size`, `duration_s`, `sample_ms`, `settle_ms`,
 `write_hwm`, `pass_budget_ms`, `read_fraction`, `ttl_ms`, `zipf_s`,
-`key_space`, `event_max_size`, `event_duration_s`, `event_runs`, `subjects`
+`key_space`, `event_max_size`, `event_duration_s`, `event_runs`,
+`overshoot_partitions` (4), `throughput_partitions` (list), `subjects`
 (names), `missing_erl_flags` (list).
 
-Each `results` row is one subject:
+Each `results` row is one subject, then its `partitions: 4` overshoot row:
 
 | field | type | meaning |
 |---|---|---|
-| `subject` | string | `theine` |
+| `subject` | string | `theine` or `theine_p4` |
+| `partitions` | integer | 1, or 4 for `theine_p4` |
 | `max_size` | integer | cache bound |
-| `overshoot.limit` | integer | `max_size + write_hwm + schedulers_online` |
+| `overshoot.limit` | integer | `max_size + partitions * write_hwm + schedulers_online` |
 | `overshoot.max_sample` | integer | largest sampled table size during the write run |
 | `overshoot.samples` | integer | number of samples taken |
 | `overshoot.writes` | integer | puts completed in the write run |
 | `overshoot.settled_size` | integer | table size 1 s after the writers stopped |
+| `pass` | object or null | the mixed run's passes; null for `theine_p4` |
 | `pass.count` | integer | pass events in the mixed run |
 | `pass.p50_us`, `pass.p99_us`, `pass.max_us` | number or null | pass `duration`, µs, nearest rank; null with no passes |
+| `backpressure` | object or null | null for `theine_p4` |
 | `backpressure.reads`, `backpressure.writes` | integer | operations in the mixed run |
 | `backpressure.call_writes` | integer or null | writes that took the call path (specs/03), null when the subject cannot tell |
 | `backpressure.fraction` | number or null | `call_writes / writes` |
-| `write_cost` | array | one object per per-event scenario, below |
+| `write_cost` | array | one object per per-event scenario, below; empty for `theine_p4` |
+| `throughput` | array | one object per partition count and scenario, below; empty for `theine_p4` |
 
 Each `write_cost` entry:
 
@@ -520,16 +564,27 @@ Each `write_cost` entry:
 | `us_per_event` | number or null | elapsed µs over puts, mean of the runs; null if a run made no puts |
 | `runs` | array | each run's `writes`, `elapsed_us`, `puts_per_s`, `us_per_event` |
 
+Each `throughput` entry has the `write_cost` fields, plus:
+
+| field | type | meaning |
+|---|---|---|
+| `partitions` | integer | 1, 2 or 4 |
+| `writers` | integer | `schedulers_online` |
+| `vs_one_partition` | number | `puts_per_s` over the same scenario's at `partitions: 1` |
+
 Thresholds (specs/09):
 
 - A5 `max sampled size <= max_size + write_hwm + schedulers`: actual
-  `max_sample`, limit `overshoot.limit`.
+  `max_sample`, limit `overshoot.limit`. For `theine_p4` the check reads
+  `max_size + 4 * write_hwm + schedulers`, and the settled-size check
+  below applies to it too.
 - A5 `size 1000 ms after writers stop`: actual `settled_size`, limit
   `<= max_size`.
 - budget `pass p99 (us)`: `<= 5000`; budget `pass max (us)`: `<= 20000`.
   A run with no pass events fails `maintenance pass events observed`
   (actual `0`, limit `>= 1`) rather than passing vacuously.
-- Backpressure and the per-event write cost are reported only.
+- Backpressure, the per-event write cost and the throughput by partitions
+  are reported only.
 
 ## Traces (`mix bench.traces`)
 

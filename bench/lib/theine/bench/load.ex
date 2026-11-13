@@ -170,16 +170,21 @@ defmodule Theine.Bench.Load do
 
   @doc """
   The per-event write cost run: keys `1..fill` are put and `subject.sync`
-  drains them, then one writer puts for `duration_ms`, with `keys` either
-  `:overwrite` (uniformly random keys of `1..fill`, seeded with `seed`) or
-  `:new` (`fill + 1`, `fill + 2`, ...: distinct keys, each evicting one
-  entry from a cache bounded at `fill`). After the writer stops,
-  `subject.sync` waits until every event has been consumed.
+  drains them, then `writers` processes (default 1) put for `duration_ms`,
+  with `keys` either `:overwrite` (uniformly random keys of `1..fill`,
+  seeded with `seed` for the first writer and `seed + 1_000 * (i - 1)` for
+  writer `i`) or `:new` (writer `i` of `w` puts `fill + i`, `fill + i + w`,
+  ...: distinct keys, each evicting one entry from a cache bounded at
+  `fill`). After the writers stop, `subject.sync` waits until every event
+  has been consumed.
 
-  The clock runs from the writer's start to the end of that sync, so the
-  time covers every event the writer sent. With one writer the maintenance
-  process is the bottleneck (a writer that gets ahead blocks on
-  backpressure), so `us_per_event` is what one write event costs it.
+  The clock runs from the writers' start to the end of that sync, so the
+  time covers every event they sent, and `writes` is the sum over the
+  writers. With one writer the maintenance process is the bottleneck (a
+  writer that gets ahead blocks on backpressure), so `us_per_event` is what
+  one write event costs it. With several writers and several maintenance
+  processes (specs/12) it is the elapsed time over the puts, the inverse of
+  the throughput, not one process's cost.
   """
   @spec event_run(map(), term(), keyword()) :: %{
           writes: non_neg_integer(),
@@ -189,22 +194,26 @@ defmodule Theine.Bench.Load do
         }
   def event_run(subject, state, opts) do
     fill = Keyword.fetch!(opts, :fill)
+    writers = Keyword.get(opts, :writers, 1)
+    seed = Keyword.fetch!(opts, :seed)
 
     Enum.each(1..fill//1, &subject.put.(state, &1, &1, nil))
     subject.sync.(state)
 
     keys =
-      case Keyword.fetch!(opts, :keys) do
-        :overwrite -> {:overwrite, fill, :rand.seed_s(:exsss, Keyword.fetch!(opts, :seed))}
-        :new -> {:new, fill + 1}
+      for i <- 1..writers do
+        case Keyword.fetch!(opts, :keys) do
+          :overwrite -> {:overwrite, fill, :rand.seed_s(:exsss, seed + 1_000 * (i - 1))}
+          :new -> {:new, fill + i, writers}
+        end
       end
 
     stop = new_stop()
     started = System.monotonic_time()
-    pid = spawn_link(fn -> event_loop(subject, state, stop, keys, 0) end)
+    pids = for k <- keys, do: spawn_link(fn -> event_loop(subject, state, stop, k, 0) end)
     Process.sleep(Keyword.fetch!(opts, :duration_ms))
     stop(stop)
-    [writes] = collect([pid], :writes)
+    writes = pids |> collect(:writes) |> Enum.sum()
     subject.sync.(state)
 
     elapsed_us =
@@ -233,7 +242,7 @@ defmodule Theine.Bench.Load do
     {key, {:overwrite, fill, rand}}
   end
 
-  defp next_key({:new, key}), do: {key, {:new, key + 1}}
+  defp next_key({:new, key, step}), do: {key, {:new, key + step, step}}
 
   defp delta(nil, _before), do: nil
   defp delta(_after, nil), do: nil

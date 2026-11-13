@@ -1,6 +1,7 @@
 # mix bench get — read latency and throughput against raw ETS (specs/09, A1/A2),
 # plus the put scenarios against an ETS insert: sustained puts (reported) and
-# bursts of 1_000 puts (the threshold).
+# bursts of 1_000 puts (the threshold), and the partitioned hit (`theine_p4`)
+# against the default cache's (specs/12).
 #
 #   ERL_FLAGS="+sbt db +sbwt very_long" mix bench get
 #   mix bench get --sizes 1000 --warmup 0.5 --time 1 --bursts 100  # quick smoke run
@@ -31,6 +32,12 @@ defmodule Theine.Bench.Get do
   # `cachex`/`nebulex` the A2 comparison (specs/09 §mix bench get).
   # `theine_nostats` is reported for information only.
   @theine_subjects ["theine", "theine_unbounded"]
+  # The partitioned cache (specs/12): `theine` with `partitions: 4`. A1/A2
+  # stay on the default cache; its p50 is checked against `theine`'s on
+  # every shape whose share is at least the minimum (specs/09 §Decisions
+  # M8.5a). Measured right after `theine`, so the pair is close in time.
+  @partitioned "theine_p4"
+  @partitions 4
   # Each with its check kind: only `cachex` has a development band.
   @rivals [{"cachex", :ips_cachex}, {"nebulex", :ips_nebulex}]
   # The sustained put scenario's subjects (specs/09: theine vs ets insert vs
@@ -149,48 +156,60 @@ defmodule Theine.Bench.Get do
           parallel <- if(scenario == "put_burst", do: [1], else: parallels),
           do: {scenario, parallel}
 
-    if runs == [] do
-      []
-    else
-      state = subject.setup.(shape.n, value_fun)
+    available? = Map.get(subject, :available?, fn _n -> true end)
 
-      try do
-        for {scenario, parallel} <- runs do
-          IO.puts(
-            :stderr,
-            "#{scenario}: n=#{shape.n} value=#{shape.value} #{subject.name} parallel=#{parallel}"
-          )
+    cond do
+      runs == [] ->
+        []
 
-          case scenario do
-            "get" ->
-              measure(
-                scenario,
-                subject.name,
-                subject.get.(state),
-                inputs.keys,
-                shape,
-                parallel,
-                timing
-              )
+      not available?.(shape.n) ->
+        IO.puts(:stderr, "skipped: n=#{shape.n} #{subject.name} (#{subject.unavailable})")
+        []
 
-            "put" ->
-              measure(
-                scenario,
-                subject.name,
-                subject.put.(state),
-                inputs.pairs,
-                shape,
-                parallel,
-                timing
-              )
+      true ->
+        run_subject_scenarios(subject, shape, value_fun, inputs, runs, timing)
+    end
+  end
 
-            "put_burst" ->
-              measure_bursts(subject.name, subject.burst.(state), inputs.pairs, shape, timing)
-          end
+  defp run_subject_scenarios(subject, shape, value_fun, inputs, runs, timing) do
+    state = subject.setup.(shape.n, value_fun)
+
+    try do
+      for {scenario, parallel} <- runs do
+        IO.puts(
+          :stderr,
+          "#{scenario}: n=#{shape.n} value=#{shape.value} #{subject.name} parallel=#{parallel}"
+        )
+
+        case scenario do
+          "get" ->
+            measure(
+              scenario,
+              subject.name,
+              subject.get.(state),
+              inputs.keys,
+              shape,
+              parallel,
+              timing
+            )
+
+          "put" ->
+            measure(
+              scenario,
+              subject.name,
+              subject.put.(state),
+              inputs.pairs,
+              shape,
+              parallel,
+              timing
+            )
+
+          "put_burst" ->
+            measure_bursts(subject.name, subject.burst.(state), inputs.pairs, shape, timing)
         end
-      after
-        subject.teardown.(state)
       end
+    after
+      subject.teardown.(state)
     end
   end
 
@@ -341,6 +360,19 @@ defmodule Theine.Bench.Get do
       # records into the read buffer and the maintenance process drains
       # it concurrently with the readers.
       theine_subject("theine", :theine_bench_bounded, fn n -> [max_size: n] end),
+      # `theine` split into @partitions partitions (specs/12), each bounded
+      # at its share of `n`. It needs a share of at least the minimum
+      # (specs/12 §Settled questions 1), so it skips n=1_000. The keys hash
+      # unevenly over the partitions, so a partition whose share is
+      # overfull after the population evicts its excess: 195 keys of 100_000
+      # in M8.5a (the `resident` line on stderr), whose reads miss.
+      theine_subject(
+        @partitioned,
+        :theine_bench_partitioned,
+        fn n -> [max_size: n, partitions: @partitions] end,
+        fn n -> div(n, @partitions) >= Theine.Config.min_share() end,
+        "partitions: #{@partitions} needs max_size >= #{@partitions * Theine.Config.min_share()}"
+      ),
       theine_subject("theine_unbounded", :theine_bench_unbounded, fn _n ->
         [max_size: :infinity]
       end),
@@ -396,13 +428,16 @@ defmodule Theine.Bench.Get do
     ]
   end
 
-  defp theine_subject(subject, name, opts) do
+  defp theine_subject(subject, name, opts, available? \\ fn _n -> true end, unavailable \\ nil) do
     %{
       name: subject,
+      available?: available?,
+      unavailable: unavailable,
       setup: fn n, value_fun ->
         {:ok, sup} = Theine.start_link([name: name] ++ opts.(n))
         populate(n, fn chunk -> Enum.each(chunk, &Theine.put(name, &1, value_fun.(&1))) end)
         wait_for_maintenance(name)
+        IO.puts(:stderr, "resident: n=#{n} #{subject} #{Theine.size(name)}")
         {name, sup}
       end,
       get: fn {name, _sup} -> fn key -> Theine.get(name, key) end end,
@@ -419,18 +454,17 @@ defmodule Theine.Bench.Get do
     1..n |> Stream.chunk_every(10_000) |> Enum.each(insert_chunk)
   end
 
-  # Every write event must be consumed before measuring, so the maintenance
-  # process is idle and size/1 reflects the population.
+  # Every write event must be consumed before measuring, so every
+  # maintenance process is idle and size/1 reflects the population.
   defp wait_for_maintenance(name) do
     :ok = Theine.run_maintenance(name)
+    partitions = Theine.Config.get(name).partitions
 
-    case Theine.Maintenance.info(name) do
-      %{pending: 0} ->
-        :ok
-
-      %{pending: _} ->
-        Process.sleep(10)
-        wait_for_maintenance(name)
+    if Enum.all?(0..(partitions - 1), &match?(%{pending: 0}, Theine.Maintenance.info(name, &1))) do
+      :ok
+    else
+      Process.sleep(10)
+      wait_for_maintenance(name)
     end
   end
 
@@ -445,6 +479,11 @@ defmodule Theine.Bench.Get do
           into: %{},
           do: {{r.n, r.value, r.parallel}, r}
 
+    theine_gets =
+      for %{scenario: "get", subject: "theine"} = r <- rows,
+          into: %{},
+          do: {{r.n, r.value, r.parallel}, r}
+
     Enum.map(rows, fn r ->
       ets = Map.fetch!(floors, {r.scenario, r.n, r.value, r.parallel})
 
@@ -456,8 +495,20 @@ defmodule Theine.Bench.Get do
         ips: r.ips / ets.ips
       })
       |> put_cachex_ratio(Map.get(cachex_puts, {r.n, r.value, r.parallel}))
+      |> put_theine_ratio(Map.get(theine_gets, {r.n, r.value, r.parallel}))
     end)
   end
+
+  # The partitioned subject's get rows against `theine`'s (specs/12).
+  defp put_theine_ratio(%{scenario: "get", subject: @partitioned} = r, %{} = theine) do
+    Map.put(r, :ratio_to_theine, %{
+      p50: r.p50_ns / theine.p50_ns,
+      p99: r.p99_ns / theine.p99_ns,
+      ips: r.ips / theine.ips
+    })
+  end
+
+  defp put_theine_ratio(r, _theine), do: r
 
   # Sustained put rows are reported against `cachex` too (specs/09).
   defp put_cachex_ratio(%{scenario: "put"} = r, %{ips: ips}),
@@ -488,7 +539,19 @@ defmodule Theine.Bench.Get do
         )
       end
 
-    get_checks ++ put_checks
+    # The partitioned hit (specs/12 §Settled questions 5): p50 at most 1.10
+    # × `theine`'s, every shape and parallelism both subjects ran.
+    partitioned_checks =
+      for %{scenario: "get", subject: @partitioned, ratio_to_theine: ratio} = r <- rows do
+        Verdict.check(
+          :partitioned_p50,
+          "#{@partitioned} p50 / theine p50, n=#{r.n} #{r.value} parallel=#{r.parallel}",
+          ratio.p50,
+          dev_floor
+        )
+      end
+
+    get_checks ++ put_checks ++ partitioned_checks
   end
 
   defp checks(r, by_key, full, dev_floor) do
@@ -534,6 +597,7 @@ defmodule Theine.Bench.Get do
     tables =
       [
         summary_table("get", rows, &get_table/1),
+        partitioned_table(rows),
         summary_table("put_burst", rows, &burst_table/1),
         summary_table("put", rows, &put_table/1)
       ]
@@ -612,6 +676,28 @@ defmodule Theine.Bench.Get do
           [r.ratio_to_ets.p50, r.ratio_to_ets.p99, r.ratio_to_ets.ips]
       end)
     )
+  end
+
+  # The partitioned subject's get rows beside `theine`'s; the threshold is
+  # on `p50/theine`.
+  defp partitioned_table(rows) do
+    case for(%{ratio_to_theine: _} = r <- rows, do: r) do
+      [] ->
+        nil
+
+      partitioned ->
+        header =
+          ~w(n value parallel) ++
+            ["#{@partitioned} p50 ns", "p99 ns", "ips", "p50/theine", "p99/theine", "ips/theine"]
+
+        Report.table(
+          header,
+          Enum.map(partitioned, fn r ->
+            [r.n, r.value, r.parallel, r.p50_ns, r.p99_ns, round(r.ips)] ++
+              [r.ratio_to_theine.p50, r.ratio_to_theine.p99, r.ratio_to_theine.ips]
+          end)
+        )
+    end
   end
 
   # The threshold is on `ns/put` / ets; p50 and p99 are over the per-burst

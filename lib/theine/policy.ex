@@ -4,7 +4,7 @@ defmodule Theine.Policy do
   (specs/05). Runs only inside the maintenance process; the tables are
   private to it.
 
-      policy  :set          {key, id, segment, seq, weight, expires_at}
+      policy  :set          {key, id, segment, seq, weight, expires_at, hash}
       order   :ordered_set  {base(segment) + seq, key}
       ids     :set          {id, key}
       expiry  :ordered_set  {{expires_at, key}, id}       (Theine.Expiry)
@@ -26,8 +26,13 @@ defmodule Theine.Policy do
   frequencies, removing the loser from the entries table and the tables
   here (specs/05 §Events `evict`).
 
+  A row keeps its key's `Sketch.hash/1`, computed once when the key enters
+  the policy, so that the overwrites and drained reads that count a key the
+  policy holds do not hash it again (specs/05 §Decisions M7.3).
+
   `max_size: :infinity` disables admission and eviction (specs/08 §Starting
-  a cache): there is no `order` table and no sketch, and `segment` is `nil`.
+  a cache): there is no `order` table and no sketch, and `segment` and
+  `hash` are `nil`.
   The tables still track every key so that `Theine.size/1` and
   `Theine.weighted_size/1` never need `:ets.info/2` and the expiry index
   (specs/06) can find each key's previous `expires_at`.
@@ -55,7 +60,8 @@ defmodule Theine.Policy do
 
   @type segment :: :window | :probation | :protected | nil
   @type row ::
-          {Entry.key(), Entry.id(), segment(), pos_integer(), Entry.weight(), Entry.expires_at()}
+          {Entry.key(), Entry.id(), segment(), pos_integer(), Entry.weight(), Entry.expires_at(),
+           Sketch.hash() | nil}
 
   @typedoc "The three region limits of a bounded policy (specs/05 §Regions and sizes)."
   @type limits :: %{
@@ -168,7 +174,8 @@ defmodule Theine.Policy do
   @evictions Theine.Stats.evictions()
   @expirations Theine.Stats.expirations()
 
-  # Positions in a policy row (1-based, for :ets.update_element/3).
+  # Positions in a policy row (1-based, for :ets.update_element/3). The
+  # sketch hash, last, is written once with the row and never updated.
   @row_id 2
   @row_segment 3
   @row_seq 4
@@ -328,7 +335,7 @@ defmodule Theine.Policy do
       [] ->
         insert(state, key, id, weight, expires_at)
 
-      [{^key, ^id, segment, _seq, old_weight, old_expires_at}] ->
+      [{^key, ^id, segment, _seq, old_weight, old_expires_at, _hash}] ->
         # Same-id events carry no order among themselves, so the one
         # applied last may be older than the table's in-place rewrite: the
         # table's expires_at is the current one (specs/06 §Decisions M3.2).
@@ -347,7 +354,7 @@ defmodule Theine.Policy do
         |> add_segment(segment, weight - old_weight)
         |> fit(key, segment, weight, old_weight)
 
-      [{^key, row_id, _segment, _seq, _weight, _expires_at} = row] when id < row_id ->
+      [{^key, row_id, _segment, _seq, _weight, _expires_at, _hash} = row] when id < row_id ->
         # An older version's event behind a newer one's: a put whose event
         # was overtaken, or an expire/3 that reported the version it saw
         # just before a put replaced it. Applied only while the table still
@@ -364,7 +371,7 @@ defmodule Theine.Policy do
   # Without a bound there is no order to keep and no segment weight, so the
   # state is unchanged.
   defp replace(%__MODULE__{order: nil} = state, key, id, weight, expires_at, row) do
-    {^key, old_id, nil, _seq, old_weight, old_expires_at} = row
+    {^key, old_id, nil, _seq, old_weight, old_expires_at, nil} = row
     true = :ets.delete(state.ids, old_id)
     true = :ets.insert(state.ids, {id, key})
 
@@ -384,7 +391,8 @@ defmodule Theine.Policy do
   # climber. The key moves to the MRU of its own segment, so the row's
   # segment stays, and its seq, id, weight and expires_at are written in
   # one `update_element`; the seq, the sketch count and the segment weight
-  # in one struct update (specs/05 §Decisions M7.2).
+  # in one struct update (specs/05 §Decisions M7.2). The sketch count uses
+  # the row's hash (specs/05 §Decisions M7.3).
   defp replace(
          %__MODULE__{order: order, policy: policy} = state,
          key,
@@ -393,7 +401,7 @@ defmodule Theine.Policy do
          expires_at,
          row
        ) do
-    {^key, old_id, segment, old_seq, old_weight, old_expires_at} = row
+    {^key, old_id, segment, old_seq, old_weight, old_expires_at, hash} = row
 
     # The seq first: a refused seq (the sentinel) must leave every table
     # untouched.
@@ -413,7 +421,7 @@ defmodule Theine.Policy do
 
     :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
     add(state, 0, weight - old_weight)
-    :ok = Sketch.increment(state.sketch, key)
+    :ok = Sketch.increment_hashed(state.sketch, hash)
 
     state
     |> accessed(seq, segment, weight - old_weight)
@@ -444,7 +452,9 @@ defmodule Theine.Policy do
   # otherwise the protected LRU entries are demoted until the segment fits.
   defp fit(state, key, :protected, weight, old_weight) when weight > old_weight do
     if weight > state.protected_max do
-      [{^key, _id, :protected, seq, ^weight, _expires_at}] = :ets.lookup(state.policy, key)
+      [{^key, _id, :protected, seq, ^weight, _expires_at, _hash}] =
+        :ets.lookup(state.policy, key)
+
       move(state, key, :protected, seq, :probation, weight)
     else
       demote(state)
@@ -455,21 +465,24 @@ defmodule Theine.Policy do
 
   defp insert(%__MODULE__{order: nil} = state, key, id, weight, expires_at) do
     seq = next_seq(state)
-    true = :ets.insert(state.policy, {key, id, nil, seq, weight, expires_at})
+    true = :ets.insert(state.policy, {key, id, nil, seq, weight, expires_at, nil})
     true = :ets.insert(state.ids, {id, key})
     :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
     add(state, 1, weight)
     %{state | next_seq: seq + 1}
   end
 
+  # The one place a key's sketch hash is computed while the policy runs;
+  # `restore/5` is the other, in a rebuild.
   defp insert(%__MODULE__{} = state, key, id, weight, expires_at) do
     seq = next_seq(state)
-    true = :ets.insert(state.policy, {key, id, :window, seq, weight, expires_at})
+    hash = Sketch.hash(key)
+    true = :ets.insert(state.policy, {key, id, :window, seq, weight, expires_at, hash})
     true = :ets.insert(state.ids, {id, key})
     true = :ets.insert(state.order, {@window_base + seq, key})
     :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
     add(state, 1, weight)
-    :ok = Sketch.increment(state.sketch, key)
+    :ok = Sketch.increment_hashed(state.sketch, hash)
 
     # A key new to the policy is the climber's miss (specs/05 §Adaptive
     # window): in a cache, the insert of a new key follows a miss.
@@ -486,10 +499,10 @@ defmodule Theine.Policy do
   # sketch count, with one struct update: a struct update costs about as
   # much as an ETS update_element here, and this is the drain's common case
   # (specs/05 §Decisions M2.11b). It counts as the climber's hit.
-  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq) do
+  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq, hash) do
     seq = next_seq(state)
     reorder(state, key, segment, old_seq, segment, seq)
-    :ok = Sketch.increment(state.sketch, key)
+    :ok = Sketch.increment_hashed(state.sketch, hash)
     %{state | next_seq: seq + 1, sketch_size: size + 1, sample_hits: state.sample_hits + 1}
   end
 
@@ -536,7 +549,8 @@ defmodule Theine.Policy do
   (specs/04 §Restart semantics step 3; specs/05 §Events `restore`): a row
   under the table's `id`, `weight` and `expires_at`, placed at the
   **probation** MRU in a bounded cache with no sketch increment, so the
-  rebuilt policy is cold and every entry is a candidate for eviction. An
+  rebuilt policy is cold and every entry is a candidate for eviction (the
+  row's sketch hash is computed all the same, for its later counts). An
   integer `expires_at` is indexed, so the sweep finds the entry after a
   restart as it would have before (specs/06 §Index). A key
   the policy already holds is left alone, whatever its id; the rebuild
@@ -551,7 +565,7 @@ defmodule Theine.Policy do
   def restore(%__MODULE__{order: nil} = state, key, id, weight, expires_at) do
     seq = next_seq(state)
 
-    if :ets.insert_new(state.policy, {key, id, nil, seq, weight, expires_at}) do
+    if :ets.insert_new(state.policy, {key, id, nil, seq, weight, expires_at, nil}) do
       true = :ets.insert(state.ids, {id, key})
       :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
       add(state, 1, weight)
@@ -564,7 +578,9 @@ defmodule Theine.Policy do
   def restore(%__MODULE__{} = state, key, id, weight, expires_at) do
     seq = next_seq(state)
 
-    if :ets.insert_new(state.policy, {key, id, :probation, seq, weight, expires_at}) do
+    row = {key, id, :probation, seq, weight, expires_at, Sketch.hash(key)}
+
+    if :ets.insert_new(state.policy, row) do
       true = :ets.insert(state.ids, {id, key})
       true = :ets.insert(state.order, {@probation_base + seq, key})
       :ok = Expiry.move(state.expiry, key, id, nil, expires_at)
@@ -604,19 +620,20 @@ defmodule Theine.Policy do
 
   def on_access(%__MODULE__{} = state, id) do
     with [{^id, key}] <- :ets.lookup(state.ids, id),
-         [{^key, ^id, segment, seq, weight, _expires_at}] <- :ets.lookup(state.policy, key) do
-      access(state, key, segment, seq, weight)
+         [{^key, ^id, segment, seq, weight, _expires_at, hash}] <-
+           :ets.lookup(state.policy, key) do
+      access(state, key, segment, seq, weight, hash)
     else
       _ -> state
     end
   end
 
   # A promotion: probation → protected MRU, then demote until it fits.
-  defp access(%__MODULE__{protected_max: max} = state, key, :probation, seq, weight)
+  defp access(%__MODULE__{protected_max: max} = state, key, :probation, seq, weight, hash)
        when weight <= max do
     new_seq = next_seq(state)
     reorder(state, key, :probation, seq, :protected, new_seq)
-    :ok = Sketch.increment(state.sketch, key)
+    :ok = Sketch.increment_hashed(state.sketch, hash)
 
     demote(%{
       state
@@ -630,8 +647,8 @@ defmodule Theine.Policy do
 
   # Window → window MRU, protected → protected MRU, and a probation entry
   # too heavy for protected → probation MRU.
-  defp access(state, key, segment, seq, _weight),
-    do: reorder_and_sample(state, key, segment, seq)
+  defp access(state, key, segment, seq, _weight, hash),
+    do: reorder_and_sample(state, key, segment, seq, hash)
 
   # Demotes protected LRU entries to probation MRU until the protected
   # segment fits. Every step removes a positive weight, and the segment is
@@ -820,6 +837,8 @@ defmodule Theine.Policy do
   # sits above it (`decide/1`'s victim clause takes the other case).
   defp previous(order, seq), do: :ets.prev(order, @probation_base + seq) - @probation_base
 
+  # Neither key's policy row is at hand here, and reading one for its hash
+  # costs more than hashing the key (specs/05 §Decisions M7.3).
   defp admit?(%__MODULE__{sketch: sketch}, candidate, victim) do
     candidate_freq = Sketch.frequency(sketch, candidate)
 
@@ -837,7 +856,7 @@ defmodule Theine.Policy do
   # segment weight, in one struct update.
   defp remove(%__MODULE__{} = state, key, candidates, cursor, floor) do
     %__MODULE__{policy: policy, table: table, counters: counters} = state
-    [{^key, id, segment, _seq, weight, _expires_at} = row] = :ets.lookup(policy, key)
+    [{^key, id, segment, _seq, weight, _expires_at, _hash} = row] = :ets.lookup(policy, key)
 
     evicted =
       case :ets.lookup(table, key) do
@@ -1102,12 +1121,12 @@ defmodule Theine.Policy do
   @spec on_remove(t(), Entry.key(), Entry.id()) :: t()
   def on_remove(%__MODULE__{} = state, key, id) do
     case :ets.lookup(state.policy, key) do
-      [{^key, ^id, _segment, _seq, _weight, _expires_at} = row] ->
+      [{^key, ^id, _segment, _seq, _weight, _expires_at, _hash} = row] ->
         if :ets.lookup_element(state.table, key, @entry_id, nil) == id,
           do: state,
           else: drop(state, row)
 
-      [{^key, _row_id, _segment, _seq, _weight, _expires_at} = row] ->
+      [{^key, _row_id, _segment, _seq, _weight, _expires_at, _hash} = row] ->
         if :ets.member(state.table, key), do: state, else: drop(state, row)
 
       [] ->
@@ -1115,13 +1134,13 @@ defmodule Theine.Policy do
     end
   end
 
-  defp drop(state, {_key, _id, segment, _seq, weight, _expires_at} = row) do
+  defp drop(state, {_key, _id, segment, _seq, weight, _expires_at, _hash} = row) do
     :ok = drop_rows(state, row)
     add_segment(state, segment, -weight)
   end
 
   # The table side of a drop: every row of the key and the published sizes.
-  defp drop_rows(state, {key, id, segment, seq, weight, expires_at}) do
+  defp drop_rows(state, {key, id, segment, seq, weight, expires_at, _hash}) do
     true = :ets.delete(state.policy, key)
     true = :ets.delete(state.ids, id)
     if state.order, do: true = :ets.delete(state.order, base(segment) + seq)
@@ -1160,7 +1179,7 @@ defmodule Theine.Policy do
 
   defp expire_key(key, id, expires_at, now, {expired, %__MODULE__{} = state}) do
     %__MODULE__{policy: policy, table: table, counters: counters} = state
-    [{^key, ^id, _segment, _seq, _weight, ^expires_at} = row] = :ets.lookup(policy, key)
+    [{^key, ^id, _segment, _seq, _weight, ^expires_at, _hash} = row] = :ets.lookup(policy, key)
 
     case :ets.lookup(table, key) do
       [{^key, _value, ^id, _weight, _written_at, at} = entry] when at <= now ->

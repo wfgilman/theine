@@ -135,7 +135,7 @@ defmodule Theine.Stress.RestartTest do
 
     for {key, value, id, _weight, _written_at, _expires_at} <- table do
       assert value == key
-      assert {:ok, {^key, ^id, _, _, 1, :infinity}} = Maintenance.policy_row(cache, key)
+      assert {:ok, {^key, ^id, _, _, 1, :infinity, _}} = Maintenance.policy_row(cache, key)
     end
 
     # No readable entry was lost: every snapshot entry the table no longer

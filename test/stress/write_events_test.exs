@@ -62,7 +62,7 @@ defmodule Theine.Stress.WriteEventsTest do
       # Every key the table holds has its policy row under the table's id;
       # with the counts equal, the policy holds no other row.
       for {key, _value, id, _weight, _written_at, _expires_at} <- table do
-        assert {:ok, {^key, ^id, _, _, 1, :infinity}} = Maintenance.policy_row(cache, key)
+        assert {:ok, {^key, ^id, _, _, 1, :infinity, _}} = Maintenance.policy_row(cache, key)
       end
     end
   end

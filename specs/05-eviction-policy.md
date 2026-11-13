@@ -22,12 +22,17 @@ window (§Adaptive window), which is on by default and moves it from there.
 ## State (private ETS, owned by maintenance)
 
 ```
-policy  :set          {key, id, segment, seq, weight, expires_at}
+policy  :set          {key, id, segment, seq, weight, expires_at, hash}
 order   :ordered_set  {base(segment) + seq, key}
 ids     :set          {id, key}
 ```
 
 - `segment` ∈ `:window | :probation | :protected`.
+- `hash` is `Sketch.hash(key)` (specs/02 §Hashing), computed once when the
+  row is created (`on_write` of an unknown key, `restore`) and never
+  rewritten. Every later `Sketch.increment` of a key the policy holds is
+  `Sketch.increment_hashed(hash)` from the row (§Decisions M7.3).
+  Without a bound there is no sketch and `hash` is `nil`.
 - `seq` is from a monotonically increasing integer in the maintenance state,
   starting at 1. Larger `seq` means more recently used.
 - An `order` key is one integer, `base(segment) + seq`, with
@@ -96,7 +101,7 @@ one the table never kept (§Decisions 2026-10-27 M1.5).
 ### `on_access(id)`
 
 Look up `ids`; if `id` is not the key's current id in `policy`, skip. Else
-`Sketch.increment(key)` and:
+`Sketch.increment(key)` (with the row's `hash`) and:
 
 - `:window` → move to window MRU.
 - `:probation` → move to protected MRU; `probation_weight -= w`,
@@ -111,7 +116,7 @@ The maintenance restart rebuild (specs/04 §Restart semantics step 3) feeds
 every entry it finds in the entries table through this instead of
 `on_write`: insert into `policy` and `ids` under the table's id, place at
 the **probation** MRU, `probation_weight += weight`, and no
-`Sketch.increment`, so the rebuilt policy is cold and every restored entry
+`Sketch.increment` (the row's `hash` is computed all the same), so the rebuilt policy is cold and every restored entry
 is a candidate for direct eviction (`candidates` is 0) until reads promote
 it. A key the policy already holds is left alone. Without a bound it is a
 plain row, as `on_write` of an unknown key would make (§Decisions M2.9).
@@ -525,3 +530,30 @@ the window moves, and records the answer in §Decisions. Unbounded
   went from 3.266 to 3.109 µs and a new key with its eviction from 6.199 to
   6.127 µs, faster in every round. Every row of `mix bench hitrate` kept
   its hits (IMPLEMENTATION_PLAN.md §Benchmark log M7.2).
+- 2026-11-12 (M7.3): a policy row keeps its key's `Sketch.hash/1` as a
+  seventh field, `hash`, set when the row is created (`on_write` of an
+  unknown key, `restore`) and never rewritten; `nil` without a bound. An
+  overwrite with a new id and a drained read count the key with
+  `Sketch.increment_hashed/2` from the row they already read, so they no
+  longer hash the key (specs/02 §Decisions M7.3). It goes last in the row,
+  so `update_element` positions 2–6 are unchanged. `restore` computes the
+  hash too, though it does not count the key, so that the restored key's
+  later reads find it. The admission test in `evict()` still calls
+  `Sketch.frequency/2` on the candidate and the victim: neither row is in
+  hand there, and reading one for its hash (`lookup_element` on `policy`,
+  about 200 ns on a 100_000-row table) costs more than hashing the key
+  (about 55 ns for an integer key). So a new key and the eviction it causes
+  gain nothing. M7's profile had put the hash at about 250 ns of each
+  sketch call, and on that estimate the plan expected the eviction path to
+  gain as well. Measured with the M7.2 probe extended by a drained-read
+  scenario (`bench/results/policy-m73.exs`, gitignored, six alternating
+  rounds against the M7.2 policy, 100_000 keys): an overwrite went from
+  3.133 to 3.065 µs, a drained read from 2.366 to 2.337 µs, and a new key
+  with its eviction measured 6.145 against 6.170 µs, inside the spread of
+  both arms. Every row of `mix bench hitrate` kept its hits
+  (IMPLEMENTATION_PLAN.md §Benchmark log M7.3). Most of a new key's time
+  is in the `order` walk. `lru_entry` and the candidate lookup each pay one
+  tree descent for `:ets.next/2` or `:ets.prev/2` and a second for
+  `lookup_element`, about 380 ns apiece. OTP 27's `:ets.next_lookup/2`
+  and `:ets.prev_lookup/2` return the row with the step, which removes the
+  second descent (plan task M7.3b).

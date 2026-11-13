@@ -115,7 +115,7 @@ defmodule Theine.ExpiryTest do
 
       # The stale {:removed, :a, id1} does not disturb the policy's v2 row.
       Theine.run_maintenance(cache)
-      assert {:ok, {:a, ^id2, _, _, _, :infinity}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, ^id2, _, _, _, :infinity, _}} = Maintenance.policy_row(cache, :a)
       assert Theine.size(cache) == 1
     end
 
@@ -208,7 +208,7 @@ defmodule Theine.ExpiryTest do
       assert [{:a, :v2, id2, _, _, :infinity}] = :ets.lookup(cache, :a)
       assert id2 > id1
       assert Theine.get(cache, :a) == {:ok, :v2}
-      assert {:ok, {:a, ^id2, _, _, _, :infinity}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, ^id2, _, _, _, :infinity, _}} = Maintenance.policy_row(cache, :a)
       assert %{size: 1, expiring: 0} = Maintenance.info(cache)
       assert expirations(cache) == 0
     end
@@ -246,7 +246,7 @@ defmodule Theine.ExpiryTest do
       true = :ets.update_element(cache, :a, {6, 50})
       release_sweep(cache, held)
 
-      assert {:ok, {:a, ^id, _, _, _, 50}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, ^id, _, _, _, 50, _}} = Maintenance.policy_row(cache, :a)
       assert %{size: 1, expiring: 1} = Maintenance.info(cache)
       assert Theine.get(cache, :a) == {:ok, :v1}
       assert expirations(cache) == 0
@@ -346,7 +346,7 @@ defmodule Theine.ExpiryTest do
 
       assert Theine.expire(cache, :a, 50) == true
       assert [{:a, :v, ^id, 1, 1_000, 1_050}] = :ets.lookup(cache, :a)
-      assert {:ok, {:a, ^id, _, _, 1, 1_050}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, ^id, _, _, 1, 1_050, _}} = Maintenance.policy_row(cache, :a)
       assert %{expiring: 1, size: 1} = Maintenance.info(cache)
 
       # The old time passes with nothing indexed there.
@@ -386,7 +386,7 @@ defmodule Theine.ExpiryTest do
 
       assert Theine.persist(cache, :a) == true
       assert [{:a, :v, _, _, _, :infinity}] = :ets.lookup(cache, :a)
-      assert {:ok, {:a, _, _, _, _, :infinity}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, _, _, _, _, :infinity, _}} = Maintenance.policy_row(cache, :a)
       assert %{expiring: 0, size: 1} = Maintenance.info(cache)
 
       Clock.advance(cache, 1_000_000)
@@ -424,7 +424,7 @@ defmodule Theine.ExpiryTest do
       assert Theine.expire(cache, :a, 1_000) == false
       assert Theine.persist(cache, :a) == false
       assert [{:a, 1, _, _, _, 1_010}] = :ets.lookup(cache, :a)
-      assert {:ok, {:a, _, _, _, _, 1_010}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, _, _, _, _, 1_010, _}} = Maintenance.policy_row(cache, :a)
       assert Theine.get(cache, :a) == :error
     end
 
@@ -448,10 +448,10 @@ defmodule Theine.ExpiryTest do
       Theine.put(cache, :a, 1)
       Theine.put(cache, :b, 2)
       # The window holds one entry, so b's arrival moved a to probation.
-      {:ok, {:a, id, :probation, seq, 1, :infinity}} = Maintenance.policy_row(cache, :a)
+      {:ok, {:a, id, :probation, seq, 1, :infinity, _}} = Maintenance.policy_row(cache, :a)
 
       assert Theine.expire(cache, :a, 50)
-      assert {:ok, {:a, ^id, :probation, ^seq, 1, 50}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, ^id, :probation, ^seq, 1, 50, _}} = Maintenance.policy_row(cache, :a)
     end
 
     test "an expired read that loses its delete to expire/3 leaves the entry and its row", %{
@@ -467,7 +467,7 @@ defmodule Theine.ExpiryTest do
       assert Entry.expired(Config.get(cache), seen) == :error
 
       assert [{:a, :v, ^id, _, _, 1_100}] = :ets.lookup(cache, :a)
-      assert {:ok, {:a, ^id, _, _, _, 1_100}} = Maintenance.policy_row(cache, :a)
+      assert {:ok, {:a, ^id, _, _, _, 1_100, _}} = Maintenance.policy_row(cache, :a)
       assert %{size: 1, expiring: 1} = Maintenance.info(cache)
 
       Clock.advance(cache, 100)
@@ -515,7 +515,7 @@ defmodule Theine.ExpiryTest do
 
       for key <- keys do
         [{^key, _, id, _, _, expires_at}] = :ets.lookup(cache, key)
-        assert {:ok, {^key, ^id, _, _, _, ^expires_at}} = Maintenance.policy_row(cache, key)
+        assert {:ok, {^key, ^id, _, _, _, ^expires_at, _}} = Maintenance.policy_row(cache, key)
       end
 
       finite = Enum.count(keys, &is_integer(:ets.lookup_element(cache, &1, 6)))

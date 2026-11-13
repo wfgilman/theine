@@ -183,6 +183,36 @@ defmodule Theine.SketchTest do
       end
     end
 
+    property "the hashed variants change and read exactly the counters of increment/2 and frequency/2" do
+      # specs/02 §Decisions M7.3: the policy keeps `hash/1` in its rows, so
+      # the stored hash must be as good as the key at every size.
+      check all keys <- list_of(key_gen(), max_length: 300), max_size <- integer(1..5_000) do
+        by_key = Sketch.new(max_size)
+        by_hash = Sketch.new(max_size)
+
+        for key <- keys do
+          :ok = Sketch.increment(by_key, key)
+          :ok = Sketch.increment_hashed(by_hash, Sketch.hash(key))
+        end
+
+        assert Sketch.dump(by_hash) == Sketch.dump(by_key)
+
+        for key <- [:never | keys] do
+          assert Sketch.frequency_hashed(by_key, Sketch.hash(key)) ==
+                   Sketch.frequency(by_key, key)
+        end
+      end
+    end
+
+    property "hash/1 is a small integer below 2^59 whatever the key" do
+      check all key <- one_of([key_gen(), integer(0..0xFFFFFFFF), term()]) do
+        hash = Sketch.hash(key)
+        assert hash >= 0 and hash < 1 <<< 59
+        # No bignum: a word on the heap, nothing more.
+        assert :erts_debug.flat_size(hash) == 0
+      end
+    end
+
     test "saturated counters stop incrementing and the words stay in range" do
       sketch = Sketch.new(1)
       for _ <- 1..100, do: Sketch.increment(sketch, :hot)

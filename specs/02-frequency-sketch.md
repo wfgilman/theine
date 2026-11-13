@@ -46,6 +46,16 @@ index   = block + 2 * i + (ci &&& 1)  # one of the block's i-th word pair
 offset  = ((ci >>> 1) &&& 15) * 4     # which nibble
 ```
 
+`hash(key)` packs everything the counters need from the key into one small
+integer: `(c <<< 27) ||| (h &&& (2^27 - 1))`, below 2^59. The low 27 bits
+of `h` hold every bit any block mask can use (a sketch has at most 2^27
+blocks), so the packed hash does not depend on the sketch's size.
+`increment_hashed(sketch, hash)` and `frequency_hashed(sketch, hash)` take
+the block from `hash &&& (blocks - 1)` and `c` from `hash >>> 27`, and
+`increment(sketch, key)` is `increment_hashed(sketch, hash(key))`, so a
+caller that keeps a key's hash changes and reads exactly the same counters
+(§Decisions M7.3).
+
 A key's four counters are therefore in four distinct words of one block.
 Both `index` and `offset` are deterministic functions of `(key, i)`. Write
 them once in a private function and test it with fixed vectors so that the
@@ -57,6 +67,8 @@ layout never silently changes between commits.
   below 15 add `1 <<< offset` to the word. Then `size + 1`; if
   `size >= sample_size`, call `reset/1`.
 - `frequency(sketch, key)`: minimum of the four nibbles. Range 0..15.
+- `increment_hashed/2` and `frequency_hashed/2`: the same, from a kept
+  `hash(key)` (§Hashing).
 - `reset/1`: for every word, `w = (w >>> 1) &&& 0x7777777777777777`, counting
   the nibbles that were odd (`odd`) so that when the reset completes `size`
   becomes `(size - (odd >>> 2)) >>> 1`. Each increment touches four
@@ -84,6 +96,9 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
   `size` follows the odd-count rule.
 - Layout vectors: for a fixed set of keys, `index/offset` pairs match the
   checked-in table in `test/theine/sketch_test.exs`.
+- Property: `increment_hashed(hash(k))` leaves the words exactly as
+  `increment(k)` does, `frequency_hashed(hash(k)) == frequency(k)`, and
+  `hash(k)` is a small integer below 2^59 for any term.
 - Collision quality: with `max_size = 10_000` and 100_000 distinct keys each
   seen once and no reset, at least 99% of keys report `frequency <= 3` and
   at least 55% report `frequency <= 1` (a crude check that the hash spread
@@ -171,3 +186,23 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
   atomics ops themselves (18–25 ns each, AGENTS.md) and likely a miss on a
   block that spans two cache lines, since the array's alignment is not
   known.
+- 2026-11-12 (M7.3): `hash/1`, `increment_hashed/2` and
+  `frequency_hashed/2`, so that the policy hashes a key once and keeps the
+  result in its row (specs/05 §Decisions M7.3). The kept value is one
+  small integer, `(c <<< 27) ||| (h &&& (2^27 - 1))`: a tuple of block and
+  counter hash would be a second heap object in every policy row, and the
+  block itself depends on the sketch's size, where the low 27 bits of `h`
+  serve every size up to the 2^30-word cap. `c` has 32 bits, so the packed
+  value is at most 2^59 - 1, the largest small integer. `increment/2` and
+  `frequency/2` keep their direct form instead of going through the packed
+  value: routed through it, the eviction path, whose admission test calls
+  `frequency/2` on two keys whose rows it does not hold, measured about
+  0.09 µs slower per new key. Measured in a compiled loop on integer keys
+  (probe `bench/results/hash-m73.exs`, gitignored): `hash/1` 55 ns,
+  `increment/2` 400 ns against 330 ns hashed, `frequency/2` 395 ns against
+  315 ns hashed. The hash is a smaller share than the M7 profile's estimate
+  of 250 ns; on larger keys `:erlang.phash2/2` costs more, so the saving
+  grows with the key. Every counter is unchanged: the layout vectors and
+  the full-width reference still match `positions/2`, which now goes
+  through `hash/1`, and a property checks that the hashed variants change
+  and read exactly the words the key-taking ones do.

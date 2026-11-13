@@ -137,7 +137,8 @@ test/                         mirrors lib/; test/support for shared helpers
   gated runs heat the laptop. To compare a `Theine.Policy` change, run
   `bench/results/policy-m72.exs` (gitignored): it times `on_write/5` +
   `evict/1` in one process against a revision's Policy (`POLICY_BASE`,
-  default HEAD) in alternating rounds, spread about 1%. The wall-clock
+  default HEAD) in alternating rounds, spread about 1%
+  (`bench/results/policy-m73.exs` adds a drained read, `on_access/2`). The wall-clock
   `event_run` is bimodal round to round (M7.2). For exact baseline hits
   without a second full bench, `bench/results/hits-m72.exs` replays the
   traces through a revision's Policy under the bench's cache names.

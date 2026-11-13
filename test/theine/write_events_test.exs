@@ -113,7 +113,7 @@ defmodule Theine.WriteEventsTest do
     # writer sends its own key's events in order.
     for w <- 1..4, i <- 0..49 do
       [{_, _, id, _, _, _}] = :ets.lookup(cache, {w, i})
-      assert {:ok, {_, ^id, _, _, _, _}} = Theine.Maintenance.policy_row(cache, {w, i})
+      assert {:ok, {_, ^id, _, _, _, _, _}} = Theine.Maintenance.policy_row(cache, {w, i})
     end
   end
 

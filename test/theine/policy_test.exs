@@ -89,7 +89,10 @@ defmodule Theine.PolicyTest do
     test "segment weights stay at zero and rows carry segment nil", %{policy: policy} do
       policy = Policy.on_write(policy, :a, 1, 3, :infinity)
       policy = Policy.on_write(policy, :a, 2, 5, :infinity)
-      assert {:ok, {:a, 2, nil, _, 5, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 2, nil, _, 5, :infinity, nil}} = Policy.lookup(policy, :a)
+      policy = Policy.restore(policy, :r, 3, 1, :infinity)
+      # No sketch, so no hash (specs/05 §State).
+      assert {:ok, {:r, 3, nil, _, 1, :infinity, nil}} = Policy.lookup(policy, :r)
       assert Policy.weights(policy) == %{window: 0, probation: 0, protected: 0}
       policy = Policy.on_remove(policy, :a, 2)
       assert Policy.weights(policy) == %{window: 0, probation: 0, protected: 0}
@@ -140,8 +143,8 @@ defmodule Theine.PolicyTest do
       policy = Policy.on_write(policy, :a, 1, 3, :infinity)
       policy = Policy.on_write(policy, :b, 2, 4, 1_000)
 
-      assert {:ok, {:a, 1, :window, 1, 3, :infinity}} = Policy.lookup(policy, :a)
-      assert {:ok, {:b, 2, :window, 2, 4, 1_000}} = Policy.lookup(policy, :b)
+      assert {:ok, {:a, 1, :window, 1, 3, :infinity, _}} = Policy.lookup(policy, :a)
+      assert {:ok, {:b, 2, :window, 2, 4, 1_000, _}} = Policy.lookup(policy, :b)
       assert Policy.order_rows(policy) == [{{:window, 1}, :a}, {{:window, 2}, :b}]
       assert Policy.lru(policy, :window) == {:ok, :a}
       assert Policy.mru(policy, :window) == {:ok, :b}
@@ -156,6 +159,33 @@ defmodule Theine.PolicyTest do
       assert policy.sketch_size == 2
     end
 
+    test "a row keeps its key's Sketch.hash/1 from insert or restore through overwrites, reads and moves" do
+      # specs/05 §State and §Decisions M7.3: the hash is written with the
+      # row and every later count of the key uses it.
+      policy = bounded(100)
+      hash = fn key -> policy |> Policy.lookup(key) |> elem(1) |> elem(6) end
+
+      policy = Policy.on_write(policy, {:user, 1}, 1, 1, :infinity)
+      policy = Policy.restore(policy, "restored", 2, 1, :infinity)
+      assert hash.({:user, 1}) == Sketch.hash({:user, 1})
+      assert hash.("restored") == Sketch.hash("restored")
+      assert Sketch.frequency(policy.sketch, "restored") == 0
+
+      # An overwrite with a new id, a promotion and a protected read.
+      policy = Policy.on_write(policy, {:user, 1}, 3, 2, 500)
+      policy = Policy.on_access(policy, 2)
+      policy = Policy.on_access(policy, 2)
+
+      assert {:ok, {"restored", 2, :protected, _, 1, :infinity, _}} =
+               Policy.lookup(policy, "restored")
+
+      assert hash.({:user, 1}) == Sketch.hash({:user, 1})
+      assert hash.("restored") == Sketch.hash("restored")
+      assert Sketch.frequency(policy.sketch, {:user, 1}) == 2
+      assert Sketch.frequency(policy.sketch, "restored") == 2
+      assert policy.sketch_size == 4
+    end
+
     test "an overwrite with a new id moves the key to its segment's MRU and counts it", %{
       table: table
     } do
@@ -165,7 +195,7 @@ defmodule Theine.PolicyTest do
       :ets.insert(table, entry(:a, 3, 5))
       policy = Policy.on_write(policy, :a, 3, 5, 2_000)
 
-      assert {:ok, {:a, 3, :window, 3, 5, 2_000}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 3, :window, 3, 5, 2_000, _}} = Policy.lookup(policy, :a)
       assert keys_in_order(policy, :window) == [:b, :a]
       assert Policy.mru(policy, :window) == {:ok, :a}
       assert Policy.lru(policy, :window) == {:ok, :b}
@@ -194,7 +224,7 @@ defmodule Theine.PolicyTest do
 
       policy = Policy.on_write(policy, :p1, 4, 3, :infinity)
 
-      assert {:ok, {:p1, 4, :probation, _, 3, :infinity}} = Policy.lookup(policy, :p1)
+      assert {:ok, {:p1, 4, :probation, _, 3, :infinity, _}} = Policy.lookup(policy, :p1)
       assert keys_in_order(policy, :probation) == [:p2, :p1]
       assert keys_in_order(policy, :window) == [:w]
       assert Policy.weights(policy) == %{window: 1, probation: 5, protected: 0}
@@ -276,7 +306,7 @@ defmodule Theine.PolicyTest do
 
       assert keys_in_order(policy, :protected) == [:a]
       assert keys_in_order(policy, :probation) == [:p, :b]
-      assert {:ok, {:b, 4, :probation, _, 80, :infinity}} = Policy.lookup(policy, :b)
+      assert {:ok, {:b, 4, :probation, _, 80, :infinity, _}} = Policy.lookup(policy, :b)
       assert Policy.weights(policy) == %{window: 0, probation: 81, protected: 30}
       assert Policy.weighted_size(policy.sizes) == 111
       assert length(Policy.order_rows(policy)) == 3
@@ -288,7 +318,7 @@ defmodule Theine.PolicyTest do
       policy = Policy.on_write(policy, :b, 2, 1, :infinity)
       policy = Policy.on_write(policy, :a, 1, 4, 2_000)
 
-      assert {:ok, {:a, 1, :window, 1, 4, 2_000}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 1, :window, 1, 4, 2_000, _}} = Policy.lookup(policy, :a)
       assert keys_in_order(policy, :window) == [:a, :b]
       assert Policy.weights(policy) == %{window: 5, probation: 0, protected: 0}
       assert Policy.weighted_size(policy.sizes) == 5
@@ -325,7 +355,7 @@ defmodule Theine.PolicyTest do
       policy = Policy.on_remove(policy, :a, 3)
       policy = Policy.on_remove(policy, :b, 2)
 
-      assert {:ok, {:a, 2, :window, 1, 3, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 2, :window, 1, 3, :infinity, _}} = Policy.lookup(policy, :a)
       assert Policy.order_rows(policy) == [{{:window, 1}, :a}]
       assert Policy.weights(policy) == %{window: 3, probation: 0, protected: 0}
       assert Policy.weighted_size(policy.sizes) == 3
@@ -365,7 +395,7 @@ defmodule Theine.PolicyTest do
       assert policy.sketch_size == 0
       # Still usable, and seq keeps increasing: order rows never collide.
       policy = Policy.on_write(policy, :a, 3, 1, :infinity)
-      assert {:ok, {:a, 3, :window, seq, 1, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 3, :window, seq, 1, :infinity, _}} = Policy.lookup(policy, :a)
       assert seq > 3
     end
 
@@ -420,8 +450,8 @@ defmodule Theine.PolicyTest do
       policy = Policy.restore(policy, :a, 7, 3, 1_000)
       policy = Policy.restore(policy, :b, 8, 4, :infinity)
 
-      assert {:ok, {:a, 7, :probation, seq_a, 3, 1_000}} = Policy.lookup(policy, :a)
-      assert {:ok, {:b, 8, :probation, seq_b, 4, :infinity}} = Policy.lookup(policy, :b)
+      assert {:ok, {:a, 7, :probation, seq_a, 3, 1_000, _}} = Policy.lookup(policy, :a)
+      assert {:ok, {:b, 8, :probation, seq_b, 4, :infinity, _}} = Policy.lookup(policy, :b)
       assert seq_a < seq_b
       assert Policy.order_rows(policy) == [{{:probation, seq_a}, :a}, {{:probation, seq_b}, :b}]
       assert Policy.lru(policy, :probation) == {:ok, :a}
@@ -438,12 +468,12 @@ defmodule Theine.PolicyTest do
 
       # A restored id is a current id: a read of it promotes as any would.
       policy = Policy.on_access(policy, 7)
-      assert {:ok, {:a, 7, :protected, _, 3, 1_000}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 7, :protected, _, 3, 1_000, _}} = Policy.lookup(policy, :a)
     end
 
     test "restores an unbounded entry as a plain row", %{policy: policy, sizes: sizes} do
       policy = Policy.restore(policy, :a, 7, 3, 1_000)
-      assert {:ok, {:a, 7, nil, _, 3, 1_000}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 7, nil, _, 3, 1_000, _}} = Policy.lookup(policy, :a)
       assert Policy.order_rows(policy) == []
       assert Policy.weights(policy) == %{window: 0, probation: 0, protected: 0}
       assert Policy.size(sizes) == 1
@@ -457,7 +487,7 @@ defmodule Theine.PolicyTest do
       policy = Policy.restore(policy, :a, 1, 2, :infinity)
       policy = Policy.restore(policy, :a, 9, 5, :infinity)
 
-      assert {:ok, {:a, 1, :window, _, 2, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 1, :window, _, 2, :infinity, _}} = Policy.lookup(policy, :a)
       assert Policy.count(policy) == 1
       assert Policy.id_count(policy) == 1
       assert length(Policy.order_rows(policy)) == 1
@@ -474,12 +504,12 @@ defmodule Theine.PolicyTest do
       # The entry's own event replayed after the rebuild is a same-id put:
       # weight and expiry only, no move, no count (specs/05 §Events).
       policy = Policy.on_write(policy, :a, 7, 2, 5_000)
-      assert {:ok, {:a, 7, :probation, _, 2, 5_000}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 7, :probation, _, 2, 5_000, _}} = Policy.lookup(policy, :a)
       assert Policy.lru(policy, :probation) == {:ok, :a}
       assert policy.sketch_size == 0
 
       policy = Policy.on_write(policy, :a, 9, 2, :infinity)
-      assert {:ok, {:a, 9, :probation, _, 2, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 9, :probation, _, 2, :infinity, _}} = Policy.lookup(policy, :a)
       assert Policy.mru(policy, :probation) == {:ok, :a}
       assert policy.sketch_size == 1
 
@@ -533,12 +563,12 @@ defmodule Theine.PolicyTest do
       # (its id is below the mark) is admitted, since the table holds it.
       :ets.insert(table, entry(:late, 1))
       policy = Policy.on_write(policy, :late, 1, 1, :infinity)
-      assert {:ok, {:late, 1, :window, _, 1, :infinity}} = Policy.lookup(policy, :late)
+      assert {:ok, {:late, 1, :window, _, 1, :infinity, _}} = Policy.lookup(policy, :late)
 
       # Above the mark nothing is read from the table: a write after the
       # rebuild is applied as before.
       policy = Policy.on_write(policy, :fresh, 13, 1, :infinity)
-      assert {:ok, {:fresh, 13, :window, _, 1, :infinity}} = Policy.lookup(policy, :fresh)
+      assert {:ok, {:fresh, 13, :window, _, 1, :infinity, _}} = Policy.lookup(policy, :fresh)
     end
 
     test "the restored-id mark only rises", %{policy: policy} do
@@ -560,7 +590,7 @@ defmodule Theine.PolicyTest do
       policy = Policy.on_access(policy, 1)
 
       assert keys_in_order(policy, :window) == [:b, :c, :a]
-      assert {:ok, {:a, 1, :window, seq, 2, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 1, :window, seq, 2, :infinity, _}} = Policy.lookup(policy, :a)
       assert seq == 4
       assert policy.next_seq == 5
       assert Policy.weights(policy) == %{window: 4, probation: 0, protected: 0}
@@ -583,7 +613,7 @@ defmodule Theine.PolicyTest do
       policy = Policy.on_access(policy, 2)
       assert keys_in_order(policy, :probation) == [:p2, :p3, :p4]
       assert keys_in_order(policy, :protected) == [:p1]
-      assert {:ok, {:p1, 2, :protected, _, 30, :infinity}} = Policy.lookup(policy, :p1)
+      assert {:ok, {:p1, 2, :protected, _, 30, :infinity, _}} = Policy.lookup(policy, :p1)
       assert Policy.weights(policy) == %{window: 1, probation: 65, protected: 30}
       assert Sketch.frequency(policy.sketch, :p1) == 2
 
@@ -597,7 +627,7 @@ defmodule Theine.PolicyTest do
       policy = Policy.on_access(policy, 4)
       assert keys_in_order(policy, :probation) == [:p4, :p1]
       assert keys_in_order(policy, :protected) == [:p2, :p3]
-      assert {:ok, {:p1, 2, :probation, _, 30, :infinity}} = Policy.lookup(policy, :p1)
+      assert {:ok, {:p1, 2, :probation, _, 30, :infinity, _}} = Policy.lookup(policy, :p1)
       assert Policy.mru(policy, :protected) == {:ok, :p3}
       assert Policy.weights(policy) == %{window: 1, probation: 35, protected: 60}
       assert Policy.weighted_size(policy.sizes) == 96
@@ -658,7 +688,7 @@ defmodule Theine.PolicyTest do
 
       assert keys_in_order(policy, :probation) == [:small, :big]
       assert keys_in_order(policy, :protected) == [:other]
-      assert {:ok, {:big, 2, :probation, _, 80, :infinity}} = Policy.lookup(policy, :big)
+      assert {:ok, {:big, 2, :probation, _, 80, :infinity, _}} = Policy.lookup(policy, :big)
       assert Policy.weights(policy) == %{window: 0, probation: 81, protected: 10}
       assert Sketch.frequency(policy.sketch, :big) == 2
 
@@ -712,7 +742,7 @@ defmodule Theine.PolicyTest do
       policy = policy |> Policy.on_access(1) |> Policy.on_access(2)
 
       assert policy == before
-      assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 3, :infinity}}
+      assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 3, :infinity, nil}}
       assert Policy.weighted_size(sizes) == 3
     end
 
@@ -749,7 +779,7 @@ defmodule Theine.PolicyTest do
       assert keys_in_order(policy, :probation) == [:a, :b]
       assert Policy.mru(policy, :probation) == {:ok, :b}
       assert Policy.weights(policy) == %{window: 1, probation: 2, protected: 0}
-      assert {:ok, {:a, 1, :probation, _, 1, :infinity}} = Policy.lookup(policy, :a)
+      assert {:ok, {:a, 1, :probation, _, 1, :infinity, _}} = Policy.lookup(policy, :a)
       assert policy.candidates == 0
       assert policy.cursor == nil
       assert evictions(policy) == 0
@@ -931,7 +961,7 @@ defmodule Theine.PolicyTest do
       assert keys_in_order(policy, :window) == [:w]
       assert total(policy) == 12
       assert policy.candidates == 2
-      assert {:ok, {:c2, 11, :probation, seq, 1, :infinity}} = Policy.lookup(policy, :c2)
+      assert {:ok, {:c2, 11, :probation, seq, 1, :infinity, _}} = Policy.lookup(policy, :c2)
       assert policy.cursor == seq
       assert evictions(policy) == 2
 
@@ -967,7 +997,7 @@ defmodule Theine.PolicyTest do
       assert {:more, 1, policy} = Policy.evict(policy)
       assert :ets.lookup(table, :c3) == []
       assert policy.candidates == 2
-      assert {:ok, {:c2, 10, :probation, c2_seq, 1, :infinity}} = Policy.lookup(policy, :c2)
+      assert {:ok, {:c2, 10, :probation, c2_seq, 1, :infinity, _}} = Policy.lookup(policy, :c2)
       assert policy.cursor == c2_seq
 
       # A write between passes: the next call overflows w, the window LRU,
@@ -1009,7 +1039,7 @@ defmodule Theine.PolicyTest do
       assert {:more, 1, policy} = Policy.evict(policy)
       assert :ets.lookup(table, :c3) == []
       assert policy.candidates == 2
-      assert {:ok, {:c1, 10, :probation, c1_seq, 1, :infinity}} = Policy.lookup(policy, :c1)
+      assert {:ok, {:c1, 10, :probation, c1_seq, 1, :infinity, _}} = Policy.lookup(policy, :c1)
       assert policy.candidate_floor == c1_seq
 
       policy = Policy.on_access(policy, 11)
@@ -1019,7 +1049,7 @@ defmodule Theine.PolicyTest do
       assert {:more, 1, policy} = Policy.evict(policy)
       assert :ets.lookup(table, :c1) == []
       assert policy.candidates == 1
-      assert {:ok, {:p9, 9, :probation, p9_seq, 1, :infinity}} = Policy.lookup(policy, :p9)
+      assert {:ok, {:p9, 9, :probation, p9_seq, 1, :infinity, _}} = Policy.lookup(policy, :p9)
       assert policy.cursor == p9_seq
       assert policy.candidate_floor == c1_seq
 
@@ -1084,7 +1114,7 @@ defmodule Theine.PolicyTest do
 
       # The in-flight event re-admits the fresh version as a new key.
       policy = Policy.on_write(policy, :p1, 99, 1, :infinity)
-      assert {:ok, {:p1, 99, :window, _, 1, :infinity}} = Policy.lookup(policy, :p1)
+      assert {:ok, {:p1, 99, :window, _, 1, :infinity, _}} = Policy.lookup(policy, :p1)
       assert Policy.id_count(policy) == 11
       assert total(policy) == 11
 
@@ -1479,7 +1509,7 @@ defmodule Theine.PolicyTest do
   # window overflow and the promotions that would otherwise take a longer
   # event sequence to arrange.
   defp place(policy, key, segment) do
-    {:ok, {^key, _id, from, seq, weight, _}} = Policy.lookup(policy, key)
+    {:ok, {^key, _id, from, seq, weight, _, _}} = Policy.lookup(policy, key)
     new_seq = policy.next_seq
     true = :ets.delete(policy.order, Policy.order_key(from, seq))
     true = :ets.insert(policy.order, {Policy.order_key(segment, new_seq), key})
@@ -1502,7 +1532,7 @@ defmodule Theine.PolicyTest do
   test "on_write of an unknown key adds a row and an ids row", %{policy: policy, sizes: sizes} do
     policy = Policy.on_write(policy, :a, 1, 3, :infinity)
 
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 3, :infinity}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 3, :infinity, nil}}
     assert Policy.count(policy) == 1
     assert Policy.id_count(policy) == 1
     assert Policy.size(sizes) == 1
@@ -1518,7 +1548,7 @@ defmodule Theine.PolicyTest do
     policy = Policy.on_write(policy, :a, 1, 3, :infinity)
     policy = Policy.on_write(policy, :a, 2, 5, 1_000)
 
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 2, nil, 1, 5, 1_000}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 2, nil, 1, 5, 1_000, nil}}
     assert Policy.count(policy) == 1
     assert Policy.id_count(policy) == 1
     assert Policy.size(sizes) == 1
@@ -1536,7 +1566,7 @@ defmodule Theine.PolicyTest do
     policy = Policy.on_write(policy, :b, 2, 1, :infinity)
     policy = Policy.on_write(policy, :a, 1, 4, 2_000)
 
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 4, 2_000}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 4, 2_000, nil}}
     assert Policy.id_count(policy) == 2
     assert Policy.weighted_size(sizes) == 5
   end
@@ -1551,17 +1581,17 @@ defmodule Theine.PolicyTest do
     policy = Policy.on_write(policy, :a, 1, 1, 100)
     policy = Policy.on_write(policy, :a, 1, 1, 500)
     policy = Policy.on_write(policy, :a, 1, 1, 300)
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 500}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 500, nil}}
     assert Expiry.rows(policy.expiry) == [{{500, :a}, 1}]
 
     # Once the table holds another version, or none, the event stands
     # until that version's own event settles the row.
     :ets.insert(table, {:a, nil, 2, 1, 0, :infinity})
     policy = Policy.on_write(policy, :a, 1, 1, 300)
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 300}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 300, nil}}
     true = :ets.delete(table, :a)
     policy = Policy.on_write(policy, :a, 1, 1, 400)
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 400}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 1, nil, 1, 1, 400, nil}}
   end
 
   test "an older id's late :put is applied only while the entries table holds that id", %{
@@ -1574,14 +1604,14 @@ defmodule Theine.PolicyTest do
     policy = Policy.on_write(policy, :a, 1, 1, 100)
     policy = Policy.on_write(policy, :a, 2, 1, 300)
     policy = Policy.on_write(policy, :a, 1, 1, 500)
-    assert {:ok, {:a, 2, nil, _, 1, 300}} = Policy.lookup(policy, :a)
+    assert {:ok, {:a, 2, nil, _, 1, 300, _}} = Policy.lookup(policy, :a)
     assert Expiry.rows(policy.expiry) == [{{300, :a}, 2}]
     assert Policy.id_count(policy) == 1
 
     # Two puts raced and the lower id was inserted last: its event wins.
     :ets.insert(table, {:a, nil, 1, 2, 0, :infinity})
     policy = Policy.on_write(policy, :a, 1, 2, :infinity)
-    assert {:ok, {:a, 1, nil, _, 2, :infinity}} = Policy.lookup(policy, :a)
+    assert {:ok, {:a, 1, nil, _, 2, :infinity, _}} = Policy.lookup(policy, :a)
     assert Expiry.rows(policy.expiry) == []
     assert Policy.weighted_size(policy.sizes) == 2
   end
@@ -1593,7 +1623,7 @@ defmodule Theine.PolicyTest do
     :ets.insert(table, {:a, nil, 1, 1, 0, 500})
     policy = Policy.on_write(policy, :a, 1, 1, 500)
     policy = Policy.on_remove(policy, :a, 1)
-    assert {:ok, {:a, 1, _, _, 1, 500}} = Policy.lookup(policy, :a)
+    assert {:ok, {:a, 1, _, _, 1, 500, _}} = Policy.lookup(policy, :a)
     assert Policy.size(sizes) == 1
     assert Expiry.rows(policy.expiry) == [{{500, :a}, 1}]
 
@@ -1626,7 +1656,7 @@ defmodule Theine.PolicyTest do
     policy = Policy.on_remove(policy, :a, 3)
     policy = Policy.on_remove(policy, :b, 2)
 
-    assert Policy.lookup(policy, :a) == {:ok, {:a, 2, nil, 1, 3, :infinity}}
+    assert Policy.lookup(policy, :a) == {:ok, {:a, 2, nil, 1, 3, :infinity, nil}}
     assert Policy.id_count(policy) == 1
     assert Policy.size(sizes) == 1
     assert Policy.weighted_size(sizes) == 3
@@ -1766,7 +1796,7 @@ defmodule Theine.PolicyTest do
 
     case Enum.find(model, fn {_key, {i, _weight}} -> i == id end) do
       {key, {^id, weight}} ->
-        {:ok, {^key, ^id, segment, _seq, ^weight, _}} = Policy.lookup(policy, key)
+        {:ok, {^key, ^id, segment, _seq, ^weight, _, _}} = Policy.lookup(policy, key)
 
         segment =
           case segment do
@@ -1802,7 +1832,7 @@ defmodule Theine.PolicyTest do
     order = Policy.order_rows(policy)
     assert length(order) == map_size(model)
 
-    for {key, _id, segment, seq, _weight, _} <- rows do
+    for {key, _id, segment, seq, _weight, _, _} <- rows do
       assert segment in [:window, :probation, :protected]
       order_key = Policy.order_key(segment, seq)
       assert :ets.lookup(policy.order, order_key) == [{order_key, key}]
@@ -1810,7 +1840,7 @@ defmodule Theine.PolicyTest do
 
     sums =
       Enum.reduce(rows, %{window: 0, probation: 0, protected: 0}, fn
-        {_, _, segment, _, weight, _}, acc -> Map.update!(acc, segment, &(&1 + weight))
+        {_, _, segment, _, weight, _, _}, acc -> Map.update!(acc, segment, &(&1 + weight))
       end)
 
     assert Policy.weights(policy) == sums
@@ -1905,7 +1935,7 @@ defmodule Theine.PolicyTest do
 
   defp apply_event(policy, _table, {:overflow, key}, model) do
     case Policy.lookup(policy, key) do
-      {:ok, {^key, _, :window, _, _, _}} -> {place(policy, key, :probation), model}
+      {:ok, {^key, _, :window, _, _, _, _}} -> {place(policy, key, :probation), model}
       _ -> {policy, model}
     end
   end
@@ -2028,7 +2058,7 @@ defmodule Theine.PolicyTest do
       assert expirations(policy) == 0
 
       policy = Policy.on_write(policy, :replaced, 3, 1, :infinity)
-      assert {:ok, {:replaced, 3, nil, _, 1, :infinity}} = Policy.lookup(policy, :replaced)
+      assert {:ok, {:replaced, 3, nil, _, 1, :infinity, _}} = Policy.lookup(policy, :replaced)
       assert Policy.on_remove(policy, :gone, 2) |> Policy.count() == 1
     end
 
@@ -2042,8 +2072,8 @@ defmodule Theine.PolicyTest do
       true = :ets.update_element(table, :persisted, {6, :infinity})
 
       assert {:done, 0, policy} = Policy.expire(policy, 10, 10)
-      assert {:ok, {:later, 1, nil, _, 1, 40}} = Policy.lookup(policy, :later)
-      assert {:ok, {:persisted, 2, nil, _, 1, :infinity}} = Policy.lookup(policy, :persisted)
+      assert {:ok, {:later, 1, nil, _, 1, 40, _}} = Policy.lookup(policy, :later)
+      assert {:ok, {:persisted, 2, nil, _, 1, :infinity, _}} = Policy.lookup(policy, :persisted)
       assert Expiry.rows(policy.expiry) == [{{40, :later}, 1}]
       assert :ets.info(table, :size) == 2
 
@@ -2154,12 +2184,15 @@ defmodule Theine.PolicyTest do
   # keeps the policy's due version in the table.
   defp apply_timed(policy, table, {:sweep, now, limit}) do
     before = expirations(policy)
-    due = for {key, id, _, _, _, at} <- :ets.tab2list(policy.policy), due?(at, now), do: {key, id}
+
+    due =
+      for {key, id, _, _, _, at, _} <- :ets.tab2list(policy.policy), due?(at, now), do: {key, id}
+
     {status, expired, policy} = Policy.expire(policy, now, limit)
 
     assert expired == expirations(policy) - before
     assert expired <= limit
-    left = for {_, _, _, _, _, at} <- :ets.tab2list(policy.policy), due?(at, now), do: at
+    left = for {_, _, _, _, _, at, _} <- :ets.tab2list(policy.policy), due?(at, now), do: at
     if status == :done, do: assert(left == [])
     if status == :more, do: assert(left != [])
 
@@ -2187,7 +2220,7 @@ defmodule Theine.PolicyTest do
   # The index the policy rows call for: one row per finite expires_at.
   defp expected_index(policy) do
     Enum.sort(
-      for {key, id, _, _, _, at} <- :ets.tab2list(policy.policy),
+      for {key, id, _, _, _, at, _} <- :ets.tab2list(policy.policy),
           is_integer(at),
           do: {{at, key}, id}
     )
@@ -2202,7 +2235,7 @@ defmodule Theine.PolicyTest do
              model |> Map.values() |> Enum.sum_by(&elem(&1, 1))
 
     for {key, {id, weight}} <- model do
-      assert {:ok, {^key, ^id, found, _seq, ^weight, :infinity}} = Policy.lookup(policy, key)
+      assert {:ok, {^key, ^id, found, _seq, ^weight, :infinity, _}} = Policy.lookup(policy, key)
       assert segment == :any or found == segment
     end
   end

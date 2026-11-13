@@ -145,7 +145,9 @@ defmodule TheineTest do
       assert Theine.get(cache, :missing) == :error
       Theine.run_maintenance(cache)
       assert Theine.size(cache) == 1
-      assert {:ok, {:a, _, :window, _, 1, :infinity}} = Theine.Maintenance.policy_row(cache, :a)
+
+      assert {:ok, {:a, _, :window, _, 1, :infinity, _}} =
+               Theine.Maintenance.policy_row(cache, :a)
 
       # Killing Maintenance keeps the same sketch and buffer: the Owner
       # allocated them, and the config is written once.
@@ -380,7 +382,7 @@ defmodule TheineTest do
 
       assert Theine.get(cache, :hot) == {:ok, :v}
 
-      assert {:ok, {:hot, _, segment, _, 1, :infinity}} =
+      assert {:ok, {:hot, _, segment, _, 1, :infinity, _}} =
                Theine.Maintenance.policy_row(cache, :hot)
 
       assert segment in [:window, :probation, :protected]
@@ -485,14 +487,16 @@ defmodule TheineTest do
     test "put_new returns {:error, :exists} and sends no event", %{cache: cache} do
       assert Theine.put_new(cache, :a, 1, weight: 2) == :ok
       Theine.run_maintenance(cache)
-      {:ok, {:a, id, nil, _, 2, :infinity}} = Theine.Maintenance.policy_row(cache, :a)
+      {:ok, {:a, id, nil, _, 2, :infinity, _}} = Theine.Maintenance.policy_row(cache, :a)
 
       assert Theine.put_new(cache, :a, 2, weight: 5) == {:error, :exists}
 
       assert Theine.get(cache, :a) == {:ok, 1}
       assert [{:a, 1, ^id, 2, _, :infinity}] = :ets.lookup(cache, :a)
       # No event: pending is untouched and the policy row is the original one.
-      assert Theine.Maintenance.policy_row(cache, :a) == {:ok, {:a, id, nil, 1, 2, :infinity}}
+      assert Theine.Maintenance.policy_row(cache, :a) ==
+               {:ok, {:a, id, nil, 1, 2, :infinity, nil}}
+
       assert %{pending: 0, size: 1, weighted_size: 2} = Theine.Maintenance.info(cache)
     end
 
@@ -513,7 +517,10 @@ defmodule TheineTest do
       assert new_id > old_id
       assert Theine.get(cache, :a) == {:ok, 2}
       Theine.run_maintenance(cache)
-      assert {:ok, {:a, ^new_id, nil, _, 1, :infinity}} = Theine.Maintenance.policy_row(cache, :a)
+
+      assert {:ok, {:a, ^new_id, nil, _, 1, :infinity, _}} =
+               Theine.Maintenance.policy_row(cache, :a)
+
       assert %{pending: 0, size: 1} = Theine.Maintenance.info(cache)
       # One expiration, no miss (counter indices from specs/08 §Stats).
       assert :counters.get(counters, 6) == 1

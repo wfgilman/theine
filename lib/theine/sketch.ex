@@ -39,6 +39,13 @@ defmodule Theine.Sketch do
   @type frequency :: 0..15
 
   @typedoc """
+  A key's sketch hash (`hash/1`): the counter hash in the bits above
+  27 and the low 27 bits of the block hash below, enough to pick a block
+  in the largest sketch (2^27 blocks). Below 2^59, so a small integer.
+  """
+  @type hash :: non_neg_integer()
+
+  @typedoc """
   A reset in progress: the 1-based index of the next word to halve and the
   odd nibbles counted so far. Kept by the maintenance process between passes.
   """
@@ -46,6 +53,11 @@ defmodule Theine.Sketch do
 
   @min_words 8
   @max_words 1 <<< 30
+  # A hash keeps the block hash's low `@block_bits` bits, enough for the
+  # largest sketch's block mask (`@max_words` / 8 blocks), and the 32-bit
+  # counter hash above them: 59 bits, the largest small integer's width.
+  @block_bits 27
+  @block_bits_mask (1 <<< @block_bits) - 1
   @mask32 0xFFFFFFFF
   @mask16 0xFFFF
   @nibble 0xF
@@ -103,11 +115,61 @@ defmodule Theine.Sketch do
     increment_at(ref, slot(block, counter_hash, 3))
   end
 
-  @doc "The estimated frequency of `key`: the minimum of its four counters."
+  @doc """
+  The estimated frequency of `key`: the minimum of its four counters. The
+  policy's admission test reads two keys whose rows it does not hold, so
+  this takes the key's hash straight to the block and counters, without
+  packing a `hash/1` (specs/02 §Decisions M7.3).
+  """
   @spec frequency(t(), term()) :: frequency()
   def frequency(%__MODULE__{ref: ref, block_mask: block_mask}, key) do
     {block, counter_hash} = hash(key, block_mask)
+    min_at(ref, block, counter_hash)
+  end
 
+  @doc """
+  The key's sketch hash: everything `increment/2` and `frequency/2` derive
+  from the key, computed once so that a caller holding many updates of one
+  key can keep it (specs/02 §Hashing, §Decisions M7.3). It does not depend
+  on the sketch's size, so it stays valid for any sketch, and it is a small
+  integer below 2^59.
+
+  `increment_hashed(sketch, hash(key))` changes exactly the counters
+  `increment(sketch, key)` does, and `frequency_hashed/2` likewise.
+  """
+  @spec hash(term()) :: hash()
+  def hash(key) do
+    block_hash = key |> :erlang.phash2(4_294_967_296) |> spread()
+    rehash(block_hash) <<< @block_bits ||| (block_hash &&& @block_bits_mask)
+  end
+
+  # `increment/2` and `frequency/2`'s own form of the hash: the block's
+  # first word (0-based) and the counter hash. One block hash picks the
+  # block, a rehash of it picks the counters, so the bits that chose the
+  # block do not also choose counter 0 (specs/02 §Hashing).
+  defp hash(key, block_mask) do
+    block_hash = key |> :erlang.phash2(4_294_967_296) |> spread()
+    {(block_hash &&& block_mask) <<< 3, rehash(block_hash)}
+  end
+
+  @doc "`increment/2` for a key whose `hash/1` the caller kept."
+  @spec increment_hashed(t(), hash()) :: :ok
+  def increment_hashed(%__MODULE__{ref: ref, block_mask: block_mask}, hash) do
+    block = (hash &&& block_mask) <<< 3
+    counter_hash = hash >>> @block_bits
+    increment_at(ref, slot(block, counter_hash, 0))
+    increment_at(ref, slot(block, counter_hash, 1))
+    increment_at(ref, slot(block, counter_hash, 2))
+    increment_at(ref, slot(block, counter_hash, 3))
+  end
+
+  @doc "`frequency/2` for a key whose `hash/1` the caller kept."
+  @spec frequency_hashed(t(), hash()) :: frequency()
+  def frequency_hashed(%__MODULE__{ref: ref, block_mask: block_mask}, hash) do
+    min_at(ref, (hash &&& block_mask) <<< 3, hash >>> @block_bits)
+  end
+
+  defp min_at(ref, block, counter_hash) do
     read_at(ref, slot(block, counter_hash, 0))
     |> min(read_at(ref, slot(block, counter_hash, 1)))
     |> min(read_at(ref, slot(block, counter_hash, 2)))
@@ -203,19 +265,14 @@ defmodule Theine.Sketch do
   # by the layout vectors in sketch_test (specs/02 §Hashing).
   @spec positions(t(), term()) :: [{non_neg_integer(), 0..60}, ...]
   def positions(%__MODULE__{block_mask: block_mask}, key) do
-    {block, counter_hash} = hash(key, block_mask)
+    hash = hash(key)
+    block = (hash &&& block_mask) <<< 3
+    counter_hash = hash >>> @block_bits
 
     for i <- 0..3 do
       {index, offset} = slot(block, counter_hash, i)
       {index - 1, offset}
     end
-  end
-
-  # One block hash picks the block, a rehash of it picks the counters, so the
-  # bits that chose the block do not also choose counter 0 (specs/02 §Hashing).
-  defp hash(key, block_mask) do
-    block_hash = key |> :erlang.phash2(4_294_967_296) |> spread()
-    {(block_hash &&& block_mask) <<< 3, rehash(block_hash)}
   end
 
   # The single definition of the layout: counter `i` of a key is in word

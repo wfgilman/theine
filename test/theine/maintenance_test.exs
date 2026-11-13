@@ -22,7 +22,9 @@ defmodule Theine.MaintenanceTest do
   defp id_of(cache, key), do: :ets.lookup_element(cache, key, 3)
 
   defp seq_of(cache, key) do
-    {:ok, {^key, _id, _segment, seq, _weight, _expires_at}} = Maintenance.policy_row(cache, key)
+    {:ok, {^key, _id, _segment, seq, _weight, _expires_at, _hash}} =
+      Maintenance.policy_row(cache, key)
+
     seq
   end
 
@@ -250,7 +252,7 @@ defmodule Theine.MaintenanceTest do
              Maintenance.info(cache)
 
     assert %{sketch: %{increments: 3}} = Maintenance.info(cache)
-    assert {:ok, {:a, _, :window, _, 4, :infinity}} = Maintenance.policy_row(cache, :a)
+    assert {:ok, {:a, _, :window, _, 4, :infinity, _}} = Maintenance.policy_row(cache, :a)
 
     # A read claimed in the buffer shows up as lag until a drain.
     config = Config.get(cache)
@@ -304,7 +306,7 @@ defmodule Theine.MaintenanceTest do
       :atomics.add(config.pending, 1, 1)
       send(name, {:put, :a, 7, 2, :infinity})
 
-      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 7, nil, 1, 2, :infinity}}
+      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 7, nil, 1, 2, :infinity, nil}}
       assert %{pending: 0, size: 1, weighted_size: 2} = Maintenance.info(cache)
     end
 
@@ -318,7 +320,7 @@ defmodule Theine.MaintenanceTest do
       :atomics.add(config.pending, 1, 3)
       send(name, {:put, :a, 7, 1, :infinity})
       send(name, {:removed, :a, 6})
-      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 7, nil, 1, 1, :infinity}}
+      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 7, nil, 1, 1, :infinity, nil}}
 
       # A remover deletes the tuple before it reports the id.
       true = :ets.delete(cache, :a)
@@ -339,7 +341,7 @@ defmodule Theine.MaintenanceTest do
       :atomics.add(config.pending, 1, 3)
       send(name, {:put, :a, 7, 1, :infinity})
       send(name, {:put, :a, 8, 2, :infinity})
-      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 8, nil, 1, 2, :infinity}}
+      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 8, nil, 1, 2, :infinity, nil}}
 
       :ets.delete(cache, :a)
       send(name, {:removed, :a, 7})
@@ -364,7 +366,7 @@ defmodule Theine.MaintenanceTest do
 
       # The stale removal arrived after the :put of id 8, which is live in
       # the table, and was ignored.
-      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 8, nil, 1, 2, :infinity}}
+      assert Maintenance.policy_row(cache, :a) == {:ok, {:a, 8, nil, 1, 2, :infinity, nil}}
       assert %{pending: 0, size: 1, weighted_size: 2} = Maintenance.info(cache)
     end
   end
@@ -955,7 +957,7 @@ defmodule Theine.MaintenanceTest do
       assert %{passes: 1, size: 51, sketch: %{increments: 54}} = Maintenance.info(cache)
       # Key 1 overflowed into probation as the later puts were applied
       # (eviction runs per applied :put) and the pass's reads promoted it.
-      assert {:ok, {1, _, :protected, _, 1, :infinity}} = Maintenance.policy_row(cache, 1)
+      assert {:ok, {1, _, :protected, _, 1, :infinity, _}} = Maintenance.policy_row(cache, 1)
 
       # Paused: ten more writes queue as events in the mailbox, and five
       # reads sit in the ring, when the process is killed. The events die
@@ -985,10 +987,12 @@ defmodule Theine.MaintenanceTest do
 
       for i <- 1..60 do
         id = id_of(cache, i)
-        assert {:ok, {^i, ^id, :probation, _, 1, :infinity}} = Maintenance.policy_row(cache, i)
+        assert {:ok, {^i, ^id, :probation, _, 1, :infinity, _}} = Maintenance.policy_row(cache, i)
       end
 
-      assert {:ok, {:ttl, _, :probation, _, 1, expires_at}} = Maintenance.policy_row(cache, :ttl)
+      assert {:ok, {:ttl, _, :probation, _, 1, expires_at, _}} =
+               Maintenance.policy_row(cache, :ttl)
+
       assert is_integer(expires_at)
       assert Sketch.frequency(config.sketch, 1) == 0
       assert flag(cache) == 0
@@ -1027,7 +1031,7 @@ defmodule Theine.MaintenanceTest do
 
       for i <- 1..20_000//997 do
         id = id_of(cache, i)
-        assert {:ok, {^i, ^id, :probation, _, 1, :infinity}} = Maintenance.policy_row(cache, i)
+        assert {:ok, {^i, ^id, :probation, _, 1, :infinity, _}} = Maintenance.policy_row(cache, i)
       end
     end
 
@@ -1069,11 +1073,11 @@ defmodule Theine.MaintenanceTest do
       assert %{pending: 0, size: 50, weighted_size: 50} = Maintenance.info(cache)
       new_id = id_of(cache, :new)
 
-      assert {:ok, {:new, ^new_id, :window, _, 1, :infinity}} =
+      assert {:ok, {:new, ^new_id, :window, _, 1, :infinity, _}} =
                Maintenance.policy_row(cache, :new)
 
       id1 = id_of(cache, 1)
-      assert {:ok, {1, ^id1, :probation, _, 1, :infinity}} = Maintenance.policy_row(cache, 1)
+      assert {:ok, {1, ^id1, :probation, _, 1, :infinity, _}} = Maintenance.policy_row(cache, 1)
       assert Maintenance.policy_row(cache, 2) == :error
       assert Theine.get(cache, 1) == {:ok, :rewritten}
       assert Theine.get(cache, :new) == {:ok, 1}
@@ -1158,7 +1162,7 @@ defmodule Theine.MaintenanceTest do
       )
 
       for {key, _value, id, _weight, _written_at, _expires_at} <- :ets.tab2list(cache) do
-        assert {:ok, {^key, ^id, _, _, 1, :infinity}} = Maintenance.policy_row(cache, key)
+        assert {:ok, {^key, ^id, _, _, 1, :infinity, _}} = Maintenance.policy_row(cache, key)
       end
 
       # `pending` can sit below zero by one per writer per restart: an
@@ -1190,7 +1194,7 @@ defmodule Theine.MaintenanceTest do
 
       for i <- 1..110//13 do
         id = id_of(cache, i)
-        assert {:ok, {^i, ^id, nil, _, 2, :infinity}} = Maintenance.policy_row(cache, i)
+        assert {:ok, {^i, ^id, nil, _, 2, :infinity, _}} = Maintenance.policy_row(cache, i)
         assert Theine.get(cache, i) == {:ok, i}
       end
 

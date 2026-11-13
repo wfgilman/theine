@@ -139,7 +139,7 @@ Order: M7.1, M7.2, M7.3, M7.3b, M7.4. Each later task is measured against the M7
 - [x] M7.1 Per-event write cost in `mix bench maintenance` **(maintenance)** (specs/09 §`mix bench maintenance`; specs/04): a reported scenario, with no threshold, that measures what one write event costs the maintenance process. A full bounded cache (`max_size: 100_000`, filled and drained before timing), one writer for 5 s, two runs: (a) overwrites of uniformly random existing keys, (b) distinct new keys, each evicting one entry. Report puts/s and µs per event for each, as the mean of 3 runs, in the bench's summary and its JSON result. Document the scenario in `bench/README.md` and specs/09 as reported only, with a dated entry under specs/09 §Decisions. — outcome: `mix bench maintenance` prints both rows and still exits 0 at 4/4; the numbers are recorded under §Benchmark log as M7's baseline (expected near 4.2 µs and 10.5 µs on the development machine).
 - [x] M7.2 Fewer one-field struct updates on the event path **(maintenance)** **(policy)** (specs/05 §Events; specs/04 §The pass): on the `on_write`, `on_remove`, `on_access` and `evict` paths, fold one-field `%{state | k: v}` updates into the multi-field update next to them, and return the state unchanged where nothing changes (`add_segment/3` with delta 0). In `Theine.Maintenance`, fold the `evicted` update into `consumed/2`'s update. In `replace/6`, merge the two `:ets.update_element/3` calls on the key's policy row (the segment and seq written by `reorder/6`, and the id, weight and `expires_at` written by `replace/6`) into one. Add a dated entry under specs/05 §Decisions recording the one-key update cost above, so later code on the event path keeps to multi-field updates. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; M7.1's overwrite and eviction µs per event both lower than the baseline, recorded under §Benchmark log.
 - [x] M7.3 Hash each key for the sketch once **(maintenance)** **(policy)** (specs/02 §Hashing, §Operations; specs/05 §State): keep the key's sketch hash in its policy row, so that `increment` and `frequency` on a key the policy holds skip `:erlang.phash2/2`, the spread and the rehash. `Theine.Sketch` gains variants that take the stored hash, and the hash function is unchanged, so every counter is bit-identical (the sketch's property tests and `positions/2` still hold). The row shape changes, so every `@row_*` position, row pattern, `restore/5` and the test helpers that read rows move with it, and specs/05 §State is updated. The drained reads benefit too: every drained hit increments the sketch through `reorder_and_sample/5`. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4 with the mixed-run pass p99 no higher than before; M7.1's eviction µs per event lower than M7.2's, recorded under §Benchmark log. Done 2026-11-12 with the eviction outcome unmet (§Benchmark log M7.3, specs/05 §Decisions M7.3): hits identical, 4/4, pass p99 3903.76 µs against 3908.16. The policy probe has an overwrite 0.07 µs and a drained read 0.03 µs faster, and a new key unchanged (6.145 against 6.170 µs). The hash costs 55 ns, not the profile's 250 ns, and `admit?` has no row from which to take a stored hash. The new key's cost is in the `order` walk, which M7.3b takes on.
-- [ ] M7.3b One tree descent per `order` step **(maintenance)** **(policy)** (specs/05 §State, §`evict()`; added by M7.3, specs/05 §Decisions M7.3): `lru_entry/2` steps with `:ets.next/2`, then reads the key with `:ets.lookup_element/3`, so the `ordered_set` is descended twice, about 380 ns each on 100_000 rows. M7.3 measured this as most of a new key's cost. Use OTP 27's `:ets.next_lookup/2` in `lru_entry/2`, and `:ets.prev_lookup/2` in `mru/2`. In `candidate/1`, one `prev_lookup` from `base + bound + 1` replaces the exact `lookup`, the `prev` and the `lookup_element`, since the cursor's own row is the first row below that key. `previous/2` needs only the key and keeps `:ets.prev/2`. Behaviour is unchanged, so the eviction property tests and every policy test hold as they are. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; `bench/results/policy-m73.exs` (gitignored; alternating rounds against M7.3's policy) shows the new-key scenario lower in every round, and the mean is recorded under §Benchmark log. M7.4 then measures against M7.3b.
+- [x] M7.3b One tree descent per `order` step **(maintenance)** **(policy)** (specs/05 §State, §`evict()`; added by M7.3, specs/05 §Decisions M7.3): `lru_entry/2` steps with `:ets.next/2`, then reads the key with `:ets.lookup_element/3`, so the `ordered_set` is descended twice, about 380 ns each on 100_000 rows. M7.3 measured this as most of a new key's cost. Use OTP 27's `:ets.next_lookup/2` in `lru_entry/2`, and `:ets.prev_lookup/2` in `mru/2`. In `candidate/1`, one `prev_lookup` from `base + bound + 1` replaces the exact `lookup`, the `prev` and the `lookup_element`, since the cursor's own row is the first row below that key. `previous/2` needs only the key and keeps `:ets.prev/2`. Behaviour is unchanged, so the eviction property tests and every policy test hold as they are. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; `bench/results/policy-m73.exs` (gitignored; alternating rounds against M7.3's policy) shows the new-key scenario lower in every round, and the mean is recorded under §Benchmark log. M7.4 then measures against M7.3b. Done 2026-11-12 (§Benchmark log M7.3b, specs/05 §Decisions M7.3b): hits identical on every row, 4/4, new key 6.246 → 6.096 µs, lower in every round. The gain is about 40 ns per descent saved, not 380 ns: the segment ends and the cursor stay in cache. M7.4's target removes a delete at a random `order` key, which does pay the cold descent.
 - [ ] M7.4 Lazy deletion in the LRU `order` table, kept only if it pays **(maintenance)** **(policy)** (specs/05 §State, §`evict()`): a move inserts the key's new `{base + seq, key}` row and leaves the old one, and the policy row's seq is the authority. Every walk of `order` (`lru_entry`, the candidate cursor and `previous/2`, `demote`, `fitting_lru`, the climber's transfers, the `lru/2` and `mru/2` helpers) drops a row whose seq no longer matches the key's row and moves on. Stale rows must stay bounded: compact in bounded steps inside the pass, inside `pass_budget`, for example when `order` holds more than twice the live rows. A property test drives random event sequences and checks that the live order is the same as with eager deletion. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; M7.1's overwrite µs per event at least 0.3 µs lower than M7.3b's. If the gain falls short or the hit counts move, revert the code, record the measurement under §Benchmark log and in a dated specs/05 §Decisions entry, and check the task off as not taken.
 
 ## M8 Partitioned maintenance (added 2026-11-12; start after M7 is checked)
@@ -221,6 +221,43 @@ resolution, and are settled by editing the spec in the build commit that
 needs the answer (PROMPT_build.md step 5).
 
 ## Benchmark log
+
+### M7.3b — `mix bench hitrate` (full, in two runs), `mix bench maintenance` and the policy probe, tree of the M7.3b commit (2026-11-12; hitrate 19/19 and 6/6 with every row identical to the hit, maintenance 4/4)
+
+**Hits.** Every adaptive `theine` and `theine_static` row equals M7.3's table to the hit (the `hits` fields of `hitrate-7599068.json`, which names M7.3's commit with this task's working tree; the first run on OLTP, S3, P3, loop and zipf, the second on DS1):
+
+| trace | size | theine M7.3 | theine M7.3b | theine_static M7.3 | theine_static M7.3b |
+| --- | --- | --- | --- | --- | --- |
+| OLTP | 1000 | 363523 | 363523 | 324531 | 324531 |
+| OLTP | 2000 | 415352 | 415352 | 382947 | 382947 |
+| OLTP | 5000 | 504230 | 504230 | 479056 | 479056 |
+| S3 | 100000 | 1924533 | 1924533 | 1967411 | 1967411 |
+| S3 | 400000 | 6988897 | 6988897 | 6944119 | 6944119 |
+| P3 | 50000 | 1006714 | 1006714 | 1034294 | 1034294 |
+| loop | 1000 | 88007 | 88007 | 88942 | 88942 |
+| zipf | 10000 | 6403286 | 6403286 | 6446324 | 6446324 |
+| zipf | 100000 | 7971043 | 7971043 | 7973675 | 7973675 |
+| DS1 | 1000000 | 6178165 | 6178165 | 6378479 | 6378479 |
+| DS1 | 4000000 | 20052457 | 20052457 | 20066089 | 20066089 |
+| DS1 | 8000000 | 30789048 | 30789048 | 30789224 | 30789224 |
+
+**Per-event cost, policy only.** `bench/results/policy-m73.exs` (gitignored), six alternating rounds against the M7.3 policy (HEAD), 300_000 events each, `+sbt db +sbwt very_long`:
+
+| scenario | M7.3 mean µs | M7.3b mean µs | M7.3 range | M7.3b range |
+| --- | --- | --- | --- | --- |
+| overwrite | 3.097 | 3.128 | 3.026–3.171 | 3.110–3.153 |
+| drained read | 2.353 | 2.358 | 2.313–2.376 | 2.340–2.368 |
+| new key, evicting one | 6.246 | 6.096 | 6.214–6.342 | 6.069–6.138 |
+
+The new key was lower in every round: M7.3b's slowest round is below M7.3's fastest. The overwrite and the drained read do not walk `order` and stay within each other's spread. The new key saves four descents (window LRU, probation LRU, and two in the candidate lookup at a fresh cursor), so the gain is about 40 ns per descent, not the 380 ns that M7.3 timed for a random key. The ends of a segment and the cursor are descended on every event, so their path stays in cache (specs/05 §Decisions M7.3b).
+
+**`mix bench maintenance`**, `ERL_FLAGS="+sbt db +sbwt very_long"`, 4/4:
+
+| max sample (limit 1001028) | writes (write run) | passes | pass p50 us | pass p99 us | pass max us | reads (mixed) | overwrite us/event | new us/event |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1001028 | 3350112 | 9133 | 1962.48 | 4046.45 | 13403.34 | 12240925 | 4.01 | 8.02 |
+
+12.2 M mixed reads show a machine at full speed (discovered issue 10). The wall-clock per-event rows fall in the spread M7.1 measured between invocations. The policy probe above is the comparison this task gates on.
 
 ### M7.3 — `mix bench hitrate` (full, in two runs), `mix bench maintenance` and two compiled probes, tree of the M7.3 commit (2026-11-12; hitrate 19/19 and 6/6 with every row identical to the hit, maintenance 4/4)
 

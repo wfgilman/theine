@@ -43,10 +43,11 @@ ids     :set          {id, key}
   `@max_seq` (about 2.3 years at a billion moves per second, centuries at
   any rate the pass can reach; assert it in a test anyway), so `base` and
   `base + @max_seq` bound a segment and are never keys themselves. The LRU
-  end of a segment is `:ets.next(order, base(segment))` when the returned
-  key is below `base(segment) + @max_seq`; the MRU end is
-  `:ets.prev(order, base(segment) + @max_seq)` when the returned key is
-  above `base(segment)`.
+  end of a segment is `:ets.next_lookup(order, base(segment))` when the
+  returned key is below `base(segment) + @max_seq`; the MRU end is
+  `:ets.prev_lookup(order, base(segment) + @max_seq)` when the returned key
+  is above `base(segment)`. Each returns the row with the step, so finding
+  an end and its key is one descent of the tree (§Decisions M7.3b).
 - `window_weight`, `probation_weight`, `protected_weight` are integers in
   the maintenance state.
 
@@ -144,8 +145,11 @@ Called after every applied `:put` event and once in every maintenance pass
    - `candidate` = the **cursor**, which starts at probation MRU (the most
      recent window overflow, since step 1 appended them at the MRU end and
      nothing else has touched probation since) and walks toward the LRU end
-     with `:ets.prev(order, {:probation, cursor_seq})`, one step per
-     decision. Each window overflow is therefore tested exactly once, as in
+     one step per decision. The entry under the cursor is the first row
+     below `base(:probation) + cursor_seq + 1`, one `:ets.prev_lookup/2`
+     (the cursor's own row when it still exists, else the nearest one
+     below it), and the next cursor is `:ets.prev/2` from the candidate's
+     key. Each window overflow is therefore tested exactly once, as in
      Caffeine, where the candidate pointer advances after both outcomes.
    - If `candidate == victim` (probation holds one entry): evict it,
      `candidates -= 1`. Continue the loop.
@@ -557,3 +561,25 @@ the window moves, and records the answer in §Decisions. Unbounded
   `lookup_element`, about 380 ns apiece. OTP 27's `:ets.next_lookup/2`
   and `:ets.prev_lookup/2` return the row with the step, which removes the
   second descent (plan task M7.3b).
+- 2026-11-12 (M7.3b): every step of the `order` walk that needs the key
+  takes it from `:ets.next_lookup/2` or `:ets.prev_lookup/2` (OTP 27), one
+  descent of the tree instead of two: the LRU end of a segment, the MRU
+  end, and the entry under the eviction cursor. The cursor's entry was an
+  exact `lookup` of its seq, then on a miss a `prev` and a
+  `lookup_element`. It is now one `prev_lookup` from `base(:probation) +
+  cursor_seq + 1`, since the first row below that key is the cursor's own
+  row when it exists and the nearest one below it otherwise; the floor
+  check is unchanged. The next cursor position needs only a seq and keeps
+  `:ets.prev/2`. A new key that evicts one saves four descents (the window
+  LRU, the probation LRU, and two in the candidate lookup at a fresh
+  cursor). Measured with `bench/results/policy-m73.exs` (gitignored, six
+  alternating rounds against the M7.3 policy, 100_000 keys) it went from
+  6.246 to 6.096 µs, lower in every round (M7.3's 6.214–6.342 against
+  6.069–6.138), and the overwrite and drained-read scenarios, which do not
+  walk `order`, did not move. That is about 40 ns per descent saved, not
+  the 380 ns that M7.3 timed for a `lookup_element` of a random key on a
+  100_000-row `ordered_set`: the ends of a segment and the cursor are
+  descended on every event, so their path stays in cache. A random
+  `order` key, as in the LRU move's delete, still pays the cold figure.
+  Every row of `mix bench hitrate` kept its hits (IMPLEMENTATION_PLAN.md
+  §Benchmark log M7.3b).

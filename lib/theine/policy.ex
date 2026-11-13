@@ -807,28 +807,21 @@ defmodule Theine.Policy do
   # The entry under the cursor: the probation entry at the cursor's seq
   # when it still exists, else the nearest one below it, as long as it was
   # placed since the batch began. `nil` cursor means the probation MRU, `0`
-  # means the walk is over.
+  # means the walk is over. The first row below `bound + 1` is the cursor's
+  # own row when it exists, else the nearest one below, so one
+  # `prev_lookup/2` finds it in one descent (specs/05 §Decisions M7.3b).
   defp candidate(%__MODULE__{order: order, cursor: cursor, candidate_floor: floor}) do
     bound = cursor || @max_seq
 
-    found =
-      case :ets.lookup(order, @probation_base + bound) do
-        [{_order_key, key}] ->
-          {bound, key}
+    case :ets.prev_lookup(order, @probation_base + bound + 1) do
+      {order_key, [{_, key}]} when order_key > @probation_base ->
+        case order_key - @probation_base do
+          seq when is_integer(floor) and seq < floor -> nil
+          seq -> {seq, key}
+        end
 
-        [] ->
-          case :ets.prev(order, @probation_base + bound) do
-            order_key when is_integer(order_key) and order_key > @probation_base ->
-              {order_key - @probation_base, :ets.lookup_element(order, order_key, 2)}
-
-            _ ->
-              nil
-          end
-      end
-
-    case found do
-      {seq, _key} when is_integer(floor) and seq < floor -> nil
-      other -> other
+      _ ->
+        nil
     end
   end
 
@@ -1266,12 +1259,9 @@ defmodule Theine.Policy do
   def mru(%__MODULE__{order: order}, segment) when not is_nil(order) do
     base = base(segment)
 
-    case :ets.prev(order, base + @max_seq) do
-      order_key when is_integer(order_key) and order_key > base ->
-        {:ok, :ets.lookup_element(order, order_key, 2)}
-
-      _ ->
-        :error
+    case :ets.prev_lookup(order, base + @max_seq) do
+      {order_key, [{_, key}]} when order_key > base -> {:ok, key}
+      _ -> :error
     end
   end
 
@@ -1279,15 +1269,14 @@ defmodule Theine.Policy do
   defp end_of(nil), do: :error
 
   # The `{seq, key}` at the LRU end of `segment`, or nil when it is empty.
+  # `next_lookup/2` returns the row with the step: one descent of the
+  # `ordered_set`, not two (specs/05 §Decisions M7.3b).
   defp lru_entry(order, segment) do
     base = base(segment)
 
-    case :ets.next(order, base) do
-      order_key when is_integer(order_key) and order_key < base + @max_seq ->
-        {order_key - base, :ets.lookup_element(order, order_key, 2)}
-
-      _ ->
-        nil
+    case :ets.next_lookup(order, base) do
+      {order_key, [{_, key}]} when order_key < base + @max_seq -> {order_key - base, key}
+      _ -> nil
     end
   end
 

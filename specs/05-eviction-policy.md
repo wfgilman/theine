@@ -583,3 +583,28 @@ the window moves, and records the answer in §Decisions. Unbounded
   `order` key, as in the LRU move's delete, still pays the cold figure.
   Every row of `mix bench hitrate` kept its hits (IMPLEMENTATION_PLAN.md
   §Benchmark log M7.3b).
+- 2026-11-12 (M7.4, not taken): a move keeps deleting the key's old
+  `order` row (eager deletion). The plan's task left that row in place,
+  with the policy row's seq deciding which row is live, and was to be kept
+  only if an overwrite got at least 0.3 µs cheaper. It cannot. A probe
+  (`bench/results/lazy-m74.exs`, gitignored; 100_000 keys, overwrites of
+  random existing keys, alternating rounds against HEAD) measured the most
+  lazy deletion could save: with the delete removed and nothing in its
+  place (no validity check, no compaction), an overwrite went from 3.028
+  to 2.363 µs, about 0.67 µs. That is the cold descent to a random `order`
+  key that §Decisions M7.3b expected. But every move leaves one stale row,
+  and a cache whose overwrites never reach a walk (a full cache of hot
+  keys) has to compact them all. A bounded-step compaction walks `order`
+  with `next_lookup/2`, reads each key's seq from `policy` and deletes the
+  rows that do not match. At a trigger of 2 × the live rows it costs
+  0.793 µs per stale row, so the overwrite costs 0.13 µs more than with
+  eager deletion. At 3 × it costs 0.624 µs, a gain of 0.01 µs, with the
+  table at four times its size. Rebuilding `order` from `policy` in one go
+  is cheaper per row (0.899 µs at 2 ×, 0.352 µs at 3 ×, so a gain of at
+  most 0.26 µs), but a rebuild of 100_000 rows takes about 100 ms. That is
+  20 times `pass_budget`, and it cannot be split into bounded steps
+  without walking as the first form does. These numbers leave out the
+  validity check that every walk would add on new keys and drained reads,
+  so the real gain is lower than measured. The `order` table is a tree, so
+  deleting a row later costs as much as deleting it now, plus the work of
+  finding it again (IMPLEMENTATION_PLAN.md §Benchmark log M7.4).

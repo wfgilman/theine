@@ -1,7 +1,9 @@
 # 12 — Partitioned maintenance (design, settled for v2)
 
-Status: settled for v2 on 2026-11-12 (§Settled questions), not yet
-planned. Nothing in `lib/` implements it, and no other spec depends on it.
+Status: settled for v2 on 2026-11-12 (§Settled questions), planned as
+IMPLEMENTATION_PLAN.md §M8 and being built. Built so far: ids and routing
+(M8.1, `Theine.Partition`), with `partitions` fixed at 1 and not yet a
+`start_link` option.
 It is the follow-on to milestone M7: M7 lowers the cost of a write event
 inside one maintenance process, and this note lets one cache run several
 of them. It says how a cache splits its policy across `partitions`
@@ -387,3 +389,11 @@ except where noted.
   the partitioned hit is 1.10× `theine`'s p50, not 1.05×, to leave room
   for the development machine's run-to-run noise. The tracing multiset,
   not the bench, guards against an added hash or BIF.
+- 2026-11-12 (M8.1): ids and routing built. `Theine.Partition.of_key/2`
+  computes the top bits as `(phash2(key, 2^32) * n) >>> 32`, which equals
+  `h >>> (32 - log2(n))` for a power-of-two `n` and needs no logarithm;
+  the product stays below 2^38, a small integer. Partition `p > 0`'s
+  maintenance process is registered as
+  `Theine.Maintenance.<cache>.Partition<p>` (`Config.maintenance_name/2`),
+  and `config.maintenances` holds the `n` names as a tuple. `partitions`
+  stays 1 and is not an option until M8.2.

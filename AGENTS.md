@@ -43,6 +43,7 @@ lib/theine/entry.ex           entries table layout + read/write primitives (spec
 lib/theine/sketch.ex          count-min sketch over :atomics (specs/02)
 lib/theine/read_buffer.ex     striped lossy ring buffers over :atomics (specs/03)
 lib/theine/write_events.ex    write-event delivery + backpressure (specs/03)
+lib/theine/partition.ex       a key's and an id's partition, id allocation (specs/12)
 lib/theine/maintenance.ex     the one policy process (specs/04)
 lib/theine/policy.ex          W-TinyLFU over private ETS (specs/05)
 lib/theine/expiry.ex          expiration index + sweep (specs/06)

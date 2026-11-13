@@ -4,7 +4,8 @@ defmodule Theine.Owner do
   (specs/08 §Supervision tree, specs/01 §Tables and handles).
 
   `init/1` creates the public entries table and the loader's `inflight`,
-  `waiters` and `refreshing` tables (specs/07), allocates the `ids`, `pending`,
+  `waiters` and `refreshing` tables (specs/07), allocates the `ids` and
+  `pending` atomics (one counter of each per partition, specs/12), the
   `flags` and `sizes` atomics and the stats counters, plus the read buffer
   (specs/03) and the frequency sketch (specs/02) when the cache is bounded,
   and writes the completed `%Theine.Config{}` to `:persistent_term`. An
@@ -118,8 +119,11 @@ defmodule Theine.Owner do
 
     %{
       config
-      | ids: :atomics.new(1, signed: false),
-        pending: :atomics.new(1, signed: true),
+      | # One id counter and one `pending` counter per partition, partition
+        # `p` at index `p + 1` (specs/12 §Ids carry the partition, specs/03
+        # §Delivery with backpressure). One of each at `partitions: 1`.
+        ids: :atomics.new(config.partitions, signed: false),
+        pending: :atomics.new(config.partitions, signed: true),
         flags: :atomics.new(@drain_flag, signed: false),
         counters: counters,
         request_counters: request_counters,

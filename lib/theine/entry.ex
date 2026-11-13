@@ -7,8 +7,10 @@ defmodule Theine.Entry do
       {key, value, id, weight, written_at, expires_at}
         1    2      3   4       5           6
 
-  - `id`: integer ≥ 1 from the cache's id counter, a fresh one per write.
-    0 is reserved to mean "empty slot" in the read buffer.
+  - `id`: integer ≥ 1 from the id counter of the key's partition, a fresh
+    one per write, carrying the partition in its low bits
+    (`Theine.Partition.next_id/3`, specs/12). 0 is reserved to mean "empty
+    slot" in the read buffer.
   - `weight`: integer ≥ 1, from the `weight:` option, else the cache's
     weigher, else 1. An entry heavier than `max_size` is never stored.
   - `written_at`: monotonic milliseconds at write, from `Theine.Clock.now/1`.
@@ -21,7 +23,7 @@ defmodule Theine.Entry do
   entry's `expires_at`.
   """
 
-  alias Theine.{Config, Stats, WriteEvents}
+  alias Theine.{Config, Partition, Stats, WriteEvents}
 
   require Theine.Clock
 
@@ -112,9 +114,10 @@ defmodule Theine.Entry do
   end
 
   @doc """
-  The write path (specs/01 §Write path): weigh the entry, allocate an id,
-  insert the entry, then deliver `{:put, key, id, weight, expires_at}` to
-  the maintenance process.
+  The write path (specs/01 §Write path): weigh the entry, allocate an id
+  from the key's partition (no hash at `partitions: 1`), insert the entry,
+  then deliver `{:put, key, id, weight, expires_at}` to that partition's
+  maintenance process.
 
   Options: `ttl:` milliseconds or `:infinity` (default: the cache's
   `expire_after_write`), `weight:` a positive integer (default: the cache's
@@ -133,7 +136,7 @@ defmodule Theine.Entry do
       weight ->
         now = Theine.Clock.now(config.name)
         expires_at = expires_at(Keyword.get(opts, :ttl, config.expire_after_write), now)
-        id = :atomics.add_get(config.ids, 1, 1)
+        id = Partition.next_id(config.ids, config.partitions, key)
         true = :ets.insert(config.table, {key, value, id, weight, now, expires_at})
         WriteEvents.deliver(config, {:put, key, id, weight, expires_at})
     end
@@ -158,7 +161,7 @@ defmodule Theine.Entry do
   defp insert_new(%Config{table: table} = config, key, value, weight, opts) do
     now = Theine.Clock.now(config.name)
     expires_at = expires_at(Keyword.get(opts, :ttl, config.expire_after_write), now)
-    id = :atomics.add_get(config.ids, 1, 1)
+    id = Partition.next_id(config.ids, config.partitions, key)
 
     if :ets.insert_new(table, {key, value, id, weight, now, expires_at}) do
       WriteEvents.deliver(config, {:put, key, id, weight, expires_at})

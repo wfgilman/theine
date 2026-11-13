@@ -120,6 +120,14 @@ to the maintenance process, with backpressure so the mailbox stays bounded.
 
 - `pending` is an `:atomics` counter. The writer does
   `n = :atomics.add_get(pending, 1, 1)`.
+- With `partitions: n > 1` (specs/12), `pending` holds one counter per
+  partition and each partition has its own maintenance process. The event's
+  partition is `p = id &&& (n - 1)`, from the id every event carries third;
+  the writer counts it at index `p + 1` and delivers it to partition `p`'s
+  process, whose registered name is `elem(config.maintenances, p)`.
+  Everything below applies per partition, `write_hwm` included (specs/12
+  §Settled questions 2). At `partitions: 1` the writer takes the
+  unpartitioned path above, with no arithmetic on the id.
 - If `n <= write_hwm` (default 1024): `send(maintenance, event)`.
 - Else: `GenServer.call(maintenance, {:event, event}, :infinity)`. The call
   returns once the maintenance process has consumed the event. This is
@@ -283,3 +291,12 @@ new process registers, and the mutation preceded the send.
   every applied `:put`). The call-path writer therefore waits for its own
   entry's eviction, as Caffeine's writer runs `maintenance` inline when the
   write buffer is full. The slack statement itself is unchanged.
+- 2026-11-12 (M8.1): `deliver/2` routes by partition (specs/12). It has
+  two clauses: `partitions: 1` matches first and is the old path, index 1
+  of `pending` and the name in `config.maintenance`, with no arithmetic on
+  the id; with `n > 1` it takes the partition from the id (element 3 of
+  both event shapes), counts at index `p + 1` and sends to
+  `elem(config.maintenances, p)`. Partition 0 keeps the unpartitioned
+  name, so tests and tools that address `Theine.Maintenance.name/1` see
+  the same process. Until M8.2 starts the other partitions' processes, the
+  `n > 1` clause runs only in tests that build a config by hand.

@@ -13,7 +13,10 @@ defmodule Theine.Config do
 
   Registered names are atoms derived from the cache name
   (`Theine.Maintenance.my_cache`), because write events are delivered with
-  `send/2`, which needs a local atom name (specs/08 §Decisions). The
+  `send/2`, which needs a local atom name (specs/08 §Decisions). The names
+  of the `partitions` maintenance processes are held as a tuple in
+  `maintenances`, partition 0 under the name in `maintenance` (specs/12
+  §Supervision); `partitions` is 1 until it becomes an option. The
   loader's `inflight`, `waiters` and `refreshing` tables are named the
   same way.
   """
@@ -62,8 +65,10 @@ defmodule Theine.Config do
           eviction_listener: boolean(),
           test_hooks: boolean(),
           policy_module: module(),
+          partitions: pos_integer(),
           table: cache(),
           maintenance: atom(),
+          maintenances: tuple(),
           task_supervisor: atom(),
           inflight: atom(),
           waiters: atom(),
@@ -110,8 +115,10 @@ defmodule Theine.Config do
             eviction_listener: false,
             test_hooks: false,
             policy_module: Theine.Policy,
+            partitions: 1,
             table: nil,
             maintenance: nil,
+            maintenances: nil,
             task_supervisor: nil,
             inflight: nil,
             waiters: nil,
@@ -197,14 +204,19 @@ defmodule Theine.Config do
         raise ArgumentError, "unknown option #{inspect(key)} given to Theine.start_link/1"
     end
 
-    name = fetch!(opts, :name)
+    # The name is validated first: every registered name derives from it.
+    name = validate!(:name, fetch!(opts, :name))
     max_size = fetch!(opts, :max_size)
 
+    # `partitions` is not a `start_link` option yet (IMPLEMENTATION_PLAN.md
+    # M8.2): every cache has one partition, whose maintenance process keeps
+    # today's name.
     base = %__MODULE__{
       name: name,
       max_size: max_size,
       table: name,
-      maintenance: Module.concat(Theine.Maintenance, name),
+      maintenance: maintenance_name(name, 0),
+      maintenances: maintenance_names(name, 1),
       task_supervisor: Module.concat(Theine.TaskSupervisor, name),
       # The single-flight tables of Theine.Loader (specs/07 §Single-flight),
       # named so that a restarted Owner recreates them under the same atom.
@@ -221,9 +233,38 @@ defmodule Theine.Config do
       Map.put(config, key, validate!(key, value))
     end)
     |> then(fn config ->
-      %{config | name: validate!(:name, name), max_size: validate!(:max_size, max_size)}
+      %{config | max_size: validate!(:max_size, max_size)}
     end)
     |> check_policy_module!()
+  end
+
+  @doc """
+  The registered name of partition `p`'s maintenance process. Partition 0
+  keeps the name an unpartitioned cache has always used, so `n = 1` is
+  unchanged (specs/12 §Supervision).
+
+      iex> Theine.Config.maintenance_name(:sessions, 0)
+      :"Elixir.Theine.Maintenance.sessions"
+      iex> Theine.Config.maintenance_name(:sessions, 3)
+      :"Elixir.Theine.Maintenance.sessions.Partition3"
+  """
+  @spec maintenance_name(cache(), non_neg_integer()) :: atom()
+  def maintenance_name(cache, 0) when is_atom(cache), do: Module.concat(Theine.Maintenance, cache)
+
+  def maintenance_name(cache, p) when is_atom(cache) and is_integer(p) and p > 0,
+    do: Module.concat([Theine.Maintenance, cache, "Partition#{p}"])
+
+  @doc """
+  The registered names of a cache's `n` maintenance processes as a tuple,
+  partition `p` at `elem(names, p)`, so a write event reaches its partition
+  with no list walk and no atom built at run time (specs/12 §Supervision).
+
+      iex> Theine.Config.maintenance_names(:sessions, 1)
+      {:"Elixir.Theine.Maintenance.sessions"}
+  """
+  @spec maintenance_names(cache(), pos_integer()) :: tuple()
+  def maintenance_names(cache, n) when is_atom(cache) and is_integer(n) and n > 0 do
+    0..(n - 1)//1 |> Enum.map(&maintenance_name(cache, &1)) |> List.to_tuple()
   end
 
   defp check_policy_module!(%__MODULE__{policy_module: Theine.Policy} = config), do: config

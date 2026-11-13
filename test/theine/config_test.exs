@@ -53,6 +53,20 @@ defmodule Theine.ConfigTest do
     assert Enum.all?([config.ids, config.pending, config.flags, config.counters], &is_nil/1)
   end
 
+  test "has one partition, whose maintenance name is today's, and is not an option yet" do
+    config = Config.new!(@required)
+
+    assert config.partitions == 1
+    assert config.maintenances == {config.maintenance}
+    refute :partitions in Config.options()
+
+    assert Config.maintenance_names(:config_test, 4) ==
+             {:"Elixir.Theine.Maintenance.config_test",
+              :"Elixir.Theine.Maintenance.config_test.Partition1",
+              :"Elixir.Theine.Maintenance.config_test.Partition2",
+              :"Elixir.Theine.Maintenance.config_test.Partition3"}
+  end
+
   test "every option is accepted with a valid value" do
     weigher = fn _k, _v -> 2 end
     loader = fn _k -> {:ignore, nil} end

@@ -30,7 +30,7 @@ defmodule Theine.WriteEvents do
   (specs/04 §Restart semantics).
   """
 
-  alias Theine.{Config, Entry}
+  alias Theine.{Config, Entry, Partition}
 
   @type event ::
           {:put, Entry.key(), Entry.id(), Entry.weight(), Entry.expires_at()}
@@ -41,13 +41,39 @@ defmodule Theine.WriteEvents do
   process: by `send/2` while `pending` is at most `write_hwm`, otherwise by a
   call that returns once the event has been consumed. Returns `:ok`, also
   when the maintenance process is restarting and the event is lost.
+
+  With `partitions: n > 1` the event goes to the partition its id carries,
+  `Theine.Partition.of_id/2`, and is counted in that partition's `pending`.
+  At `partitions: 1` the path is the unpartitioned one, with no arithmetic
+  on the id.
   """
   @spec deliver(Config.t(), event()) :: :ok
-  def deliver(%Config{pending: pending, maintenance: maintenance, write_hwm: hwm}, event) do
+  def deliver(
+        %Config{partitions: 1, pending: pending, maintenance: maintenance, write_hwm: hwm},
+        event
+      ) do
     if :atomics.add_get(pending, 1, 1) <= hwm do
       send_event(maintenance, event)
     else
       call_event(maintenance, event)
+    end
+  end
+
+  # With `n` partitions the event's id names its partition `p` (both event
+  # shapes carry the id third), whose `pending` counter is at index `p + 1`
+  # and whose maintenance process is `elem(maintenances, p)` (specs/12 §Ids
+  # carry the partition). `write_hwm` applies per partition (specs/12
+  # §Settled questions 2).
+  def deliver(
+        %Config{partitions: n, pending: pending, maintenances: names, write_hwm: hwm},
+        event
+      ) do
+    p = Partition.of_id(elem(event, 2), n)
+
+    if :atomics.add_get(pending, p + 1, 1) <= hwm do
+      send_event(elem(names, p), event)
+    else
+      call_event(elem(names, p), event)
     end
   end
 

@@ -40,6 +40,9 @@ write-once, read-always.
 
 - `id`: integer ≥ 1 from the cache's `:atomics` id counter, `add_get/3`.
   A new id per write. 0 is reserved to mean "empty slot" in the read buffer.
+  With `n > 1` partitions each partition has its own counter and its ids
+  carry the partition in their low bits (§Write path, specs/12); ids are
+  increasing per key, which is the only order the specs rely on.
 - `weight`: integer ≥ 1 from the weigher (default 1). Entries heavier than
   `max_size` are never admitted (specs/05).
 - `written_at`: `System.monotonic_time(:millisecond)` at write.
@@ -92,6 +95,8 @@ The reader found an entry past its `expires_at`. It:
    concurrent `put` has already replaced the tuple (different id), so this
    never deletes a fresh value. This is the only write a read may perform.
 2. Sends the write event `{:removed, key, id}` (specs/03 §Write events).
+   With `n > 1` partitions the event goes to partition `id &&& (n - 1)`;
+   the reader holds the id, so it does no hashing (specs/12).
 3. Increments both the miss counter and the expirations counter, and
    returns `:error`.
 
@@ -100,7 +105,12 @@ The reader found an entry past its `expires_at`. It:
 1. Resolve config. Compute `weight` via the weigher if one is configured.
    If `weight > max_size`, do not store; return `:ok` (Caffeine's semantics:
    oversized entries are rejected silently). Document it; test it.
-2. `id = :atomics.add_get(config.ids, 1, 1)`.
+2. `id = Theine.Partition.next_id(config.ids, config.partitions, key)`:
+   `:atomics.add_get(config.ids, 1, 1)` at `partitions: 1`, with no hash of
+   the key; with `n > 1` partitions, `:atomics.add_get(ids, p + 1, 1) * n + p`
+   for the key's partition `p`, the top `log2(n)` bits of
+   `:erlang.phash2(key, 2^32)`, so that `id &&& (n - 1) == p` (specs/12 §The
+   partition of a key, §Ids carry the partition).
 3. `expires_at` from `ttl:` option, else the cache's `expire_after_write`,
    else `:infinity`. `written_at = now`.
 4. `:ets.insert(table, {key, value, id, weight, written_at, expires_at})`.
@@ -192,3 +202,12 @@ are emptied before `clear/1` returns.
   ETS. The A1/A2 figures themselves were reset at the same time (specs/00
   §Decisions). Unbounded caches have no read buffer and keep the counter
   op on a hit; `stats: false` removes it there.
+- 2026-11-12 (M8.1): ids are allocated by `Theine.Partition.next_id/3`,
+  for `put/4`, `put_new/4` and a loader's commit alike (specs/12 §Ids carry
+  the partition). Its `n = 1` clause is the old `:atomics.add_get(ids, 1,
+  1)` and does not hash the key, so `put/4`'s traced multiset is unchanged
+  and partition_test traces `:erlang` to show that no `phash2` runs. The
+  cost at `n = 1` is one remote call on the write path, about 9 ns by this
+  spec's M1.2 figures, against a put of about 1 µs; the read path is
+  untouched. `ids` and `pending` are allocated with one counter per
+  partition, which at `n = 1` is the one counter each had before.

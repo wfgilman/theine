@@ -83,7 +83,7 @@ list is the contract.
   loader is a function; what it calls is the user's business.
 - Weak/soft references, cache-wide locks, transactions.
 - Partitioned maintenance (several policy processes per cache, to raise the
-  sustained write ceiling of specs/03). Drafted for v2 in specs/12.
+  sustained write ceiling of specs/03). Settled for v2 in specs/12.
 
 ## Mapping to Caffeine (for anyone who knows it)
 
@@ -242,5 +242,6 @@ list is the contract.
   so tuning one maintenance process cannot multiply a cache's write
   ceiling. The note splits the policy across `partitions` processes over
   one entries table and carries the partition in the id, so a hit needs
-  no hash. It leaves six questions for a human, among them the A5 slack
-  for `n > 1`. No code changed.
+  no hash. Its six open questions were settled the same day (specs/12
+  §Settled questions), among them the A5 slack for `n > 1`:
+  `max_size + n * write_hwm + writers`. No code changed.

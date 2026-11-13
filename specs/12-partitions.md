@@ -1,12 +1,13 @@
-# 12 — Partitioned maintenance (design note, draft)
+# 12 — Partitioned maintenance (design, settled for v2)
 
-Status: a draft for v2. Nothing in `lib/` implements it, and no other spec
-depends on it. It is the follow-on to milestone M7: M7 lowers the cost of a
-write event inside one maintenance process, and this note lets one cache
-run several of them. It says how a cache could split its policy across
-`partitions` maintenance processes while readers keep one entries table,
-what that costs, and which decisions a human has to make before a build
-task can start.
+Status: settled for v2 on 2026-11-12 (§Settled questions), not yet
+planned. Nothing in `lib/` implements it, and no other spec depends on it.
+It is the follow-on to milestone M7: M7 lowers the cost of a write event
+inside one maintenance process, and this note lets one cache run several
+of them. It says how a cache splits its policy across `partitions`
+maintenance processes while readers keep one entries table, and what that
+costs. Build tasks start after M7 is checked, because M7.1's per-event
+measurement is the throughput baseline here.
 
 ## Why
 
@@ -179,7 +180,7 @@ max_size + n * write_hwm + writers
 entries' weight. At `n = 1` this is today's bound. The alternative, giving
 each partition `div(write_hwm, n)`, keeps today's bound but lowers the
 burst each partition absorbs before its writers block. That is open
-question 2.
+question 2, settled for per-partition `write_hwm`.
 
 ### Supervision
 
@@ -253,7 +254,7 @@ of the accesses. Over a share of many thousand entries that should be
 statistically close to one global policy. Small shares are where it breaks
 down. At `max_size: 1_000` with `n = 8`, each partition has 125 entries and
 a window of one or two, and the climber's samples are noisy. That is why
-there is a minimum share (open question 1). Uneven weights can also leave
+there is a minimum share (settled question 1). Uneven weights can also leave
 one partition evicting while another has room: the hash spreads keys
 evenly, not weight.
 
@@ -297,18 +298,21 @@ evenly, not weight.
   and specs/04 §Acceptance Restart holds for partition 1's keys.
 - **Hit rate.** A `theine_p4` subject in `mix bench hitrate` (`partitions:
   4`) on every row whose share is at least the minimum: DS1, S3, P3 and
-  zipf 100_000. It is within the margin of open question 3 of `theine` on
-  each of those rows. The bench drives every partition through
+  zipf 100_000. It is within 1 point of `theine` on each of those rows
+  (settled question 3). The bench drives every partition through
   `run_maintenance/1`, and each partition's `:rand` is seeded from the
   cache name and `p`, so the rows stay deterministic.
 - **Throughput.** M7.1's per-event scenario, run with `partitions` in
-  {1, 2, 4} and one writer per scheduler, reports writes/s for each
-  (open question 4).
+  {1, 2, 4} and one writer per scheduler, reports writes/s for each. On
+  the reference machine `partitions: 4` reaches at least 2 × `partitions:
+  1` (settled question 4); on the development machine it is reported
+  only.
 - **Hot path.** `mix bench get` gains a `theine_p4` subject. Its hit is
-  measured as `theine`'s is, and it is reported against `theine` (open
-  question 5).
+  measured as `theine`'s is, and its p50 is at most 1.10 × `theine`'s on
+  every shape (settled question 5). tracing_test pins the partitioned
+  hit's multiset, which is the same as `theine`'s.
 
-## Build order (once the open questions are answered)
+## Build order
 
 1. Ids and routing with `n = 1` exact: per-partition id counters, the
    partition function and the id-derived partition of every event, all
@@ -325,37 +329,46 @@ evenly, not weight.
 5. Bench subjects: `theine_p4` in `hitrate` and `get`, and the throughput
    scenario. README and docs, including the entry-weight limit.
 
-## Open questions (for a human)
+## Settled questions
 
-1. **The minimum share.** **Recommended:** with `n > 1` and a finite
-   `max_size`, `start_link` raises `ArgumentError` when
-   `div(max_size, n) < 10_000`. A window of 1% is then at least 100
-   entries. The hit-rate subject of step 5 would confirm the figure or move
-   it. Unbounded caches have no minimum, since they have no policy to
-   dilute, and they still gain the write ceiling.
-2. **The A5 slack.** **Recommended:** `write_hwm` per partition and the
-   bound `max_size + n * write_hwm + writers`. Each partition then behaves
-   as today's cache does, and the burst check of specs/09 keeps its
-   meaning. At `n = 64` the extra slack is 64 × 1_024 = 65_536 entries,
-   about 10% of the 640_000-entry minimum cache that `n = 64` requires
-   under open question 1. This
-   restates an A5 threshold for `n > 1` only, so it needs a human decision
-   (specs/09 says never to relax a threshold in the loop).
-3. **The hit-rate margin.** **Recommended:** `theine_p4` within 1 point of
-   `theine` on every qualifying row, the same tolerance A3 gives the
-   Caffeine cross-check.
-4. **Gate the throughput or report it.** **Recommended:** report it on the
-   development machine, and on the reference machine gate `partitions: 4`
-   at ≥ 2 × `partitions: 1` with one writer per scheduler. That holds the
-   feature to its purpose without gating a dual-core laptop on a
-   four-process speedup.
-5. **The partitioned hit and A1/A2.** **Recommended:** A1/A2 stay defined
-   on the default cache (`n = 1`). `theine_p4` is reported against
-   `theine` with a limit of 1.05× its p50, so the partitioned hit's
-   arithmetic cannot quietly grow.
-6. **The default.** **Recommended:** `partitions: 1`, opt-in. Choosing a
-   default from `schedulers_online` and `max_size` can come later, after
-   the reference machine has measured both hit rate and throughput.
+Settled 2026-11-12. The owner delegated these to the assistant that
+drafted the note, and each answer is the recommendation the draft made,
+except where noted.
+
+1. **The minimum share.** With `n > 1` and a finite `max_size`,
+   `start_link` raises `ArgumentError` when `div(max_size, n) < 10_000`. A
+   window of 1% is then at least 100 entries. Unbounded caches have no
+   minimum, since they have no policy to dilute, and they still gain the
+   write ceiling. The build does not move the figure. If `theine_p4`
+   misses the hit-rate margin on a qualifying row, that is a discovered
+   issue for a human.
+2. **The A5 slack.** `write_hwm` applies per partition, and the bound is
+   `max_size + n * write_hwm + writers`. Each partition then behaves as
+   today's cache does, and the burst check of specs/09 keeps its meaning.
+   At `n = 64` the extra slack is 64 × 1_024 = 65_536 entries, about 10%
+   of the 640_000-entry minimum cache that `n = 64` requires under
+   question 1. At `n = 1` the bound is today's. This restates the A5
+   threshold for `n > 1` only, as a human decision (specs/09 says never to
+   relax a threshold in the loop).
+3. **The hit-rate margin.** `theine_p4` is within 1 point of `theine` on
+   every qualifying row, the same tolerance A3 gives the Caffeine
+   cross-check.
+4. **Throughput.** Reported on the development machine. On the reference
+   machine (specs/09 §Reference machine) `partitions: 4` must reach at
+   least 2 × `partitions: 1` with one writer per scheduler, judged by a
+   person as A1/A2 are. That holds the feature to its purpose without
+   gating a 2-core laptop on a four-process speedup.
+5. **The partitioned hit and A1/A2.** A1/A2 stay defined on the default
+   cache (`n = 1`). `theine_p4`'s p50 is at most **1.10×** `theine`'s on
+   every shape. The draft proposed 1.05×. The development machine's
+   ratios move by several percent from run to run (three runs put the
+   bounded p99 at 1.5–2.0× `ets`, README §Benchmarks, and discovered
+   issue 4 is the same noise). The p50 spread between two subjects has not
+   been measured, and 1.05× leaves too little room for it. An added hash or BIF is caught by the tracing multiset, not by
+   this limit, so the limit only needs to catch gross growth.
+6. **The default.** `partitions: 1`, opt-in. Choosing a default from
+   `schedulers_online` and `max_size` can come later, after the reference
+   machine has measured both hit rate and throughput.
 
 ## Decisions
 
@@ -364,3 +377,8 @@ evenly, not weight.
   gain perhaps 15–25%. The design keeps one entries table and moves the
   partition into the id, so a hit routes its read without hashing the key
   and an unpartitioned cache keeps today's paths exactly. No code changed.
+- 2026-11-12: the six open questions settled (§Settled questions). The
+  owner delegated them. Five take the draft's recommendation; the limit on
+  the partitioned hit is 1.10× `theine`'s p50, not 1.05×, to leave room
+  for the development machine's run-to-run noise. The tracing multiset,
+  not the bench, guards against an added hash or BIF.

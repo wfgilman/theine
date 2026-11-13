@@ -80,7 +80,8 @@ Order, matching Caffeine:
    (specs/05 §Adaptive window).
 8. Record pass duration and queue depths in the maintenance state and emit
    `[:theine, :maintenance, :pass]` telemetry with measurements
-   `%{duration: native, reads: n, writes: n, expired: n, evicted: n}`;
+   `%{duration: native, reads: n, writes: n, expired: n, evicted: n}` and
+   metadata `%{cache: name, partition: p}`;
    `writes` and `evicted` count since the previous pass, on arrival and in
    this pass alike.
 
@@ -223,7 +224,7 @@ and `p`; partition 0 keeps the cache name's seed.
     the previous pass, on arrival and in step 1, so with the mailbox idle
     before a pass it is exactly what step 1 consumed; `expired` is 0 until
     `Theine.Expiry.sweep/2` lands (M3.1); `duration` is in native units.
-    The event's metadata is `%{cache: name}`.
+    The event's metadata is `%{cache: name, partition: p}` (M8.3).
   - Sketch aging (step 6) is the maintenance process's own: it keeps the
     cursor (`nil` or `Theine.Sketch.reset_cursor/0`) in its state, reported
     by `info/1` as `sketch.reset`, starts a reset when the policy's
@@ -289,7 +290,8 @@ and `p`; partition 0 keeps the cache name's seed.
   - The scan also runs on a fresh start, over an empty table, so there is
     one code path and one `[:theine, :maintenance, :rebuild]` event per
     maintenance start (measurements `%{duration: native, entries: n,
-    chunks: n}`, metadata `%{cache: name}`; specs/08 §Telemetry). The
+    chunks: n}`, metadata `%{cache: name, partition: p}`; specs/08
+    §Telemetry). The
     event is how a test, or an operator, sees that a restart happened and
     what it cost.
   - Step 4 goes through `ReadBuffer.schedule_drain/1`: the flag was
@@ -467,3 +469,10 @@ and `p`; partition 0 keeps the cache name's seed.
   take a partition and default to 0; `policy_row/2` asks the key's own
   partition. The pass and rebuild telemetry metadata are unchanged until
   M8.3 adds `partition`.
+- 2026-11-13 (M8.3): the `[:theine, :maintenance, :pass]` and
+  `[:theine, :maintenance, :rebuild]` metadata is `%{cache: name,
+  partition: p}`, with `p` 0 in a cache of one partition (specs/12 §Calls
+  that span partitions). The key is added, not changed, so a handler that
+  matches `%{cache: c}` still matches. A partitioned cache's `clear/1`
+  calls `reset/2`, and its `run_maintenance/1` calls `run/2`, on
+  partitions 0 to `n - 1` in order, each after the previous call returned.

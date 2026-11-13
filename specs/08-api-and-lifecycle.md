@@ -77,6 +77,12 @@ All take the cache `name` as first argument. `key` and `value` are any term.
 atomics counter maintained by the maintenance process, never
 `:ets.info(_, :size)`, which is slow with decentralized counters.
 
+With `partitions: n > 1` (specs/12 §Calls that span partitions), `size/1`
+and `weighted_size/1` sum the `n` partitions' fields, `clear/1` empties the
+table and then resets each partition in turn, and `run_maintenance/1` runs
+one pass of each partition in order, returning after the last. The other
+calls are per key and unchanged.
+
 Return conventions: `{:ok, v} | :error` mirrors `Map.fetch/2`; `{:error,
 reason}` only where a reason exists (loads). No bang variants in v1.
 
@@ -138,6 +144,8 @@ Emitted off the hot path only:
 - `[:theine, :maintenance, :rebuild]` once per maintenance start, with the
   restart rebuild's `duration`, `entries` and `chunks` (specs/04 §Restart
   semantics, §Decisions M2.9).
+- Both carry `%{cache: name, partition: p}` metadata, `p` being the
+  emitting process's partition, 0 in a cache of one partition (M8.3).
 - `[:theine, :load, :start | :stop | :exception]` around a loader call made
   by a claimant or a refresh task, with `%{cache: name}` metadata and the
   key omitted.
@@ -296,3 +304,10 @@ specs/09.
   process sets it in its own copy (specs/04 §Decisions M8.2). Until M8.3,
   `size/1`, `weighted_size/1`, `clear/1` and `run_maintenance/1` of a
   partitioned cache act on partition 0 only.
+- 2026-11-13 (M8.3): the calls that span partitions (§Calls) and the
+  `partition` telemetry metadata (§Telemetry). At `n = 1`, `size/1` and
+  `weighted_size/1` keep their one-field read through a `partitions: 1`
+  clause; with `n > 1` they read the `2n` fields one at a time, so the sum
+  is not a snapshot, which "as last seen by maintenance" already allows.
+  `Theine.Maintenance.info/1` stays partition 0's, as specs/12 says, so
+  existing tests read the same thing; there is no cache-wide `info`.

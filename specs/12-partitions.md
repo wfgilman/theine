@@ -412,3 +412,7 @@ except where noted.
   exists from M8.2, because the isolation tests read each partition;
   M8.3 still owns the calls that span partitions and the telemetry
   metadata.
+- 2026-11-13 (M8.3): the calls that span partitions built as §Calls that
+  span partitions states them (specs/04, 08 §Decisions M8.3). The pass and
+  rebuild metadata gain `partition` at every `n`. A test drives every call
+  of specs/08 §Calls on an unbounded `partitions: 4` cache.

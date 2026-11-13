@@ -615,8 +615,9 @@ defmodule Theine do
 
   @doc """
   Removes every entry and returns `:ok` once the maintenance process has
-  forgotten them too, so `size/1` reads 0 afterwards. The cache's
-  configuration and statistics are untouched.
+  forgotten them too, so `size/1` reads 0 afterwards. With `partitions: n`
+  the maintenance processes are reset one after another, once the table is
+  empty. The cache's configuration and statistics are untouched.
 
       iex> {:ok, _} = Theine.start_link(name: :clear_doc, max_size: :infinity)
       iex> Theine.put(:clear_doc, :a, 1)
@@ -628,10 +629,14 @@ defmodule Theine do
   """
   @spec clear(cache()) :: :ok
   def clear(cache) do
-    %{table: table} = :persistent_term.get(cache)
+    %{table: table, partitions: n} = :persistent_term.get(cache)
     true = :ets.delete_all_objects(table)
-    Theine.Maintenance.reset(cache)
+    each_partition(n, &Theine.Maintenance.reset(cache, &1))
   end
+
+  # Calls `fun` on partitions 0 to n - 1 in order, each after the previous
+  # one returned (specs/12 §Calls that span partitions).
+  defp each_partition(n, fun), do: Enum.each(0..(n - 1), fun)
 
   @doc """
   Sets a new expiry for an existing `key`, `ms` milliseconds from now or
@@ -692,7 +697,8 @@ defmodule Theine do
 
   @doc """
   Number of entries as last seen by the maintenance process: writes it has
-  not yet consumed are not counted. Never reads `:ets.info/2`.
+  not yet consumed are not counted. Never reads `:ets.info/2`. With
+  `partitions: n` it is the sum of the `n` processes' counts.
 
       iex> {:ok, _} = Theine.start_link(name: :size_doc, max_size: :infinity)
       iex> Theine.put(:size_doc, :a, 1)
@@ -703,11 +709,15 @@ defmodule Theine do
   """
   @spec size(cache()) :: non_neg_integer()
   def size(cache) do
-    Policy.size(:persistent_term.get(cache).sizes)
+    case :persistent_term.get(cache) do
+      %{partitions: 1, sizes: sizes} -> Policy.size(sizes)
+      %{partitions: n, sizes: sizes} -> sum_partitions(n, &Policy.size(sizes, &1))
+    end
   end
 
   @doc """
-  Sum of the entry weights as last seen by the maintenance process.
+  Sum of the entry weights as last seen by the maintenance process, or by
+  the `n` processes together with `partitions: n`.
 
       iex> {:ok, _} = Theine.start_link(name: :weighted_doc, max_size: :infinity)
       iex> Theine.put(:weighted_doc, :a, 1, weight: 3)
@@ -718,8 +728,15 @@ defmodule Theine do
   """
   @spec weighted_size(cache()) :: non_neg_integer()
   def weighted_size(cache) do
-    Policy.weighted_size(:persistent_term.get(cache).sizes)
+    case :persistent_term.get(cache) do
+      %{partitions: 1, sizes: sizes} -> Policy.weighted_size(sizes)
+      %{partitions: n, sizes: sizes} -> sum_partitions(n, &Policy.weighted_size(sizes, &1))
+    end
   end
+
+  # Each partition publishes its own fields in the shared `sizes` atomics
+  # (specs/12 §Calls that span partitions); the reads are not one snapshot.
+  defp sum_partitions(n, read), do: Enum.reduce(0..(n - 1), 0, &(read.(&1) + &2))
 
   @doc """
   Returns the cache's statistics as a `%Theine.Stats{}`: `hits`, `misses`,
@@ -750,12 +767,15 @@ defmodule Theine do
   @doc """
   Runs one full maintenance pass and returns `:ok` when it is complete. For
   tests and benchmarks. Write events the caller sent before calling are
-  applied before the pass.
+  applied before the pass. With `partitions: n` each partition runs one
+  pass, partition 0 first, and the call returns after the last.
 
       iex> {:ok, _} = Theine.start_link(name: :run_doc, max_size: :infinity)
       iex> Theine.run_maintenance(:run_doc)
       :ok
   """
   @spec run_maintenance(cache()) :: :ok
-  def run_maintenance(cache), do: Theine.Maintenance.run(cache)
+  def run_maintenance(cache) do
+    each_partition(:persistent_term.get(cache).partitions, &Theine.Maintenance.run(cache, &1))
+  end
 end

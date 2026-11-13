@@ -25,7 +25,9 @@ defmodule Theine.Maintenance do
   is done; a rebuilt cache over `max_size` schedules a `:drain` so the next
   pass evicts. One `[:theine, :maintenance, :rebuild]` event reports the
   scan's `duration`, `entries` and `chunks`. A fresh start scans an empty
-  table. Write events
+  table. The metadata of both `[:theine, :maintenance, :rebuild]` and
+  `[:theine, :maintenance, :pass]` is `%{cache: cache, partition: p}`,
+  with `p` 0 in a cache of one partition. Write events
   (`{:put, key, id, weight, expires_at}` and `{:removed, key, id}`,
   specs/03) are applied to the policy as they arrive and decrement `pending`
   per event; nothing waits for a pass (specs/04 §The pass). A `:put` is
@@ -274,7 +276,8 @@ defmodule Theine.Maintenance do
   window's limits and sample (`Theine.Policy.climber/1`), the read
   buffer's shape and lag (specs/03) and the sketch's size, increments since
   its last reset and the cursor of a reset in progress; those four are
-  `nil` for `max_size: :infinity`.
+  `nil` for `max_size: :infinity`. In a cache started with `partitions: n
+  > 1` this is partition 0's process only; `info/2` reads another.
 
       Theine.Maintenance.info(:sessions)
       #=> %{cache: :sessions, passes: 0, last_pass_duration: nil, pending: 0, call_writes: 0,
@@ -370,7 +373,7 @@ defmodule Theine.Maintenance do
     :telemetry.execute(
       [:theine, :maintenance, :rebuild],
       %{duration: duration, entries: n, chunks: chunks},
-      %{cache: state.cache}
+      %{cache: state.cache, partition: config.partition}
     )
 
     # Step 4: over capacity, the next pass must evict. The flag was cleared
@@ -672,7 +675,7 @@ defmodule Theine.Maintenance do
         expired: expired,
         evicted: state.evicted + evicted
       },
-      %{cache: state.cache}
+      %{cache: state.cache, partition: config.partition}
     )
 
     %{

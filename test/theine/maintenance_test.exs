@@ -1373,6 +1373,50 @@ defmodule Theine.MaintenanceTest do
       end
     end
 
+    test "pass and rebuild events carry the partition, at n = 1 too" do
+      one = unique_cache()
+      attach_rebuild_handler(one)
+      start_supervised!({Theine, [name: one, max_size: :infinity] ++ @quiet}, id: one)
+      attach_pass_handler(one)
+
+      # An added key, so a handler matching `%{cache: c}` still matches.
+      assert_receive {:rebuild, %{entries: 0}, %{cache: ^one, partition: 0} = metadata}
+      assert map_size(metadata) == 2
+      :ok = Maintenance.run(one)
+      assert_receive {:pass, _, %{cache: ^one, partition: 0} = metadata, _}
+      assert map_size(metadata) == 2
+
+      cache = unique_cache()
+      # The rebuild handler attached above forwards every cache's events.
+      start_partitioned(cache)
+      attach_pass_handler(cache)
+
+      for p <- 0..(@partitions - 1),
+          do: assert_receive({:rebuild, %{entries: 0}, %{cache: ^cache, partition: ^p}})
+
+      for key <- 1..400, do: Theine.put(cache, key, key)
+      Theine.run_maintenance(cache)
+
+      # One pass per partition, each counting its own partition's writes.
+      writes =
+        for p <- 0..(@partitions - 1) do
+          assert_receive {:pass, %{writes: writes}, %{cache: ^cache, partition: ^p}, _}
+          assert writes == Enum.count(1..400, &(Partition.of_key(&1, @partitions) == p))
+          writes
+        end
+
+      assert Enum.sum(writes) == 400
+      refute_received {:pass, _, %{cache: ^cache}, _}
+
+      # A restart's rebuild names the restarted partition and counts its
+      # own entries only.
+      own = map_size(table_of(cache, 2))
+      old = Process.whereis(Maintenance.name(cache, 2))
+      Process.exit(old, :kill)
+      assert_receive {:rebuild, %{entries: ^own}, %{cache: ^cache, partition: 2}}, 1_000
+      for p <- [0, 1, 3], do: refute_received({:rebuild, _, %{cache: ^cache, partition: ^p}})
+    end
+
     test "4 writers' put, get, delete and expire over 100_000 keys lose no event" do
       cache = unique_cache()
       start_partitioned(cache)

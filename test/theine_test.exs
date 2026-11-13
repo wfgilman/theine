@@ -644,6 +644,203 @@ defmodule TheineTest do
     end
   end
 
+  describe "partitions: 4 (specs/12 §Calls that span partitions)" do
+    @partitions 4
+
+    defp start_partitioned(extra \\ []) do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine,
+         [name: cache, max_size: :infinity, partitions: @partitions, maintenance_interval: 60_000] ++
+           extra}
+      )
+
+      cache
+    end
+
+    defp infos(cache), do: for(p <- 0..(@partitions - 1), do: Theine.Maintenance.info(cache, p))
+
+    # Every event any process delivered has been applied: `pending` is
+    # decremented only once its event is (specs/03 §Delivery with
+    # backpressure), and the sizes are published as it is applied.
+    defp idle!(cache) do
+      pending = Config.get(cache).pending
+      assert_eventually(fn -> Enum.all?(1..@partitions, &(:atomics.get(pending, &1) == 0)) end)
+    end
+
+    defp table_weight(cache), do: cache |> :ets.tab2list() |> Enum.map(&elem(&1, 3)) |> Enum.sum()
+
+    # Forwards the attached cache's pass events as `{:pass, partition}`.
+    def handle_pass(_event, _measurements, %{cache: cache, partition: p}, {test, cache}),
+      do: send(test, {:pass, p})
+
+    def handle_pass(_event, _measurements, _metadata, _config), do: :ok
+
+    test "size/1 of a partitioned cache equals the table size once idle" do
+      cache = start_partitioned()
+
+      1..4
+      |> Enum.map(fn w ->
+        Task.async(fn ->
+          for key <- w..4_000//4, do: Theine.put(cache, key, key, weight: rem(key, 3) + 1)
+          for key <- w..4_000//28, do: Theine.delete(cache, key)
+        end)
+      end)
+      |> Task.await_many()
+
+      idle!(cache)
+      entries = :ets.info(cache, :size)
+      assert entries == 4_000 - length(Enum.to_list(1..4_000//7))
+
+      assert Theine.size(cache) == entries
+      assert Theine.weighted_size(cache) == table_weight(cache)
+
+      # The sum spans every partition, not partition 0's share.
+      sizes = Enum.map(infos(cache), & &1.size)
+      assert Enum.all?(sizes, &(&1 > 0))
+      assert Enum.sum(sizes) == entries
+    end
+
+    test "clear/1 empties every partition and size/1 reads 0" do
+      cache = start_partitioned()
+
+      for key <- 1..1_000, do: Theine.put(cache, key, key, weight: 2)
+      for key <- 1_001..1_400, do: Theine.put(cache, key, key, ttl: 60_000)
+      Theine.run_maintenance(cache)
+      assert Theine.size(cache) == 1_400
+      assert Enum.all?(infos(cache), &(&1.size > 0 and &1.expiring > 0))
+
+      assert Theine.clear(cache) == :ok
+
+      assert :ets.info(cache, :size) == 0
+      assert Theine.size(cache) == 0
+      assert Theine.weighted_size(cache) == 0
+
+      for info <- infos(cache),
+          do: assert(%{pending: 0, size: 0, weighted_size: 0, expiring: 0} = info)
+
+      for key <- [1, 2, 3, 4, 1_001, 1_002],
+          do: assert(Theine.Maintenance.policy_row(cache, key) == :error)
+
+      # Still usable in every partition.
+      for key <- 1..100, do: Theine.put(cache, key, key)
+      Theine.run_maintenance(cache)
+      assert Theine.size(cache) == 100
+      assert Enum.all?(infos(cache), &(&1.size > 0))
+    end
+
+    test "run_maintenance/1 runs a pass on each partition" do
+      cache = start_partitioned()
+      handler = {__MODULE__, :pass, cache}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:theine, :maintenance, :pass],
+          &__MODULE__.handle_pass/4,
+          {self(), cache}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      before = Enum.map(infos(cache), & &1.passes)
+      # Fewer than `write_batch` events per partition, so no pass of its own.
+      for key <- 1..400, do: Theine.put(cache, key, key)
+
+      assert Theine.run_maintenance(cache) == :ok
+
+      # One pass each, partition 0 first, and the caller's events to every
+      # partition applied before the call returned.
+      for p <- 0..(@partitions - 1), do: assert_received({:pass, ^p})
+      refute_received {:pass, _}
+      assert Enum.map(infos(cache), & &1.passes) == Enum.map(before, &(&1 + 1))
+      assert Theine.size(cache) == 400
+    end
+
+    test "every call of specs/08 §Calls returns its documented shape" do
+      test = self()
+
+      loader = fn
+        {:gated, _} = key ->
+          send(test, {:loading, self()})
+
+          receive do
+            :go -> {:commit, key}
+          end
+
+        key ->
+          {:commit, {:loaded, key}}
+      end
+
+      cache = start_partitioned(loader: loader)
+      keys = 1..64
+
+      assert keys
+             |> Enum.map(&Theine.Partition.of_key(&1, @partitions))
+             |> Enum.uniq()
+             |> length() == 4
+
+      for key <- keys, do: assert(Theine.put(cache, key, key, weight: 2) == :ok)
+
+      for key <- keys do
+        assert Theine.get(cache, key) == {:ok, key}
+        assert Theine.get(cache, key, :default) == key
+      end
+
+      assert Theine.get(cache, :missing) == :error
+      assert Theine.get(cache, :missing, :default) == :default
+      assert Theine.put_new(cache, 1, :other) == {:error, :exists}
+      assert Theine.put_new(cache, :new, 1) == :ok
+
+      assert Theine.fetch(cache, :f1) == {:ok, {:loaded, :f1}}
+
+      assert Theine.fetch(cache, :f2, fn _ -> {:commit, :per_call} end, timeout: 1_000) ==
+               {:ok, :per_call}
+
+      assert %Task{} = task = Theine.fetch_async(cache, :f3)
+      assert Task.await(task) == {:ok, {:loaded, :f3}}
+      assert Theine.fetch_all(cache, [1, :f4]) == %{1 => {:ok, 1}, :f4 => {:ok, {:loaded, :f4}}}
+
+      assert Theine.expire(cache, 2, 60_000) == true
+      assert Theine.expire(cache, :missing, 1_000) == false
+      assert {:ok, ms} = Theine.ttl(cache, 2)
+      assert ms in 1..60_000
+      assert Theine.persist(cache, 2) == true
+      assert Theine.persist(cache, :missing) == false
+      assert Theine.ttl(cache, 2) == {:ok, :infinity}
+      assert Theine.ttl(cache, :missing) == :error
+      assert Theine.delete(cache, 3) == :ok
+      assert Theine.delete(cache, 3) == :ok
+
+      gated = {:gated, 1}
+      Theine.put(cache, gated, :old)
+      assert Theine.refresh(cache, gated) == :ok
+      assert_receive {:loading, pid}
+      assert Theine.refresh(cache, gated) == {:error, :refreshing}
+      send(pid, :go)
+      refreshing = Config.get(cache).refreshing
+      assert_eventually(fn -> not :ets.member(refreshing, gated) end)
+      assert Theine.get(cache, gated) == {:ok, gated}
+
+      idle!(cache)
+      assert Theine.run_maintenance(cache) == :ok
+      assert Theine.size(cache) == :ets.info(cache, :size)
+      assert Theine.size(cache) == 64 - 1 + 1 + 4 + 1
+      assert Theine.weighted_size(cache) == table_weight(cache)
+
+      assert %Theine.Stats{hits: hits, misses: misses, load_failures: 0, hit_rate: rate} =
+               Theine.stats(cache)
+
+      assert hits >= 128 + 1
+      assert misses >= 2
+      assert is_float(rate)
+
+      assert Theine.clear(cache) == :ok
+      assert Theine.size(cache) == 0
+    end
+  end
+
   describe "documentation" do
     # specs/08 §Documentation: every public function has a doc with an
     # example, which `doctest Theine` above runs.

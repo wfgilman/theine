@@ -314,20 +314,25 @@ evenly, not weight.
 
 ## Build order
 
-1. Ids and routing with `n = 1` exact: per-partition id counters, the
-   partition function and the id-derived partition of every event, all
-   unused while `n = 1`. Gate: everything unchanged.
-2. Per-partition read rings and drain flags, the partitioned `hit` shape,
-   and the `partitions` option accepted for unbounded caches only, which
-   have no read buffer. Gate: `mix bench get` `n = 1` unchanged.
-3. `n` maintenance processes under `Theine.Partitions`, with shares,
-   `pending` and backpressure per partition, and restart by partition.
-   Bounded caches accepted, with the minimum share. Gate: the A5 and
-   isolation tests.
-4. The calls that span partitions (`size`, `clear`, `run_maintenance`,
+IMPLEMENTATION_PLAN.md §M8 holds the tasks. Each one leaves a cache that
+works, and `partitions: 1` stays exact throughout.
+
+1. Ids and routing: per-partition id counters, the partition function,
+   and the id-derived partition of every event. No `start_link` option
+   yet. Gate: everything unchanged.
+2. `n` maintenance processes under `Theine.Partitions`, with `pending`,
+   backpressure and restart per partition. The `partitions` option is
+   accepted for unbounded caches only, which have no read buffer or
+   policy shares. Gate: the isolation and restart tests.
+3. The calls that span partitions (`size`, `clear`, `run_maintenance`,
    `info/2`, telemetry metadata).
-5. Bench subjects: `theine_p4` in `hitrate` and `get`, and the throughput
-   scenario. README and docs, including the entry-weight limit.
+4. Bounded partitions: the read buffer split by partition, the
+   partitioned `hit` shape, capacity shares, sketches sized for each
+   share, and the minimum share. Gate: `mix bench get`'s `n = 1` rows
+   unchanged, and the A5 test with `partitions: 4`.
+5. Bench subjects and thresholds: `theine_p4` in `hitrate` and `get`, the
+   overshoot run with `partitions: 4`, and the throughput scenario.
+6. Docs and README, including the entry-weight limit, and specs/00.
 
 ## Settled questions
 

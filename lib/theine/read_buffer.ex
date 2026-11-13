@@ -28,6 +28,15 @@ defmodule Theine.ReadBuffer do
   drain flag before draining so that readers can schedule the next pass
   while one runs (specs/04 §The pass step 2).
 
+  A cache of `partitions: n > 1` has `n` groups of `stripes` stripes in the
+  one array, partition `p`'s group from stripe `p * stripes` (specs/12 §The
+  read buffer is split by partition). A hit records into the stripe of its
+  scheduler within the group of its id's partition, `id &&& (n - 1)`, and
+  asks that partition's process for a pass. `drain/3`, `reset_heads/1`,
+  `lag/1` and `dump/1` work on the group of `config.partition` (the
+  maintenance process's view, `Theine.Config.partition/2`), so ids never
+  travel between partitions; `hits/1` sums every group's tails.
+
   `record/2` is the reference implementation of the hot-path side;
   `Theine.get/2` carries a copy of its body. Readers that claimed a sequence
   but have not yet written their slot, drains that race them, and readers
@@ -88,6 +97,7 @@ defmodule Theine.ReadBuffer do
   @spec record(Config.t(), id()) :: :ok
   def record(
         %{
+          partitions: 1,
           read_buffer: buffer,
           stripes: stripes,
           read_buffer_slots: slots,
@@ -99,6 +109,27 @@ defmodule Theine.ReadBuffer do
     n = :atomics.add_get(buffer, base, 1)
     :atomics.put(buffer, base + 2 + Bitwise.band(n - 1, slots - 1), id)
     if Bitwise.band(n, threshold - 1) == 0, do: schedule_drain(config), else: :ok
+  end
+
+  # A partitioned cache (specs/12 §The read buffer is split by partition):
+  # the stripe of the scheduler within the group of the id's partition, and
+  # that partition's drain flag and process.
+  def record(
+        %{
+          partitions: partitions,
+          read_buffer: buffer,
+          stripes: stripes,
+          read_buffer_slots: slots,
+          drain_threshold: threshold
+        } = config,
+        id
+      ) do
+    p = Bitwise.band(id, partitions - 1)
+    stripe = p * stripes + Bitwise.band(:erlang.system_info(:scheduler_id) - 1, stripes - 1)
+    base = stripe * (2 + slots) + 1
+    n = :atomics.add_get(buffer, base, 1)
+    :atomics.put(buffer, base + 2 + Bitwise.band(n - 1, slots - 1), id)
+    if Bitwise.band(n, threshold - 1) == 0, do: schedule_drain(config, p), else: :ok
   end
 
   @doc """
@@ -182,21 +213,24 @@ defmodule Theine.ReadBuffer do
   Only the maintenance process may call this.
   """
   @spec drain(Config.t(), acc, (id(), acc -> acc)) :: drained(acc) when acc: term()
-  def drain(%{read_buffer: buffer, stripes: stripes, read_buffer_slots: slots}, acc, fun)
+  def drain(%{read_buffer: buffer, read_buffer_slots: slots} = config, acc, fun)
       when is_function(fun, 2) do
-    drain_stripes(buffer, 0, stripes, 2 + slots, slots, fun, {acc, 0, false})
+    {first, last} = group(config)
+    drain_stripes(buffer, first, last, 2 + slots, slots, fun, {acc, 0, false})
   end
 
   @doc """
-  Moves every head up to its tail without visiting the slots: a restarted
-  maintenance process starts from the present rather than replaying reads
-  of a policy it no longer has (specs/04 §Restart semantics). Returns `:ok`.
+  Moves every head of the partition's group up to its tail without
+  visiting the slots: a restarted maintenance process starts from the
+  present rather than replaying reads of a policy it no longer has
+  (specs/04 §Restart semantics). Returns `:ok`.
   """
   @spec reset_heads(Config.t()) :: :ok
-  def reset_heads(%{read_buffer: buffer, stripes: stripes, read_buffer_slots: slots}) do
+  def reset_heads(%{read_buffer: buffer, read_buffer_slots: slots} = config) do
     width = 2 + slots
+    {first, last} = group(config)
 
-    for s <- 0..(stripes - 1)//1 do
+    for s <- first..(last - 1)//1 do
       base = s * width + 1
       :atomics.put(buffer, base + 1, :atomics.get(buffer, base))
     end
@@ -206,31 +240,51 @@ defmodule Theine.ReadBuffer do
 
   @doc """
   The number of reads recorded since the array was created, dropped or not:
-  the sum of the stripe tails (specs/03 §Hits from the tails). This is the
-  hit count of a bounded cache.
+  the sum of the stripe tails of every partition's group (specs/03 §Hits
+  from the tails). This is the hit count of a bounded cache.
   """
   @spec hits(Config.t()) :: non_neg_integer()
-  def hits(%{read_buffer: buffer, stripes: stripes, read_buffer_slots: slots}) do
+  def hits(%{
+        read_buffer: buffer,
+        stripes: stripes,
+        read_buffer_slots: slots,
+        partitions: partitions
+      }) do
     width = 2 + slots
 
-    Enum.reduce(0..(stripes - 1)//1, 0, fn s, sum ->
+    Enum.reduce(0..(stripes * partitions - 1)//1, 0, fn s, sum ->
       sum + :atomics.get(buffer, s * width + 1)
     end)
   end
 
   @doc """
-  How far the drainer is behind: the sum over stripes of `tail - head`.
-  Counts dropped reads too, so it can exceed `stripes * slots`.
+  How far the drainer of the partition is behind: the sum over its stripes
+  of `tail - head`. Counts dropped reads too, so it can exceed `stripes *
+  slots`.
   """
   @spec lag(Config.t()) :: non_neg_integer()
-  def lag(%{read_buffer: buffer, stripes: stripes, read_buffer_slots: slots}) do
+  def lag(%{read_buffer: buffer, read_buffer_slots: slots} = config) do
     width = 2 + slots
+    {first, last} = group(config)
 
-    Enum.reduce(0..(stripes - 1)//1, 0, fn s, sum ->
+    Enum.reduce(first..(last - 1)//1, 0, fn s, sum ->
       base = s * width + 1
       sum + :atomics.get(buffer, base) - :atomics.get(buffer, base + 1)
     end)
   end
+
+  @doc """
+  The stripes of `config.partition`'s group, as the 0-based first stripe
+  and the stripe after the last: `stripes` stripes from `partition *
+  stripes` (specs/12 §The read buffer is split by partition). The whole
+  array at `partitions: 1`.
+
+      iex> config = Theine.Config.new!(name: :c, max_size: :infinity, stripes: 4, partitions: 2)
+      iex> Theine.ReadBuffer.group(Theine.Config.partition(config, 1))
+      {4, 8}
+  """
+  @spec group(Config.t()) :: {non_neg_integer(), pos_integer()}
+  def group(%{stripes: stripes, partition: p}), do: {p * stripes, (p + 1) * stripes}
 
   @doc "The stripe of the scheduler with id `scheduler_id` (1-based), 0-based."
   @spec stripe_of(pos_integer(), pos_integer()) :: non_neg_integer()
@@ -239,12 +293,16 @@ defmodule Theine.ReadBuffer do
     rem(scheduler_id - 1, stripes)
   end
 
-  @doc "Every stripe's tail, head and ring contents, for tests and `info/1`."
+  @doc """
+  The tail, head and ring contents of every stripe of the partition's
+  group, for tests and `info/1`.
+  """
   @spec dump(Config.t()) :: [stripe()]
-  def dump(%{read_buffer: buffer, stripes: stripes, read_buffer_slots: slots}) do
+  def dump(%{read_buffer: buffer, read_buffer_slots: slots} = config) do
     width = 2 + slots
+    {first, last} = group(config)
 
-    for s <- 0..(stripes - 1)//1 do
+    for s <- first..(last - 1)//1 do
       base = s * width + 1
 
       %{
@@ -255,10 +313,11 @@ defmodule Theine.ReadBuffer do
     end
   end
 
-  defp drain_stripes(_buffer, s, stripes, _width, _slots, _fun, result) when s >= stripes,
+  # Stripes `s` up to `last - 1` (the partition's group).
+  defp drain_stripes(_buffer, s, last, _width, _slots, _fun, result) when s >= last,
     do: result
 
-  defp drain_stripes(buffer, s, stripes, width, slots, fun, {acc, reads, full?}) do
+  defp drain_stripes(buffer, s, last, width, slots, fun, {acc, reads, full?}) do
     base = s * width + 1
     head = :atomics.get(buffer, base + 1)
     tail = :atomics.get(buffer, base)
@@ -269,7 +328,7 @@ defmodule Theine.ReadBuffer do
     drain_stripes(
       buffer,
       s + 1,
-      stripes,
+      last,
       width,
       slots,
       fun,

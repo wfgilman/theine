@@ -64,4 +64,44 @@ defmodule Theine.Partition do
     p = of_key(key, n)
     :atomics.add_get(ids, p + 1, 1) * n + p
   end
+
+  @doc """
+  Partition `p`'s capacity share of `max_size` in a cache of `n`
+  partitions: `div(max_size, n)`, plus one for each of the first
+  `rem(max_size, n)` partitions, so the `n` shares add up to `max_size`
+  (specs/12 §Each partition is a whole policy).
+
+      iex> for p <- 0..3, do: Theine.Partition.share(40_002, 4, p)
+      [10_001, 10_001, 10_000, 10_000]
+      iex> Theine.Partition.share(1_000, 1, 0)
+      1_000
+  """
+  @spec share(pos_integer(), pos_integer(), non_neg_integer()) :: pos_integer()
+  def share(max_size, n, p) when p < rem(max_size, n), do: div(max_size, n) + 1
+  def share(max_size, n, _p), do: div(max_size, n)
+
+  @doc """
+  True when an entry of `weight` is heavier than its key's partition's
+  share of `max_size`, so that it is never stored (specs/12 §Each partition
+  is a whole policy). At `n = 1` the share is `max_size`. With `n > 1` the
+  key is hashed only for a weight of exactly `div(max_size, n) + 1`, the
+  one weight that fits some shares and not others.
+
+      iex> Theine.Partition.oversized?(10_001, 40_000, 4, :key)
+      true
+      iex> Theine.Partition.oversized?(10_000, 40_000, 4, :key)
+      false
+  """
+  @spec oversized?(pos_integer(), pos_integer(), pos_integer(), term()) :: boolean()
+  def oversized?(weight, max_size, 1, _key), do: weight > max_size
+
+  def oversized?(weight, max_size, n, key) do
+    least = div(max_size, n)
+
+    cond do
+      weight <= least -> false
+      weight > least + 1 -> true
+      true -> of_key(key, n) >= rem(max_size, n)
+    end
+  end
 end

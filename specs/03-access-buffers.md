@@ -29,6 +29,21 @@ options and must be powers of two (`ArgumentError` otherwise), so that
 every modulo below is a bit mask; the masks and the stripe width
 `2 + slots` are precomputed in the config's `hit` tuple (specs/08).
 
+With `partitions: n > 1` (specs/12 §The read buffer is split by
+partition) the array holds `n` groups of `stripes` stripes, size
+`n * stripes * (2 + slots)`, partition `p`'s group from stripe
+`p * stripes`. A hit records into the stripe of its scheduler within the
+group of its id's partition:
+
+```
+base = (id &&& (n - 1)) * stripes * (2 + slots) + s * (2 + slots) + 1
+```
+
+The `hit` tuple of such a cache is the 7-tuple `{buffer, stripes - 1,
+2 + slots, slots - 1, drain_threshold - 1, n - 1, stripes * (2 + slots)}`,
+so the group costs one `band`, one multiply and one add and no BIF, hash or
+atomics op. A cache of one partition keeps the 5-tuple and its clause.
+
 ### `record(config, id)` — the hot-path side
 
 1. `s = :erlang.system_info(:scheduler_id) - 1` modulo `stripes`
@@ -58,6 +73,12 @@ arrives too soon after the last pass is deferred with the flag still set
 (specs/04 §The pass, `drain_backoff`), and readers in that gap pay one
 failed compare_exchange per `drain_threshold` reads and nothing else.
 
+With `partitions: n > 1` there is one drain flag per partition, partition
+`p`'s at index `p + 1` of `flags`, and a trigger in partition `p`'s group
+calls `schedule_drain(config, p)`, which flips that flag and sends `:drain`
+to `elem(config.maintenances, p)`. At most one drain message is in flight
+per partition.
+
 Budget on a hit: one scheduler-id read, one add_get, one put, and once per
 `drain_threshold` reads one compare_exchange plus one send. That is inside
 the "at most three atomics ops" of specs/00 and specs/01 in every case; the
@@ -81,7 +102,9 @@ tails are never reset: a maintenance restart moves heads up to the tails
 an Owner restart (which recreates the array) starts the count over, exactly
 as it does for the counters. `record/2` must therefore claim the sequence
 for every hit, including hits that are dropped and hits in a cache started
-with `stats: false`; the one add_get is the whole cost of counting.
+with `stats: false`; the one add_get is the whole cost of counting. With
+`partitions: n > 1` the sum is over the tails of every group, and a
+partition's restart moves only its own group's heads.
 
 Note that a slot may hold a stale id (a reader claimed `t` but has not yet
 `put`), a newer id (a reader claimed `t + slots` and wrote it while the
@@ -100,7 +123,9 @@ ring reached its capacity since the last drain, so reads may have been
 overwritten and the pass follows up (specs/04 §The pass).
 
 The drainer processes at most `stripes * slots` ids per pass, which bounds
-pass time.
+pass time. With `partitions: n > 1` partition `p`'s process drains its own
+group only (`config.partition` of its view, specs/12), so ids never travel
+between partitions.
 
 ## Write events: `Theine.WriteEvents`
 
@@ -300,3 +325,17 @@ new process registers, and the mutation preceded the send.
   name, so tests and tools that address `Theine.Maintenance.name/1` see
   the same process. Until M8.2 starts the other partitions' processes, the
   `n > 1` clause runs only in tests that build a config by hand.
+- 2026-11-13 (M8.4): the read buffer split by partition (§Layout,
+  `schedule_drain/1`, §Hits from the tails, specs/12). One array of
+  `n * stripes` stripes, so `ReadBuffer.new/2` is unchanged and the Owner
+  asks for `stripes * partitions`. `drain/3`, `reset_heads/1`, `lag/1` and
+  `dump/1` work on the group of `config.partition` (`ReadBuffer.group/1`),
+  which at `partitions: 1` is the whole array, so a cache of one partition
+  drains exactly as before; `hits/1` sums the tails of all `n * stripes`.
+  `record/2`, the reference implementation, gained a `partitions: 1`
+  clause that is the old body and an `n > 1` clause that records into the
+  id's group and calls `schedule_drain/2`. A partition's A5 slack is its
+  own `write_hwm`, as specs/12 §A5 with partitions states: maintenance_test
+  samples a `partitions: 4` cache under one writer per scheduler and finds
+  every partition's policy within one event of its share and the table
+  within `max_size + 4 * write_hwm + writers`.

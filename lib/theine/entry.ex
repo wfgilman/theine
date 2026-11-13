@@ -12,7 +12,8 @@ defmodule Theine.Entry do
     (`Theine.Partition.next_id/3`, specs/12). 0 is reserved to mean "empty
     slot" in the read buffer.
   - `weight`: integer ≥ 1, from the `weight:` option, else the cache's
-    weigher, else 1. An entry heavier than `max_size` is never stored.
+    weigher, else 1. An entry heavier than `max_size`, or with
+    `partitions: n > 1` than its partition's share of it, is never stored.
   - `written_at`: monotonic milliseconds at write, from `Theine.Clock.now/1`.
   - `expires_at`: monotonic milliseconds, or `:infinity`.
 
@@ -125,7 +126,8 @@ defmodule Theine.Entry do
 
   An entry whose weight exceeds `max_size` is not stored and sends no
   event; the call still returns `:ok` (Caffeine rejects oversized entries
-  silently).
+  silently). With `partitions: n > 1` the limit is the share of `max_size`
+  of the key's partition (`Theine.Partition.share/3`).
   """
   @spec put(Config.t(), key(), value(), keyword()) :: :ok
   def put(%Config{} = config, key, value, opts) when is_list(opts) do
@@ -302,17 +304,25 @@ defmodule Theine.Entry do
   end
 
   # The entry's weight from the `weight:` option, else the weigher, else 1;
-  # `:oversized` when it exceeds a finite `max_size` (specs/01 §Write path).
+  # `:oversized` when it exceeds a finite `max_size` (specs/01 §Write path),
+  # or with `partitions: n > 1` the key's partition's share of it (specs/12
+  # §Each partition is a whole policy). Unbounded and `n = 1` caches never
+  # hash the key here.
   @spec weight(Config.t(), key(), value(), keyword()) :: weight() | :oversized
-  defp weight(%Config{max_size: max_size, weigher: weigher}, key, value, opts) do
+  defp weight(%Config{max_size: max_size, weigher: weigher, partitions: n}, key, value, opts) do
     weight =
       case Keyword.fetch(opts, :weight) do
         {:ok, w} -> weight_option(w)
         :error -> weigh(weigher, key, value)
       end
 
-    if is_integer(max_size) and weight > max_size, do: :oversized, else: weight
+    if is_integer(max_size) and oversized?(weight, max_size, n, key),
+      do: :oversized,
+      else: weight
   end
+
+  defp oversized?(weight, max_size, 1, _key), do: weight > max_size
+  defp oversized?(weight, max_size, n, key), do: Partition.oversized?(weight, max_size, n, key)
 
   defp weight_option(w) when is_integer(w) and w > 0, do: w
 

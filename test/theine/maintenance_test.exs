@@ -711,6 +711,52 @@ defmodule Theine.MaintenanceTest do
       assert Theine.weighted_size(cache) == max_size
     end
 
+    # specs/12 §A5 with partitions: each partition keeps specs/03's
+    # invariant over its share, so the table holds at most max_size +
+    # n * write_hwm + writers.
+    test "with partitions: 4 under saturating writers the table never exceeds max_size + 4 * write_hwm + writers" do
+      cache = unique_cache()
+      n = 4
+      max_size = 40_002
+      start_supervised!({Theine, [name: cache, max_size: max_size, partitions: n] ++ @quiet})
+      config = Config.get(cache)
+      shares = for p <- 0..(n - 1), do: Partition.share(max_size, n, p)
+      writers = System.schedulers_online()
+      stop = :atomics.new(1, [])
+
+      pids = for i <- 1..writers, do: spawn_link(fn -> write_until(cache, stop, i, writers) end)
+      refs = Enum.map(pids, &Process.monitor/1)
+
+      # As the unpartitioned test above: each partition's policy, written
+      # by its own process alone, is within one event of its share, and the
+      # table within the bound.
+      samples =
+        for _ <- 1..200 do
+          policies = for p <- 0..(n - 1), do: Policy.weighted_size(config.sizes, p)
+          table = :ets.info(cache, :size)
+          Process.sleep(5)
+          {table, policies}
+        end
+
+      :atomics.put(stop, 1, 1)
+      for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, :normal}, 5_000)
+
+      for {table, policies} <- samples do
+        for {policy, share} <- Enum.zip(policies, shares), do: assert(policy <= share + 1)
+        assert table <= max_size + n * config.write_hwm + writers
+      end
+
+      assert Enum.any?(samples, fn {table, _} -> table > max_size end)
+
+      assert_eventually(fn ->
+        Enum.all?(0..(n - 1), &(Maintenance.info(cache, &1).pending == 0))
+      end)
+
+      assert :ets.info(cache, :size) == max_size
+      assert Theine.weighted_size(cache) == max_size
+      assert for(p <- 0..(n - 1), do: Maintenance.info(cache, p).weighted_size) == shares
+    end
+
     test "a full stripe schedules exactly one follow-up pass" do
       cache = unique_cache()
 
@@ -1329,6 +1375,52 @@ defmodule Theine.MaintenanceTest do
 
       assert %{pending: 0, size: size2} = Maintenance.info(cache, 2)
       assert size2 == map_size(table_of(cache, 2))
+    end
+
+    test "a restarted bounded partition resets only its own stripes and its own sketch" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine,
+         [name: cache, max_size: 40_000, partitions: @partitions, test_hooks: true] ++ @quiet}
+      )
+
+      config = Config.get(cache)
+      views = for p <- 0..(@partitions - 1), do: Config.partition(config, p)
+      # Each partition's sketch counts its own keys' writes.
+      for i <- 1..2_000, do: Theine.put(cache, i, i)
+      Theine.run_maintenance(cache)
+
+      first =
+        for p <- 0..(@partitions - 1),
+            do: Enum.find(1..2_000, &(Partition.of_key(&1, @partitions) == p))
+
+      for {view, key} <- Enum.zip(views, first) do
+        assert Sketch.frequency(view.sketch, key) > 0
+      end
+
+      # Reads queued behind paused partitions, then partition 1 killed.
+      for p <- 0..(@partitions - 1), do: :ok = Maintenance.pause(cache, p)
+      for i <- 1..2_000, do: {:ok, ^i} = Theine.get(cache, i)
+      lags = Enum.map(views, &ReadBuffer.lag/1)
+      assert Enum.all?(lags, &(&1 > 0))
+
+      old = Process.whereis(Maintenance.name(cache, 1))
+      Process.exit(old, :kill)
+      assert_eventually(fn -> Process.whereis(Maintenance.name(cache, 1)) not in [nil, old] end)
+      # The rebuild has run once info/2 answers.
+      Maintenance.info(cache, 1)
+
+      # Partition 1 starts from the present; the others' reads still wait.
+      assert Enum.map(views, &ReadBuffer.lag/1) == List.replace_at(lags, 1, 0)
+
+      for {view, key} <- Enum.zip(views, first) do
+        if view.partition == 1,
+          do: assert(Sketch.frequency(view.sketch, key) == 0),
+          else: assert(Sketch.frequency(view.sketch, key) > 0)
+      end
+
+      for p <- [0, 2, 3], do: :ok = Maintenance.resume(cache, p)
     end
 
     test "each partition sweeps its own expired keys" do

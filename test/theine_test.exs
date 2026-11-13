@@ -3,7 +3,7 @@ defmodule TheineTest do
 
   import Theine.Test.Helpers
 
-  alias Theine.{Config, Entry}
+  alias Theine.{Config, Entry, ReadBuffer}
 
   doctest Theine
 
@@ -838,6 +838,140 @@ defmodule TheineTest do
 
       assert Theine.clear(cache) == :ok
       assert Theine.size(cache) == 0
+    end
+  end
+
+  describe "bounded partitions (specs/12 §Each partition is a whole policy)" do
+    # The least max_size four partitions accept, plus two: shares 10_001,
+    # 10_001, 10_000 and 10_000.
+    @max_size 40_002
+    @shares [10_001, 10_001, 10_000, 10_000]
+
+    defp start_bounded(extra \\ []) do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine,
+         [name: cache, max_size: @max_size, partitions: 4, maintenance_interval: 60_000] ++
+           extra}
+      )
+
+      cache
+    end
+
+    defp all_idle!(cache) do
+      pending = Config.get(cache).pending
+      assert_eventually(fn -> Enum.all?(1..4, &(:atomics.get(pending, &1) == 0)) end)
+    end
+
+    # The first key of `{:key, i}` in each partition.
+    defp key_of(p),
+      do: Enum.find(Stream.map(1..1_000, &{:key, &1}), &(Theine.Partition.of_key(&1, 4) == p))
+
+    test "an entry heavier than its share is not stored" do
+      cache = start_bounded()
+      [k0, k1, k2, k3] = for p <- 0..3, do: key_of(p)
+
+      # The larger share fits partitions 0 and 1 and no other.
+      assert Theine.put(cache, k0, :a, weight: 10_001) == :ok
+      assert Theine.put(cache, k2, :b, weight: 10_001) == :ok
+      assert Theine.put_new(cache, k3, :c, weight: 10_001) == :ok
+      # Heavier than every share, though far below max_size.
+      assert Theine.put(cache, k1, :d, weight: 10_002) == :ok
+      assert Theine.put(cache, {:key, :heavy}, :e, weight: 40_000) == :ok
+
+      assert Theine.get(cache, k0) == {:ok, :a}
+      assert Theine.get(cache, k2) == :error
+      assert Theine.get(cache, k3) == :error
+      assert Theine.get(cache, k1) == :error
+      assert Theine.get(cache, {:key, :heavy}) == :error
+
+      # The smaller share fits every partition.
+      assert Theine.put(cache, k3, :f, weight: 10_000) == :ok
+      assert Theine.put(cache, k1, :g, weight: 10_001) == :ok
+      assert Theine.get(cache, k3) == {:ok, :f}
+      assert Theine.get(cache, k1) == {:ok, :g}
+
+      Theine.run_maintenance(cache)
+      assert Theine.size(cache) == 3
+      assert Theine.weighted_size(cache) == 10_001 + 10_001 + 10_000
+    end
+
+    test "each partition evicts to its own share, which add up to max_size" do
+      cache = start_bounded()
+
+      1..4
+      |> Enum.map(fn w ->
+        Task.async(fn -> for k <- w..60_000//4, do: Theine.put(cache, k, k) end)
+      end)
+      |> Task.await_many(30_000)
+
+      all_idle!(cache)
+      Theine.run_maintenance(cache)
+
+      infos = for p <- 0..3, do: Theine.Maintenance.info(cache, p)
+      assert Enum.map(infos, & &1.weighted_size) == @shares
+      assert Theine.size(cache) == @max_size
+      assert :ets.info(cache, :size) == @max_size
+
+      # Every partition runs a whole policy over its share, with its own
+      # sketch and its own group of read-buffer stripes.
+      config = Config.get(cache)
+
+      for {info, share} <- Enum.zip(infos, @shares) do
+        %{window: window, probation: probation, protected: protected} = info.segments
+        assert window + probation + protected == share
+        assert info.sketch.words == Theine.Sketch.words(share)
+        assert info.read_buffer.stripes == config.stripes
+      end
+
+      sketches = for p <- 0..3, do: Config.partition(config, p).sketch.ref
+      assert length(Enum.uniq(sketches)) == 4
+      assert config.sketch == nil
+    end
+
+    test "a hit records into the group of its id's partition, and hits sum every group" do
+      cache = start_bounded(test_hooks: true, stripes: 2)
+      keys = for k <- 1..200, do: {:k, k}
+      for key <- keys, do: Theine.put(cache, key, key)
+      Theine.run_maintenance(cache)
+      # No drain moves a head while the reads are counted.
+      for p <- 0..3, do: :ok = Theine.Maintenance.pause(cache, p)
+
+      for key <- keys, do: {:ok, ^key} = Theine.get(cache, key)
+
+      config = Config.get(cache)
+
+      for p <- 0..3 do
+        own = Enum.count(keys, &(Theine.Partition.of_key(&1, 4) == p))
+        view = Config.partition(config, p)
+        assert ReadBuffer.lag(view) == own
+
+        for %{tail: tail, ids: ids} <- ReadBuffer.dump(view),
+            id <- Enum.take(ids, min(tail, config.read_buffer_slots)),
+            do: assert(Theine.Partition.of_id(id, 4) == p)
+      end
+
+      assert Theine.stats(cache).hits == 200
+      for p <- 0..3, do: :ok = Theine.Maintenance.resume(cache, p)
+
+      # The queued `:drain`s reach each partition's own process.
+      assert_eventually(fn ->
+        Enum.all?(0..3, &(ReadBuffer.lag(Config.partition(config, &1)) == 0))
+      end)
+    end
+
+    test "a hit in a cache with refresh_after_write records into its partition too" do
+      cache = start_bounded(refresh_after_write: 60_000, loader: fn k -> {:commit, k} end)
+      assert {:refresh, 60_000, {_, _, _, _, _, 3, _}} = Config.get(cache).hit
+
+      Theine.put(cache, :a, 1)
+      assert Theine.get(cache, :a) == {:ok, 1}
+      assert Theine.fetch(cache, :a) == {:ok, 1}
+
+      p = Theine.Partition.of_key(:a, 4)
+      assert ReadBuffer.hits(Config.get(cache)) == 2
+      assert ReadBuffer.lag(Config.partition(Config.get(cache), p)) == 2
     end
   end
 

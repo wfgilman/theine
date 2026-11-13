@@ -1,9 +1,9 @@
 defmodule Theine.PartitionTest do
   @moduledoc """
   Routing by partition (specs/12 §The partition of a key, §Ids carry the
-  partition; IMPLEMENTATION_PLAN.md M8.1). `partitions` is not a
-  `start_link` option yet, so the partitioned paths are driven through a
-  config built by hand: `Theine.Entry` writes into a private table, and the
+  partition; IMPLEMENTATION_PLAN.md M8.1) and capacity shares (§Each
+  partition is a whole policy, M8.4). The partitioned paths are driven
+  through a config built by hand: `Theine.Entry` writes into a private table, and the
   partitions' maintenance names are held by forwarders owned by the test.
   """
 
@@ -83,6 +83,29 @@ defmodule Theine.PartitionTest do
         assert map_size(counts) == n
         assert Enum.all?(Map.values(counts), &(&1 > div(8_000 * 8, n * 10)))
       end
+    end
+  end
+
+  describe "shares (specs/12 §Each partition is a whole policy)" do
+    property "oversized?/4 is a weight above the share of the key's partition" do
+      check all key <- term(),
+                n <- member_of(@ns),
+                max_size <- integer(1..200_000),
+                weight <- integer(1..(div(max_size, n) + 3)) do
+        share = Partition.share(max_size, n, Partition.of_key(key, n))
+        assert Partition.oversized?(weight, max_size, n, key) == weight > share
+      end
+    end
+
+    test "a weight of exactly the larger share is the only one that hashes the key" do
+      # 40_002 over 4: shares 10_001, 10_001, 10_000, 10_000.
+      for weight <- [1, 10_000, 10_002] do
+        calls = Trace.calls([:erlang], fn -> Partition.oversized?(weight, 40_002, 4, :k) end)
+        refute Map.has_key?(calls, {:erlang, :phash2, 2})
+      end
+
+      calls = Trace.calls([:erlang], fn -> Partition.oversized?(10_001, 40_002, 4, :k) end)
+      assert calls[{:erlang, :phash2, 2}] == 1
     end
   end
 

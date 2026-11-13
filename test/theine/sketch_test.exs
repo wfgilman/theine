@@ -238,6 +238,54 @@ defmodule Theine.SketchTest do
     end
   end
 
+  describe "partitions (specs/12 §The partition of a key, §Acceptance)" do
+    # The chi-square statistic of `keys` over the blocks of `sketch`, the
+    # block a key's counters live in (`hash(key) &&& block_mask`), and the
+    # upper 1% point of the chi-square distribution with blocks - 1 degrees
+    # of freedom by the Wilson-Hilferty approximation (z = 2.3263).
+    defp block_chi_square(%Sketch{block_mask: block_mask}, keys) do
+      blocks = block_mask + 1
+      counts = Enum.frequencies_by(keys, &(Sketch.hash(&1) &&& block_mask))
+      expected = length(keys) / blocks
+
+      statistic =
+        Enum.reduce(0..block_mask, 0.0, fn b, sum ->
+          d = Map.get(counts, b, 0) - expected
+          sum + d * d / expected
+        end)
+
+      df = blocks - 1
+      a = 2 / (9 * df)
+      {statistic, df * :math.pow(1 - a + 2.3263 * :math.sqrt(a), 3)}
+    end
+
+    test "at n = 8, 100_000 random keys of one partition fill its sketch's blocks evenly (chi-square at 1%)" do
+      n = 8
+      max_size = n * 10_000
+      # The top three bits of a key's hash are its partition and constant
+      # within it; the block index must not lose the remaining bits.
+      :rand.seed(:exsss, {8, 100_000, 1})
+      keys = for _ <- 1..1_000_000, do: {:key, :rand.uniform(1 <<< 62)}
+      by_partition = Enum.group_by(keys, &Theine.Partition.of_key(&1, n))
+      assert map_size(by_partition) == n
+
+      for p <- 0..(n - 1) do
+        own = by_partition |> Map.fetch!(p) |> Enum.take(100_000)
+        assert length(own) == 100_000
+        sketch = Sketch.new(Theine.Partition.share(max_size, n, p))
+        # A share of 10_000: 16_384 words, 2_048 blocks, about 49 keys each.
+        assert sketch.block_mask == 2_047
+
+        {statistic, critical} = block_chi_square(sketch, own)
+        assert statistic < critical, "partition #{p}: #{statistic} >= #{critical}"
+
+        # As the same keys do in an unpartitioned sketch for the whole cache.
+        {statistic, critical} = block_chi_square(Sketch.new(max_size), own)
+        assert statistic < critical, "unpartitioned, partition #{p}'s keys: #{statistic}"
+      end
+    end
+  end
+
   describe "reset" do
     @reset_mask 0x7777777777777777
 

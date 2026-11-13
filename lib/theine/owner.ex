@@ -7,8 +7,10 @@ defmodule Theine.Owner do
   `waiters` and `refreshing` tables (specs/07), allocates the `ids` and
   `pending` atomics, the `flags` and `sizes` atomics (one counter, flag or
   pair of size fields per partition, specs/12) and the stats counters, plus
-  the read buffer
-  (specs/03) and the frequency sketch (specs/02) when the cache is bounded,
+  the read buffer (specs/03; one group of stripes per partition) and the
+  frequency sketch (specs/02; one per partition, each sized for its share
+  of `max_size`, held in `sketches` when `partitions` is above 1) when the
+  cache is bounded,
   and writes the completed `%Theine.Config{}` to `:persistent_term`. An
   unbounded cache (`max_size: :infinity`) allocates neither, so its hits
   never touch `:atomics` (specs/08 §Acceptance). After that the process does
@@ -107,16 +109,17 @@ defmodule Theine.Owner do
     # one nil match there (specs/08 §Stats).
     request_counters = if(stats, do: counters, else: nil)
 
+    # `partitions` groups of `stripes` stripes, partition `p`'s group first
+    # at stripe `p * stripes` (specs/12 §The read buffer is split by
+    # partition); one group at `partitions: 1`.
     read_buffer =
-      if(bounded?, do: ReadBuffer.new(config.stripes, config.read_buffer_slots), else: nil)
-
-    hit =
       if(bounded?,
-        do:
-          {read_buffer, config.stripes - 1, 2 + config.read_buffer_slots,
-           config.read_buffer_slots - 1, config.drain_threshold - 1},
-        else: request_counters
+        do: ReadBuffer.new(config.stripes * config.partitions, config.read_buffer_slots),
+        else: nil
       )
+
+    hit = if(bounded?, do: buffer_hit(config, read_buffer), else: request_counters)
+    {sketch, sketches} = sketches(config)
 
     %{
       config
@@ -141,8 +144,42 @@ defmodule Theine.Owner do
         # span partitions), partition `p`'s from index `2p + 1`.
         sizes: :atomics.new(@size_fields * config.partitions, signed: true),
         read_buffer: read_buffer,
-        sketch: if(bounded?, do: Sketch.new(config.max_size), else: nil)
+        sketch: sketch,
+        sketches: sketches
     }
+  end
+
+  # The bounded `hit` tuple. A cache of one partition keeps the 5-tuple and
+  # its clause in `Theine.get/2`; a partitioned one adds the partition mask
+  # and the width of a group of stripes, so a hit finds its id's group with
+  # one `band`, one multiply and one add (specs/12 §The read buffer is split
+  # by partition).
+  defp buffer_hit(%Config{partitions: 1} = config, read_buffer) do
+    {read_buffer, config.stripes - 1, 2 + config.read_buffer_slots, config.read_buffer_slots - 1,
+     config.drain_threshold - 1}
+  end
+
+  defp buffer_hit(%Config{partitions: n} = config, read_buffer) do
+    width = 2 + config.read_buffer_slots
+
+    {read_buffer, config.stripes - 1, width, config.read_buffer_slots - 1,
+     config.drain_threshold - 1, n - 1, config.stripes * width}
+  end
+
+  # One sketch sized for `max_size` at `partitions: 1`; with `n > 1` one per
+  # partition, each sized for its share, held in `sketches` and handed to
+  # each partition by `Config.partition/2` (specs/12 §Each partition is a
+  # whole policy, specs/02 §Layout). None in an unbounded cache.
+  defp sketches(%Config{max_size: :infinity}), do: {nil, nil}
+  defp sketches(%Config{partitions: 1, max_size: max_size}), do: {Sketch.new(max_size), nil}
+
+  defp sketches(%Config{partitions: n, max_size: max_size}) do
+    sketches =
+      0..(n - 1)//1
+      |> Enum.map(&Sketch.new(Theine.Partition.share(max_size, n, &1)))
+      |> List.to_tuple()
+
+    {nil, sketches}
   end
 
   # `get/2` can refresh only with the cache's loader, so a cache without one

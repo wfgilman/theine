@@ -178,8 +178,10 @@ defmodule Theine do
     applied by one maintenance process, which caps the writes a cache can
     sustain; with `partitions: n` each key belongs to one of `n`
     processes, each with its own policy, expiry and `write_hwm`, so the
-    entries table may hold up to `n * write_hwm` unapplied writes. For now
-    only an unbounded cache (`max_size: :infinity`) takes more than one.
+    entries table may hold up to `n * write_hwm` unapplied writes. In a
+    bounded cache each partition evicts within its share of `max_size`,
+    `div(max_size, n)` or one more, which must be at least 10_000, and an
+    entry heavier than its partition's share is never stored.
   - `stats`: `false` stops `get/2` from counting hits and misses (see
     `stats/1`); load, eviction, expiration and refresh counts are kept
     either way.
@@ -261,6 +263,11 @@ defmodule Theine do
             %{hit: nil} ->
               :ok
 
+            # Only a bounded cache of `partitions: n > 1`: a 7-tuple
+            # (specs/12 §The read buffer is split by partition).
+            %{hit: {_, _, _, _, _, _, _} = hit} = config ->
+              record_partitioned(config, hit, id)
+
             # Only a cache with refresh_after_write and a loader: a
             # 3-tuple, which neither the counters ref nor the buffer
             # tuple is (specs/07 §Decisions M4.4).
@@ -328,6 +335,9 @@ defmodule Theine do
       nil ->
         :ok
 
+      {_, _, _, _, _, _, _} ->
+        record_partitioned(config, hit, id)
+
       counters ->
         :counters.add(counters, @hits, 1)
     end
@@ -352,6 +362,29 @@ defmodule Theine do
     n = :atomics.add_get(buffer, base, 1)
     :atomics.put(buffer, base + 2 + Bitwise.band(n - 1, slot_mask), id)
     if Bitwise.band(n, trigger_mask) == 0, do: ReadBuffer.schedule_drain(config)
+    :ok
+  end
+
+  # The bounded hit of a cache of `partitions: n > 1` (specs/12 §The read
+  # buffer is split by partition): `record/7` within the group of stripes
+  # of the id's partition, `id &&& (n - 1)`, which costs one `band`, one
+  # multiply and one add over it and no BIF, hash or `:atomics` op. The
+  # trigger asks that partition's process for a pass. A separate function
+  # and `hit` shape, so that the `n = 1` hit keeps its clause unchanged.
+  defp record_partitioned(
+         config,
+         {buffer, stripe_mask, width, slot_mask, trigger_mask, partition_mask, group_width},
+         id
+       ) do
+    p = Bitwise.band(id, partition_mask)
+
+    base =
+      p * group_width +
+        Bitwise.band(:erlang.system_info(:scheduler_id) - 1, stripe_mask) * width + 1
+
+    n = :atomics.add_get(buffer, base, 1)
+    :atomics.put(buffer, base + 2 + Bitwise.band(n - 1, slot_mask), id)
+    if Bitwise.band(n, trigger_mask) == 0, do: ReadBuffer.schedule_drain(config, p)
     :ok
   end
 
@@ -559,6 +592,8 @@ defmodule Theine do
 
   An entry whose weight exceeds `max_size` is not stored: the call returns
   `:ok` and the cache is unchanged, as Caffeine does with oversized entries.
+  With `partitions: n > 1` the limit is the share of `max_size` of the
+  key's partition.
 
       iex> {:ok, _} = Theine.start_link(name: :put_doc, max_size: :infinity)
       iex> Theine.put(:put_doc, :a, 1)

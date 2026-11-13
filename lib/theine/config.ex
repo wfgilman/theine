@@ -22,7 +22,11 @@ defmodule Theine.Config do
   `partition` is 0 in the stored config. A maintenance process works on
   `partition/2`'s view of it, which names its own partition, so that
   `Theine.Policy` publishes to that partition's fields of `sizes`
-  (specs/12 §Calls that span partitions).
+  (specs/12 §Calls that span partitions). In a bounded cache of `n > 1`
+  partitions the stored config keeps the whole `max_size`, its `sketch` is
+  nil and `sketches` holds one sketch per partition; the view carries the
+  partition's share and sketch (specs/12 §Each partition is a whole
+  policy).
   """
 
   @type cache :: atom()
@@ -34,7 +38,11 @@ defmodule Theine.Config do
   the read-buffer tuple `{buffer, stripes - 1, 2 + slots, slots - 1,
   drain_threshold - 1}` that `record/2` needs, the sizes precomputed as the
   bit masks and the stripe width the ring arithmetic uses (specs/03
-  §Decisions M2.8b); in an unbounded cache the request counters, or nil
+  §Decisions M2.8b); in a bounded cache of `n > 1` partitions the 7-tuple
+  `{buffer, stripes - 1, 2 + slots, slots - 1, drain_threshold - 1, n - 1,
+  stripes * (2 + slots)}`, which adds the partition mask and the width of
+  one partition's group of stripes (specs/12 §The read buffer is split by
+  partition); in an unbounded cache the request counters, or nil
   with `stats: false`. A cache with both `refresh_after_write` and a
   `loader:` wraps that value as `{:refresh, ms, hit}`, so only such a
   cache pays for the refresh check (specs/07 §Decisions M4.4).
@@ -44,6 +52,8 @@ defmodule Theine.Config do
   @type plain_hit ::
           {:atomics.atomics_ref(), non_neg_integer(), pos_integer(), non_neg_integer(),
            non_neg_integer()}
+          | {:atomics.atomics_ref(), non_neg_integer(), pos_integer(), non_neg_integer(),
+             non_neg_integer(), non_neg_integer(), pos_integer()}
           | :counters.counters_ref()
           | nil
 
@@ -86,7 +96,8 @@ defmodule Theine.Config do
           hit: hit(),
           sizes: :atomics.atomics_ref() | nil,
           read_buffer: :atomics.atomics_ref() | nil,
-          sketch: Theine.Sketch.t() | nil
+          sketch: Theine.Sketch.t() | nil,
+          sketches: tuple() | nil
         }
 
   @enforce_keys [
@@ -137,7 +148,8 @@ defmodule Theine.Config do
             hit: nil,
             sizes: nil,
             read_buffer: nil,
-            sketch: nil
+            sketch: nil,
+            sketches: nil
 
   @options [
     :name,
@@ -164,6 +176,10 @@ defmodule Theine.Config do
     :policy_module
   ]
 
+  # The least capacity share of a partition of a bounded cache (specs/12
+  # §Settled questions 1): a 1% window of at least 100 entries.
+  @min_share 10_000
+
   # Fields filled in by Theine.Owner, not by options. `request_counters` is
   # the same ref as `counters`, or nil with `stats: false`, so that the miss
   # path decides with one map key (specs/08 §Stats, §Decisions M1.6); `hit`
@@ -177,7 +193,8 @@ defmodule Theine.Config do
     :hit,
     :sizes,
     :read_buffer,
-    :sketch
+    :sketch,
+    :sketches
   ]
 
   @doc "The `start_link/1` option names, in the order of the specs/08 table."
@@ -245,33 +262,55 @@ defmodule Theine.Config do
     |> check_partitions!()
   end
 
-  # Bounded partitions need the read buffer split by partition and capacity
-  # shares (specs/12 §The read buffer is split by partition, §Each partition
-  # is a whole policy), which are not built yet: until then only an
-  # unbounded cache, which has neither, may run more than one partition.
+  # A bounded cache of `n > 1` partitions runs `n` policies over shares of
+  # `max_size`, and a small share dilutes admission and the hill climber
+  # (specs/12 §Costs, §Settled questions 1): each share must hold at least
+  # `@min_share`. An unbounded cache has no policy to dilute.
   defp check_partitions!(%__MODULE__{partitions: 1} = config),
     do: %{config | maintenances: maintenance_names(config.name, 1)}
 
-  defp check_partitions!(%__MODULE__{partitions: n, max_size: :infinity} = config),
-    do: %{config | maintenances: maintenance_names(config.name, n)}
+  defp check_partitions!(%__MODULE__{partitions: n, max_size: max_size} = config)
+       when max_size == :infinity or div(max_size, n) >= @min_share,
+       do: %{config | maintenances: maintenance_names(config.name, n)}
 
   defp check_partitions!(%__MODULE__{partitions: n, max_size: max_size}) do
     raise ArgumentError,
-          "option :partitions (#{n}) needs max_size: :infinity, got max_size: #{max_size}: " <>
-            "a bounded cache runs one partition until bounded partitions are built " <>
-            "(specs/12, IMPLEMENTATION_PLAN.md M8.4)"
+          "option :partitions (#{n}) needs a max_size of at least #{n * @min_share}, " <>
+            "got max_size: #{max_size}: each partition's share, div(max_size, partitions), " <>
+            "must be at least #{@min_share} (specs/12 §Settled questions 1)"
   end
 
   @doc """
-  The view of `config` that partition `p`'s maintenance process works on:
-  the same config with `partition` set to `p` (specs/12 §Each partition is
-  a whole policy). The stored config is partition 0's view.
+  The least share of `max_size` a partition of a bounded cache with
+  `partitions` above 1 may have: `start_link` raises when
+  `div(max_size, partitions)` is below it (specs/12 §Settled questions 1).
+  """
+  @spec min_share() :: 10_000
+  def min_share, do: @min_share
+
+  @doc """
+  The view of `config` that partition `p`'s maintenance process works on
+  (specs/12 §Each partition is a whole policy): `partition` set to `p`, and
+  in a bounded cache of `n > 1` partitions `max_size` set to the
+  partition's share (`Theine.Partition.share/3`) and `sketch` to its own
+  sketch, `elem(sketches, p)`. The policy, the restart rebuild and `info/2`
+  read both from the view, so each partition is a whole W-TinyLFU over its
+  share. At `n = 1` the view of partition 0 is the stored config.
 
       iex> config = Theine.Config.new!(name: :c, max_size: :infinity, partitions: 4)
       iex> Theine.Config.partition(config, 2).partition
       2
+      iex> config = Theine.Config.new!(name: :c, max_size: 40_002, partitions: 4)
+      iex> Theine.Config.partition(config, 1).max_size
+      10_001
   """
   @spec partition(t(), non_neg_integer()) :: t()
+  def partition(%__MODULE__{partitions: n, max_size: max_size, sketches: sketches} = config, p)
+      when is_integer(p) and p >= 0 and p < n and n > 1 and is_integer(max_size) do
+    sketch = if is_tuple(sketches), do: elem(sketches, p), else: nil
+    %{config | partition: p, max_size: Theine.Partition.share(max_size, n, p), sketch: sketch}
+  end
+
   def partition(%__MODULE__{partitions: n} = config, p)
       when is_integer(p) and p >= 0 and p < n,
       do: %{config | partition: p}

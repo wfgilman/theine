@@ -343,6 +343,114 @@ defmodule Theine.ReadBufferTest do
     end
   end
 
+  describe "partitions (specs/12 §The read buffer is split by partition)" do
+    # `config/1` over `n` groups of stripes, with one drain flag per
+    # partition and `names` as the partitions' maintenance names.
+    defp partitioned(n, opts) do
+      stripes = Keyword.get(opts, :stripes, 1)
+      slots = Keyword.get(opts, :slots, 8)
+      names = Keyword.get_lazy(opts, :names, fn -> for(_ <- 1..n, do: unique_maintenance()) end)
+
+      %{
+        config(opts)
+        | partitions: n,
+          read_buffer: ReadBuffer.new(stripes * n, slots),
+          flags: :atomics.new(n, signed: false),
+          maintenance: hd(names),
+          maintenances: List.to_tuple(names)
+      }
+    end
+
+    defp view(config, p), do: Config.partition(config, p)
+
+    defp flags(config, n), do: for(i <- 1..n, do: :atomics.get(config.flags, i))
+
+    test "a hit records into the stripes of its id's partition" do
+      n = 4
+      stripes = 2
+      per_reader = 8
+      config = partitioned(n, stripes: stripes, slots: 32, threshold: 128)
+
+      # Every reader records ids of every partition: id &&& 3 cycles.
+      schedulers = record_pinned(config, fn s -> for i <- 1..per_reader, do: s * 100 + i end)
+
+      for p <- 0..(n - 1) do
+        dump = ReadBuffer.dump(view(config, p))
+        assert length(dump) == stripes
+        assert ReadBuffer.group(view(config, p)) == {p * stripes, (p + 1) * stripes}
+
+        for {%{tail: tail, head: 0, ids: ids}, s} <- Enum.with_index(dump) do
+          expected =
+            for sched <- 1..schedulers,
+                ReadBuffer.stripe_of(sched, stripes) == s,
+                i <- 1..per_reader,
+                id = sched * 100 + i,
+                Bitwise.band(id, n - 1) == p,
+                do: id
+
+          assert tail == length(expected)
+          # Readers sharing a stripe interleave, so compare as sets.
+          assert Enum.sort(Enum.take(ids, tail)) == Enum.sort(expected)
+        end
+      end
+
+      # The hit count sums the tails of every group.
+      assert ReadBuffer.hits(config) == per_reader * schedulers
+    end
+
+    test "a partition's drain sees only its own ids" do
+      n = 4
+      config = partitioned(n, slots: 8, threshold: 128)
+      # Ten ids of each partition: partition p's group of one stripe of 8
+      # is lapped, the others are not touched by its drain.
+      record_all(config, 1..40)
+
+      assert for(p <- 0..3, do: ReadBuffer.lag(view(config, p))) == [10, 10, 10, 10]
+
+      # Partition 2 drains its eight newest ids (and finds its ring full),
+      # and nobody else's lag moves.
+      assert {ids, 8, true} = drain_list(view(config, 2))
+      assert ids == Enum.filter(1..40, &(Bitwise.band(&1, 3) == 2)) |> Enum.drop(2)
+      assert for(p <- 0..3, do: ReadBuffer.lag(view(config, p))) == [10, 10, 0, 10]
+      assert {[], 0, false} = drain_list(view(config, 2))
+
+      # A restart of partition 1 moves only its heads.
+      assert ReadBuffer.reset_heads(view(config, 1)) == :ok
+      assert for(p <- 0..3, do: ReadBuffer.lag(view(config, p))) == [10, 0, 0, 10]
+
+      record_all(config, [4, 8, 5])
+      assert {[5], 1, false} = drain_list(view(config, 1))
+      assert {own, 8, true} = drain_list(view(config, 0))
+      assert Enum.all?(own, &(Bitwise.band(&1, 3) == 0))
+      assert Enum.take(own, -2) == [4, 8]
+
+      # Every recorded read is still a hit, drained, dropped or reset.
+      assert ReadBuffer.hits(config) == 43
+    end
+
+    test "every drain_threshold-th read of a partition's stripe asks that partition's process" do
+      name = register_as_maintenance()
+      names = [unique_maintenance(), unique_maintenance(), name, unique_maintenance()]
+      config = partitioned(4, slots: 8, threshold: 4, names: names)
+
+      # Three reads of partition 2 and seven of the others trigger nothing.
+      record_all(config, [2, 6, 10, 1, 5, 9, 3, 7, 11, 4])
+      assert flags(config, 4) == [0, 0, 0, 0]
+      refute_received :drain
+
+      # Partition 2's fourth read flips its flag and sends to its process.
+      record_all(config, [14])
+      assert_received :drain
+      assert flags(config, 4) == [0, 0, 1, 0]
+
+      # Partition 1's fourth read sets its own flag; its name is not
+      # registered, so nothing arrives and nothing raises.
+      record_all(config, [13])
+      assert flags(config, 4) == [0, 1, 1, 0]
+      refute_received :drain
+    end
+  end
+
   describe "properties (specs/03 §Acceptance)" do
     property "drain yields a sub-multiset of recorded ids, never more than slots per stripe" do
       check all slots <- member_of([1, 2, 4, 8, 16]),

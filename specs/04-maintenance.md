@@ -476,3 +476,12 @@ and `p`; partition 0 keeps the cache name's seed.
   matches `%{cache: c}` still matches. A partitioned cache's `clear/1`
   calls `reset/2`, and its `run_maintenance/1` calls `run/2`, on
   partitions 0 to `n - 1` in order, each after the previous call returned.
+- 2026-11-13 (M8.4): a bounded partition. Partition `p`'s view of the
+  config carries its share of `max_size` and its own sketch (specs/12 §Each
+  partition is a whole policy), so its policy, its over-capacity check
+  after a rebuild and `info/2`'s `sketch` all read the share. Its restart
+  moves only its own group's read-buffer heads (`ReadBuffer.reset_heads/1`
+  works on `config.partition`'s group) and clears only its own sketch, and
+  a reader's trigger sends `:drain` to the partition of the id it read.
+  `info/2`'s `read_buffer` reports the partition's `stripes` and the lag
+  of its own group.

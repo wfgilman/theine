@@ -4,8 +4,11 @@ Status: settled for v2 on 2026-11-12 (§Settled questions), planned as
 IMPLEMENTATION_PLAN.md §M8 and being built. Built so far: ids and routing
 (M8.1, `Theine.Partition`), and `n` maintenance processes under
 `Theine.Partitions` with per-partition `pending`, backpressure, drain flag,
-`sizes` fields and restart (M8.2). `partitions` is a `start_link` option;
-`n > 1` is accepted only with `max_size: :infinity` until M8.4.
+`sizes` fields and restart (M8.2), the calls that span partitions (M8.3),
+and bounded partitions: the read buffer split by partition, the
+partitioned `hit` shape, capacity shares, a sketch per share and the
+minimum share (M8.4). `partitions` is a `start_link` option. The bench
+subjects (M8.5) and the docs (M8.6) remain.
 It is the follow-on to milestone M7: M7 lowers the cost of a write event
 inside one maintenance process, and this note lets one cache run several
 of them. It says how a cache splits its policy across `partitions`
@@ -416,3 +419,21 @@ except where noted.
   span partitions states them (specs/04, 08 §Decisions M8.3). The pass and
   rebuild metadata gain `partition` at every `n`. A test drives every call
   of specs/08 §Calls on an unbounded `partitions: 4` cache.
+- 2026-11-13 (M8.4): bounded partitions built as §The read buffer is split
+  by partition and §Each partition is a whole policy state them (specs/01,
+  02, 03, 04, 05, 08, 10 §Decisions M8.4). Three details the note left
+  open. (1) The partitioned `hit` is the 7-tuple `{buffer, stripe_mask,
+  width, slot_mask, trigger_mask, n - 1, stripes * width}`: with the group
+  width precomputed, `base` is `p * group_width + s * width + 1`, the one
+  `band`, one multiply and one add the note budgets. (2) The share and the
+  sketch live in `Config.partition/2`'s view, as M8.2 planned: the stored
+  config keeps the whole `max_size`, a nil `sketch` and the `sketches`
+  tuple, and the view swaps in the partition's share and sketch, so
+  `Theine.Policy` and `Theine.Maintenance` needed no change beyond
+  `ReadBuffer` working on the view's group. (3) The weight limit is
+  checked against the key's own share without a second hash in the common
+  case: a weight up to `div(max_size, n)` fits every share, one above
+  `div(max_size, n) + 1` fits none, and only the weight in between hashes
+  the key (`Theine.Partition.oversized?/4`). The minimum share is
+  `Theine.Config.min_share/0`, and the error names the least `max_size`
+  for the given `n`.

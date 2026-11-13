@@ -26,6 +26,12 @@ million-entry cache (8 MB) costs the maintenance process no GC.
   it simply keeps the four reads for one key adjacent).
 - `sample_size = 10 * max_size`, `size` is the number of increments since the
   last reset (a plain integer in the maintenance state).
+- With `partitions: n > 1` (specs/12 §Each partition is a whole policy)
+  each partition has its own sketch, sized and sampled as above for its
+  share of `max_size` in place of `max_size`, so the total is about one
+  sketch for the cache. The Owner allocates them as the tuple `sketches`;
+  partition `p`'s view of the config (`Theine.Config.partition/2`) carries
+  `elem(sketches, p)` as its `sketch`.
 
 ## Hashing
 
@@ -106,6 +112,10 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
 - Chunked reset: a sketch of 2^20 words resets in passes that each touch at
   most `reset_chunk` words, and `frequency/2` stays within `[old/2, old]` of
   the true halved value for any key throughout.
+- Partition independence (specs/12 §Acceptance): at `n = 8` and a share of
+  10_000, 100_000 random keys of one partition fill its sketch's blocks
+  evenly (a chi-square test at the 1% level), as the same keys do in a
+  sketch for the whole cache. The test checks every partition.
 
 ## Decisions
 
@@ -206,3 +216,13 @@ point: TinyLFU estimates recent popularity, not lifetime popularity.
   the full-width reference still match `positions/2`, which now goes
   through `hash/1`, and a property checks that the hashed variants change
   and read exactly the words the key-taking ones do.
+- 2026-11-13 (M8.4): one sketch per partition (§Layout, specs/12 §Each
+  partition is a whole policy). The Owner allocates `Sketch.new(share)` for
+  each partition into the config's `sketches` tuple and leaves the stored
+  config's `sketch` nil with `n > 1`; `Theine.Config.partition/2` hands
+  partition `p` its own. At `n = 1` nothing changed: one sketch for
+  `max_size` in `sketch`, and `sketches` nil. The block-evenness argument
+  of specs/12 §The partition of a key held: the chi-square statistic of
+  each of the eight partitions' 100_000 keys over its 2_048 blocks is below
+  the 1% point, and so is that of the same keys over the 16_384 blocks of
+  a whole-cache sketch.

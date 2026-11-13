@@ -33,7 +33,7 @@ children = [
 | `evict_batch` | pos_integer | 1024 | 04, 05 |
 | `maintenance_interval` | ms | 1000 | 04 |
 | `drain_backoff` | non_neg_integer | 3 | 04 (a drain-triggered pass waits this multiple of the last pass's duration; 0 disables) |
-| `partitions` | power of two, 1..64 | 1 | 12 (maintenance processes; more than 1 needs `max_size: :infinity` until M8.4) |
+| `partitions` | power of two, 1..64 | 1 | 12 (maintenance processes; with a finite `max_size`, more than 1 needs `div(max_size, partitions) >= 10_000`) |
 | `stats` | boolean | true | this file |
 | `eviction_listener` | boolean | false | this file (§Telemetry `[:theine, :eviction]`) |
 | `test_hooks` | boolean | false | 04 (`pause/1`, `resume/1`; tests only) |
@@ -81,7 +81,11 @@ With `partitions: n > 1` (specs/12 §Calls that span partitions), `size/1`
 and `weighted_size/1` sum the `n` partitions' fields, `clear/1` empties the
 table and then resets each partition in turn, and `run_maintenance/1` runs
 one pass of each partition in order, returning after the last. The other
-calls are per key and unchanged.
+calls are per key and unchanged, except that in a bounded cache an entry
+heavier than its key's partition's share of `max_size` (specs/12 §Each
+partition is a whole policy), rather than `max_size` itself, is not
+stored: `put`, `put_new` and a loader's commit return as they do for an
+entry heavier than `max_size`. The `start_link/1` doc must say so.
 
 Return conventions: `{:ok, v} | :error` mirrors `Map.fetch/2`; `{:error,
 reason}` only where a reason exists (loads). No bang variants in v1.
@@ -311,3 +315,11 @@ specs/09.
   is not a snapshot, which "as last seen by maintenance" already allows.
   `Theine.Maintenance.info/1` stays partition 0's, as specs/12 says, so
   existing tests read the same thing; there is no cache-wide `info`.
+- 2026-11-13 (M8.4): M8.2's restriction is lifted. A finite `max_size`
+  with `partitions: n > 1` is accepted when `div(max_size, n)` is at least
+  10_000 (`Theine.Config.min_share/0`), and otherwise raises
+  `ArgumentError` naming the least `max_size` for that `n` (specs/12
+  §Settled questions 1). The stored config keeps the whole `max_size`;
+  each partition's view carries its share. An entry heavier than its key's
+  partition's share is not stored, which the `start_link/1` and `put/4`
+  docs state.

@@ -292,6 +292,95 @@ defmodule Theine.TracingTest do
       # Every hit claimed a sequence, overwritten or not (specs/03 §Hits from the tails).
       assert %Theine.Stats{hits: 12} = Theine.stats(cache)
     end
+
+    # specs/12 §Constraints, §Acceptance Hot path: a partitioned hit may add
+    # integer arithmetic, not a BIF call, a hash or an `:atomics` op.
+    test "the partitioned hit's multiset equals the bounded hit's", %{bounded: bounded} do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache] ++ Keyword.merge(@bounded, max_size: 40_000, partitions: 4)}
+      )
+
+      Theine.put(cache, :present, 1)
+      Theine.run_maintenance(cache)
+      # The first call of a path loads modules, which reads persistent_term.
+      {:ok, 1} = Theine.get(cache, :present)
+      {:ok, 1} = Theine.get(bounded, :present)
+
+      for modules <- [@modules, [:erlang]] do
+        partitioned = Trace.calls(modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+        unpartitioned = Trace.calls(modules, fn -> {:ok, 1} = Theine.get(bounded, :present) end)
+
+        assert partitioned == unpartitioned
+        refute Map.has_key?(partitioned, {:erlang, :phash2, 2})
+      end
+    end
+
+    # specs/12 §Costs: a partitioned put adds one `phash2` and integer
+    # arithmetic; a partitioned delete adds nothing.
+    test "the partitioned put and delete multisets equal the bounded ones, plus one hash on the put",
+         %{bounded: bounded} do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache] ++ Keyword.merge(@bounded, max_size: 40_000, partitions: 4)}
+      )
+
+      for c <- [cache, bounded], do: :ok = Theine.put(c, :warm, 0)
+
+      put = fn c -> fn -> :ok = Theine.put(c, :new, 1) end end
+      delete = fn c -> fn -> :ok = Theine.delete(c, :new) end end
+
+      for op <- [put, delete] do
+        assert Trace.calls(@modules, op.(cache)) == Trace.calls(@modules, op.(bounded))
+      end
+
+      # Restore :new in both, then compare the :erlang calls too.
+      for c <- [cache, bounded], do: :ok = Theine.put(c, :new, 1)
+      partitioned = Trace.calls([:erlang], put.(cache))
+      unpartitioned = Trace.calls([:erlang], put.(bounded))
+      assert partitioned[{:erlang, :phash2, 2}] == 1
+      assert Map.delete(partitioned, {:erlang, :phash2, 2}) == unpartitioned
+
+      assert Trace.calls([:erlang], delete.(cache)) == Trace.calls([:erlang], delete.(bounded))
+    end
+
+    test "every drain_threshold-th partitioned hit adds one compare_exchange and asks its partition" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine, [name: cache] ++ Keyword.merge(@bounded, max_size: 40_000, partitions: 4)}
+      )
+
+      Theine.put(cache, :present, 1)
+      Theine.run_maintenance(cache)
+      p = Theine.Partition.of_key(:present, 4)
+      for q <- 0..3, do: Theine.Maintenance.pause(cache, q)
+
+      # Sequences 0..2 of the key's partition's one stripe; the fourth hit
+      # claims sequence 3, a trigger.
+      for _ <- 1..3, do: {:ok, 1} = Theine.get(cache, :present)
+      calls = Trace.calls(@modules, fn -> {:ok, 1} = Theine.get(cache, :present) end)
+
+      assert calls == %{
+               {:persistent_term, :get, 1} => 1,
+               {:ets, :lookup, 2} => 1,
+               {:atomics, :add_get, 3} => 1,
+               {:atomics, :put, 3} => 1,
+               {:atomics, :compare_exchange, 4} => 1
+             }
+
+      # The flag set is the key's partition's, and its process got the
+      # `:drain`: once resumed, it drains its group to nothing.
+      flags = Theine.Config.get(cache).flags
+      assert for(q <- 1..4, do: :atomics.get(flags, q)) == List.replace_at([0, 0, 0, 0], p, 1)
+      for q <- 0..3, do: Theine.Maintenance.resume(cache, q)
+
+      assert_eventually(fn ->
+        assert %{read_buffer: %{lag: 0}} = Theine.Maintenance.info(cache, p)
+      end)
+    end
   end
 
   describe "refresh_after_write" do

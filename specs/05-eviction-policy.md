@@ -19,6 +19,14 @@ percentage is a `start_link` option `window_percent` (default 1), so the
 hit-rate bench can sweep it, and it is the starting size for the adaptive
 window (§Adaptive window), which is on by default and moves it from there.
 
+With `partitions: n > 1` (specs/12 §Each partition is a whole policy)
+each partition's policy runs everything in this spec over its capacity
+share, `div(max_size, n)` plus one for `p < rem(max_size, n)`, in place of
+`max_size`: its regions, its sampling, its climber steps and its eviction
+bound. The shares add up to `max_size`, and `start_link` raises unless
+`div(max_size, n)` is at least 10_000 (specs/12 §Settled questions 1).
+Nothing inside the policy changes; its config view carries the share.
+
 ## State (private ETS, owned by maintenance)
 
 ```
@@ -620,3 +628,8 @@ the window moves, and records the answer in §Decisions. Unbounded
   whole cache at `partitions: 1`. Nothing else in the policy changed: at
   `n = 1` the indices are the constants 1 and 2 they were, read from the
   struct.
+- 2026-11-13 (M8.4): capacity shares (§Regions and sizes). `new/1` reads
+  `max_size` and `sketch` from the config it is given, and partition `p`'s
+  view of the config carries the share and the partition's own sketch
+  (`Theine.Config.partition/2`), so the policy module did not change. At
+  `partitions: 1` the view is the stored config.

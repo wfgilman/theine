@@ -1,5 +1,6 @@
 defmodule Theine.ConfigTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias Theine.Config
 
@@ -87,19 +88,45 @@ defmodule Theine.ConfigTest do
       end
     end
 
-    test "a finite max_size takes one partition only, until bounded partitions are built" do
+    # specs/12 §Settled questions 1. This replaces M8.2's test that a finite
+    # max_size took one partition only: M8.4 lifts that restriction.
+    test "minimum share" do
+      assert Config.min_share() == 10_000
       assert Config.new!(name: :x, max_size: 100, partitions: 1).partitions == 1
 
-      for n <- [2, 4, 64] do
+      for n <- [2, 4, 8, 64] do
+        # div(max_size, n) at the minimum is accepted, one below it is not.
+        assert Config.new!(name: :x, max_size: n * 10_000, partitions: n).partitions == n
+        assert Config.new!(name: :x, max_size: n * 10_000 + n - 1, partitions: n).partitions == n
+
         assert_raise ArgumentError,
-                     ~r/:partitions \(#{n}\) needs max_size: :infinity.*M8\.4/,
-                     fn ->
-                       Config.new!(name: :x, max_size: 100_000, partitions: n)
-                     end
+                     ~r/:partitions \(#{n}\) needs a max_size of at least #{n * 10_000}/,
+                     fn -> Config.new!(name: :x, max_size: n * 10_000 - 1, partitions: n) end
+      end
+
+      # An unbounded cache has no policy to dilute, so no minimum.
+      assert Config.new!(name: :x, max_size: :infinity, partitions: 64).partitions == 64
+    end
+
+    property "shares add up to max_size" do
+      check all exponent <- integer(0..6),
+                extra <- integer(0..1_000_000) do
+        n = Integer.pow(2, exponent)
+        max_size = n * 10_000 + extra
+        shares = for p <- 0..(n - 1), do: Theine.Partition.share(max_size, n, p)
+
+        assert Enum.sum(shares) == max_size
+        assert Enum.max(shares) - Enum.min(shares) <= 1
+        # The larger shares are the first rem(max_size, n).
+        assert shares == Enum.sort(shares, :desc)
+
+        config = Config.new!(name: :x, max_size: max_size, partitions: n)
+
+        assert for(p <- 0..(n - 1), do: Config.partition(config, p).max_size) == shares
       end
     end
 
-    test "partition/2 is the stored config with its partition set" do
+    test "partition/2 of an unbounded cache is the stored config with its partition set" do
       config = Config.new!(Keyword.put(@required, :partitions, 4))
 
       for p <- 0..3 do
@@ -107,6 +134,24 @@ defmodule Theine.ConfigTest do
       end
 
       assert_raise FunctionClauseError, fn -> Config.partition(config, 4) end
+    end
+
+    test "partition/2 of a bounded cache carries the partition's share and sketch" do
+      config = Config.new!(name: :x, max_size: 40_002, partitions: 4)
+      sketches = List.to_tuple(for p <- 0..3, do: {:sketch, p})
+      config = %{config | sketches: sketches}
+
+      for {p, share} <- [{0, 10_001}, {1, 10_001}, {2, 10_000}, {3, 10_000}] do
+        assert Config.partition(config, p) ==
+                 %{config | partition: p, max_size: share, sketch: {:sketch, p}}
+      end
+
+      # Before the Owner allocated them, the view has no sketch.
+      assert Config.partition(%{config | sketches: nil}, 1).sketch == nil
+
+      # A bounded cache of one partition: the stored config itself.
+      one = Config.new!(name: :x, max_size: 1_000)
+      assert Config.partition(one, 0) == one
     end
   end
 

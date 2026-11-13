@@ -70,7 +70,11 @@ A hit performs exactly these operations, in this order, and nothing else:
 4. `:persistent_term.get(name)` → config.
 5. `Theine.ReadBuffer.record(config, id)` (specs/03): one scheduler-id read,
    at most two atomics ops, and at most one more atomics op plus one message
-   send when the stripe crosses its drain threshold.
+   send when the stripe crosses its drain threshold. A bounded cache of
+   `partitions: n > 1` has its own `hit` shape, a 7-tuple, and records into
+   the stripes of the id's partition `id &&& (n - 1)` with the same calls
+   and three more integer operations (specs/03 §Layout, specs/12 §The read
+   buffer is split by partition).
 6. Increment the hit counter. Return `{:ok, value}`.
 
 The miss path increments one counter and returns. Misses are not recorded in
@@ -211,3 +215,14 @@ are emptied before `clear/1` returns.
   spec's M1.2 figures, against a put of about 1 µs; the read path is
   untouched. `ids` and `pending` are allocated with one counter per
   partition, which at `n = 1` is the one counter each had before.
+- 2026-11-13 (M8.4): the partitioned hit. `Theine.get/2` gains a clause
+  for the 7-tuple `hit` after the 5-tuple's, calling a local
+  `record_partitioned/3` with the tuple whole, so the `n = 1` clauses are
+  unchanged and the body grows by one call. tracing_test pins the
+  partitioned hit's multiset over `:ets`, `:atomics`, `:counters`,
+  `:persistent_term` and `:erlang` as equal to the bounded hit's. The
+  write path's oversize check takes the key's partition's share with
+  `n > 1` (specs/12 §Each partition is a whole policy); it hashes the key
+  a second time only for a weight of exactly `div(max_size, n) + 1`, the
+  one weight that fits some shares and not others, and not at all at
+  `n = 1`.

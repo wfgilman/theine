@@ -110,3 +110,12 @@ correctness is in the branches (claim races, admission ties, stale ids).
   (default 90%, the suite is at 97%), so the per-module floor is read, not
   enforced by the tool. Cover compilation adds about a second to the
   suite (13.7 s against 12.6 s) and did not change its results.
+- 2026-11-13 (M8.4): the partitioned hit's multiset (specs/12 §Acceptance
+  Hot path) is pinned in tracing_test as equal to the bounded hit's, over
+  the four hot-path modules and over `:erlang`, so an added BIF or hash
+  fails it; a second test pins the trigger hit (one more
+  `compare_exchange`) and that the `:drain` goes to the id's partition.
+  A third pins the partitioned put and delete: over the four modules both
+  equal the bounded cache's, and over `:erlang` the put adds exactly one
+  `phash2/2` (specs/12 §Costs) and the delete adds nothing. The multisets
+  of a cache of one partition are unchanged.

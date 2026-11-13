@@ -28,6 +28,7 @@ defmodule Theine.ConfigTest do
     assert config.evict_batch == 1024
     assert config.maintenance_interval == 1000
     assert config.drain_backoff == 3
+    assert config.partitions == 1
     assert config.stats == true
     assert config.eviction_listener == false
     assert config.test_hooks == false
@@ -53,18 +54,60 @@ defmodule Theine.ConfigTest do
     assert Enum.all?([config.ids, config.pending, config.flags, config.counters], &is_nil/1)
   end
 
-  test "has one partition, whose maintenance name is today's, and is not an option yet" do
+  test "has one partition by default, whose maintenance name is today's" do
     config = Config.new!(@required)
 
     assert config.partitions == 1
+    assert config.partition == 0
     assert config.maintenances == {config.maintenance}
-    refute :partitions in Config.options()
 
     assert Config.maintenance_names(:config_test, 4) ==
              {:"Elixir.Theine.Maintenance.config_test",
               :"Elixir.Theine.Maintenance.config_test.Partition1",
               :"Elixir.Theine.Maintenance.config_test.Partition2",
               :"Elixir.Theine.Maintenance.config_test.Partition3"}
+  end
+
+  describe "the partitions option (specs/12 §What is asked)" do
+    test "takes a power of two from 1 to 64 and names one maintenance process per partition" do
+      for n <- [1, 2, 4, 8, 16, 32, 64] do
+        config = Config.new!(Keyword.put(@required, :partitions, n))
+
+        assert config.partitions == n
+        assert config.maintenances == Config.maintenance_names(:config_test, n)
+        assert elem(config.maintenances, 0) == config.maintenance
+      end
+    end
+
+    test "rejects anything else, naming the option" do
+      for n <- [0, -1, 3, 6, 12, 128, 1.0, :four, nil] do
+        assert_raise ArgumentError, ~r/:partitions.*power of two from 1 to 64/, fn ->
+          Config.new!(Keyword.put(@required, :partitions, n))
+        end
+      end
+    end
+
+    test "a finite max_size takes one partition only, until bounded partitions are built" do
+      assert Config.new!(name: :x, max_size: 100, partitions: 1).partitions == 1
+
+      for n <- [2, 4, 64] do
+        assert_raise ArgumentError,
+                     ~r/:partitions \(#{n}\) needs max_size: :infinity.*M8\.4/,
+                     fn ->
+                       Config.new!(name: :x, max_size: 100_000, partitions: n)
+                     end
+      end
+    end
+
+    test "partition/2 is the stored config with its partition set" do
+      config = Config.new!(Keyword.put(@required, :partitions, 4))
+
+      for p <- 0..3 do
+        assert Config.partition(config, p) == %{config | partition: p}
+      end
+
+      assert_raise FunctionClauseError, fn -> Config.partition(config, 4) end
+    end
   end
 
   test "every option is accepted with a valid value" do
@@ -90,6 +133,7 @@ defmodule Theine.ConfigTest do
         evict_batch: 6,
         maintenance_interval: 50,
         drain_backoff: 0,
+        partitions: 8,
         stats: false,
         eviction_listener: true,
         test_hooks: true,
@@ -111,6 +155,7 @@ defmodule Theine.ConfigTest do
     assert config.evict_batch == 6
     assert config.maintenance_interval == 50
     assert config.drain_backoff == 0
+    assert config.partitions == 8
     refute config.stats
     assert config.eviction_listener
     assert config.test_hooks
@@ -155,6 +200,7 @@ defmodule Theine.ConfigTest do
       maintenance_interval: 0,
       drain_backoff: -1,
       drain_backoff: 1.5,
+      partitions: 3,
       stats: :yes,
       eviction_listener: nil,
       test_hooks: 1,

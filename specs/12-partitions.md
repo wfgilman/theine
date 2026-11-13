@@ -2,8 +2,10 @@
 
 Status: settled for v2 on 2026-11-12 (§Settled questions), planned as
 IMPLEMENTATION_PLAN.md §M8 and being built. Built so far: ids and routing
-(M8.1, `Theine.Partition`), with `partitions` fixed at 1 and not yet a
-`start_link` option.
+(M8.1, `Theine.Partition`), and `n` maintenance processes under
+`Theine.Partitions` with per-partition `pending`, backpressure, drain flag,
+`sizes` fields and restart (M8.2). `partitions` is a `start_link` option;
+`n > 1` is accepted only with `max_size: :infinity` until M8.4.
 It is the follow-on to milestone M7: M7 lowers the cost of a write event
 inside one maintenance process, and this note lets one cache run several
 of them. It says how a cache splits its policy across `partitions`
@@ -397,3 +399,16 @@ except where noted.
   `Theine.Maintenance.<cache>.Partition<p>` (`Config.maintenance_name/2`),
   and `config.maintenances` holds the `n` names as a tuple. `partitions`
   stays 1 and is not an option until M8.2.
+- 2026-11-13 (M8.2): `n` maintenance processes for unbounded caches. Each
+  works on its own view of the config, `Config.partition(config, p)`,
+  whose `partition` field gives every per-partition index: `pending` and
+  the drain flag at `p + 1`, `sizes` from `2p + 1` (specs/04, 05
+  §Decisions M8.2). The supervisor is `Theine.Partitions`, registered as
+  `Theine.Partitions.<cache>`, with child ids `{Theine.Maintenance, p}`.
+  Partition `p > 0` seeds `:rand` from `{cache, p}` and partition 0 from
+  the cache name, as at `n = 1`. A process schedules its own follow-up
+  pass with `ReadBuffer.schedule_drain/2`; readers keep `schedule_drain/1`
+  until M8.4 gives them one flag per partition. `Maintenance.info/2`
+  exists from M8.2, because the isolation tests read each partition;
+  M8.3 still owns the calls that span partitions and the telemetry
+  metadata.

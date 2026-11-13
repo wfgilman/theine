@@ -216,4 +216,66 @@ defmodule Theine.WriteEventsTest do
       assert size == @hwm + blocked
     end
   end
+
+  describe "backpressure with partitions: 4 (specs/12 §Each partition is a whole policy)" do
+    @hwm 8
+    @n 4
+
+    # The first `count` integer keys of partition `p`.
+    defp keys_of(p, count) do
+      Stream.iterate(1, &(&1 + 1))
+      |> Stream.filter(&(Theine.Partition.of_key(&1, @n) == p))
+      |> Enum.take(count)
+    end
+
+    test "backpressure on one partition does not block a writer of another" do
+      cache = unique_cache()
+
+      start_supervised!(
+        {Theine,
+         name: cache,
+         max_size: :infinity,
+         partitions: @n,
+         write_hwm: @hwm,
+         test_hooks: true,
+         maintenance_interval: 60_000}
+      )
+
+      config = Config.get(cache)
+      test = self()
+      :ok = Maintenance.pause(cache, 1)
+
+      # Partition 1's writers: the first hwm send and return, the other
+      # three block in a call that partition 1 cannot answer while paused.
+      for key <- keys_of(1, @hwm + 3) do
+        spawn_link(fn ->
+          :ok = Theine.put(cache, key, key)
+          send(test, {:done, key})
+        end)
+      end
+
+      assert_eventually(fn -> :atomics.get(config.pending, 2) == @hwm + 3 end)
+      assert count_done(50) == @hwm
+
+      # A writer of partition 2 writes ten times its partition's hwm and
+      # returns, while partition 1's writers are still blocked.
+      others = keys_of(2, 10 * @hwm)
+
+      spawn_link(fn ->
+        for key <- others, do: :ok = Theine.put(cache, key, key)
+        send(test, :other_done)
+      end)
+
+      assert_receive :other_done, 5_000
+      assert count_done(0) == 0
+      assert :atomics.get(config.pending, 2) == @hwm + 3
+      assert_eventually(fn -> Maintenance.info(cache, 2).pending == 0 end)
+      assert Maintenance.info(cache, 2).size == length(others)
+
+      :ok = Maintenance.resume(cache, 1)
+      assert count_done(500) == 3
+      assert_eventually(fn -> Maintenance.info(cache, 1).pending == 0 end)
+      assert Maintenance.info(cache, 1).size == @hwm + 3
+    end
+  end
 end

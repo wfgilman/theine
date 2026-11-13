@@ -98,6 +98,7 @@ defmodule Theine.Policy do
           expiry: Expiry.t(),
           table: Config.cache(),
           sizes: :atomics.atomics_ref(),
+          size_at: pos_integer(),
           counters: :counters.counters_ref(),
           sketch: Sketch.t() | nil,
           max_size: pos_integer() | :infinity,
@@ -133,6 +134,9 @@ defmodule Theine.Policy do
     :window_max,
     :protected_max,
     :evict_batch,
+    # The index of this partition's `size` field in `sizes`, its
+    # `weighted_size` the next one (specs/12 §Calls that span partitions).
+    size_at: 1,
     window_weight: 0,
     probation_weight: 0,
     protected_weight: 0,
@@ -182,7 +186,8 @@ defmodule Theine.Policy do
   @row_weight 5
   @row_expires_at 6
 
-  # Fields of the `sizes` atomics (allocated by Theine.Owner).
+  # Fields of the `sizes` atomics (allocated by Theine.Owner): partition
+  # `p`'s `size` at `2p + @size`, its `weighted_size` at `2p + @weighted_size`.
   @size 1
   @weighted_size 2
 
@@ -230,9 +235,9 @@ defmodule Theine.Policy do
 
   @doc """
   Creates the policy tables, owned by the calling process, and zeroes the
-  `sizes` atomics of `config`. A bounded config brings its sketch, which is
-  cleared here so that a restarted maintenance process starts cold
-  (specs/04 §Restart semantics).
+  fields of `config.partition` in the `sizes` atomics of `config`. A
+  bounded config brings its sketch, which is cleared here so that a
+  restarted maintenance process starts cold (specs/04 §Restart semantics).
   """
   @spec new(Config.t()) :: t()
   def new(%Config{table: table, sizes: sizes, counters: counters, max_size: :infinity} = config) do
@@ -242,6 +247,7 @@ defmodule Theine.Policy do
       expiry: Expiry.new(),
       table: table,
       sizes: sizes,
+      size_at: size_at(config.partition),
       counters: counters,
       max_size: :infinity,
       listener: listener(config)
@@ -286,6 +292,7 @@ defmodule Theine.Policy do
       expiry: Expiry.new(),
       table: table,
       sizes: sizes,
+      size_at: size_at(config.partition),
       counters: counters,
       sketch: sketch,
       max_size: max_size,
@@ -1334,17 +1341,28 @@ defmodule Theine.Policy do
   @spec id_count(t()) :: non_neg_integer()
   def id_count(%__MODULE__{ids: ids}), do: :ets.info(ids, :size)
 
-  @doc "Entry count as published to the `sizes` atomics."
+  @doc "Entry count of partition 0 as published to the `sizes` atomics."
   @spec size(:atomics.atomics_ref()) :: non_neg_integer()
   def size(sizes), do: :atomics.get(sizes, @size)
 
-  @doc "Weighted size as published to the `sizes` atomics."
+  @doc "Entry count of partition `p` as published to the `sizes` atomics."
+  @spec size(:atomics.atomics_ref(), non_neg_integer()) :: non_neg_integer()
+  def size(sizes, p), do: :atomics.get(sizes, size_at(p))
+
+  @doc "Weighted size of partition 0 as published to the `sizes` atomics."
   @spec weighted_size(:atomics.atomics_ref()) :: non_neg_integer()
   def weighted_size(sizes), do: :atomics.get(sizes, @weighted_size)
 
-  defp add(%__MODULE__{sizes: sizes}, entries, weight) do
-    if entries != 0, do: :atomics.add(sizes, @size, entries)
-    if weight != 0, do: :atomics.add(sizes, @weighted_size, weight)
+  @doc "Weighted size of partition `p` as published to the `sizes` atomics."
+  @spec weighted_size(:atomics.atomics_ref(), non_neg_integer()) :: non_neg_integer()
+  def weighted_size(sizes, p), do: :atomics.get(sizes, size_at(p) + 1)
+
+  defp size_at(p), do: 2 * p + @size
+
+  # `weighted_size` is the field after `size` (`@weighted_size - @size`).
+  defp add(%__MODULE__{sizes: sizes, size_at: at}, entries, weight) do
+    if entries != 0, do: :atomics.add(sizes, at, entries)
+    if weight != 0, do: :atomics.add(sizes, at + 1, weight)
     :ok
   end
 
@@ -1363,8 +1381,8 @@ defmodule Theine.Policy do
   defp add_segment(%{protected_weight: w} = state, :protected, delta),
     do: %{state | protected_weight: w + delta}
 
-  defp publish(%__MODULE__{sizes: sizes}, size, weighted_size) do
-    :atomics.put(sizes, @size, size)
-    :atomics.put(sizes, @weighted_size, weighted_size)
+  defp publish(%__MODULE__{sizes: sizes, size_at: at}, size, weighted_size) do
+    :atomics.put(sizes, at, size)
+    :atomics.put(sizes, at + 1, weighted_size)
   end
 end

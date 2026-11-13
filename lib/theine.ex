@@ -79,6 +79,7 @@ defmodule Theine do
   | `evict_batch` | pos_integer | 1024 |
   | `maintenance_interval` | ms | 1000 |
   | `drain_backoff` | non_neg_integer | 3 |
+  | `partitions` | power of two, 1..64 | 1 |
   | `stats` | boolean | `true` |
   | `eviction_listener` | boolean | `false` |
   | `test_hooks` | boolean | `false` |
@@ -173,6 +174,12 @@ defmodule Theine do
     the previous pass's duration after it, which caps the maintenance
     process's share of a scheduler under heavy reads; 0 runs such passes
     back to back.
+  - `partitions`: the number of maintenance processes. Every write is
+    applied by one maintenance process, which caps the writes a cache can
+    sustain; with `partitions: n` each key belongs to one of `n`
+    processes, each with its own policy, expiry and `write_hwm`, so the
+    entries table may hold up to `n * write_hwm` unapplied writes. For now
+    only an unbounded cache (`max_size: :infinity`) takes more than one.
   - `stats`: `false` stops `get/2` from counting hits and misses (see
     `stats/1`); load, eviction, expiration and refresh counts are kept
     either way.

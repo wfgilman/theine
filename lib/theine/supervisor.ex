@@ -11,6 +11,10 @@ defmodule Theine.Supervisor do
   everything after it, while a Maintenance crash restarts only Maintenance.
   Each process is registered under an atom derived from the cache name, see
   `name/1`, `Theine.Owner.name/1` and `Theine.Maintenance.name/1`.
+
+  With `partitions: n > 1` the last child is `Theine.Partitions`, a
+  `one_for_one` supervisor of the `n` maintenance processes (specs/12
+  §Supervision).
   """
 
   use Supervisor
@@ -34,9 +38,15 @@ defmodule Theine.Supervisor do
       Supervisor.child_spec({Task.Supervisor, name: config.task_supervisor},
         id: Theine.TaskSupervisor
       ),
-      {Theine.Maintenance, config.name}
+      maintenance(config)
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
+
+  # One partition keeps the tree above; more get their own `one_for_one`
+  # supervisor, so a crash in one partition restarts that one only
+  # (specs/12 §Supervision).
+  defp maintenance(%Config{partitions: 1, name: cache}), do: {Theine.Maintenance, cache}
+  defp maintenance(%Config{} = config), do: {Theine.Partitions, config}
 end

@@ -5,8 +5,9 @@ defmodule Theine.Owner do
 
   `init/1` creates the public entries table and the loader's `inflight`,
   `waiters` and `refreshing` tables (specs/07), allocates the `ids` and
-  `pending` atomics (one counter of each per partition, specs/12), the
-  `flags` and `sizes` atomics and the stats counters, plus the read buffer
+  `pending` atomics, the `flags` and `sizes` atomics (one counter, flag or
+  pair of size fields per partition, specs/12) and the stats counters, plus
+  the read buffer
   (specs/03) and the frequency sketch (specs/02) when the cache is bounded,
   and writes the completed `%Theine.Config{}` to `:persistent_term`. An
   unbounded cache (`max_size: :infinity`) allocates neither, so its hits
@@ -124,7 +125,9 @@ defmodule Theine.Owner do
         # §Delivery with backpressure). One of each at `partitions: 1`.
         ids: :atomics.new(config.partitions, signed: false),
         pending: :atomics.new(config.partitions, signed: true),
-        flags: :atomics.new(@drain_flag, signed: false),
+        # One drain flag per partition, partition `p`'s at `@drain_flag + p`
+        # (specs/12 §Supervision).
+        flags: :atomics.new(@drain_flag + config.partitions - 1, signed: false),
         counters: counters,
         request_counters: request_counters,
         # The hit path fetches this one key: the read-buffer tuple when
@@ -134,7 +137,9 @@ defmodule Theine.Owner do
         # A hit that may start a refresh is tagged, so that no other cache
         # pays for the check (specs/07 §Decisions M4.4).
         hit: refresh_hit(config, hit),
-        sizes: :atomics.new(@size_fields, signed: true),
+        # Each partition publishes its own two fields (specs/12 §Calls that
+        # span partitions), partition `p`'s from index `2p + 1`.
+        sizes: :atomics.new(@size_fields * config.partitions, signed: true),
         read_buffer: read_buffer,
         sketch: if(bounded?, do: Sketch.new(config.max_size), else: nil)
     }

@@ -1,10 +1,18 @@
 defmodule Theine.Maintenance do
   @moduledoc """
-  The one policy process per cache (specs/04).
+  The one policy process per cache (specs/04), or per partition of a cache
+  started with `partitions: n > 1` (specs/12).
 
   Registered as `Theine.Maintenance.<cache>` so that writers can reach it
   with `send/2` and a restart needs no `:persistent_term` write: the config
-  holds the name, not the pid.
+  holds the name, not the pid. Partition `p > 0` is registered as
+  `Theine.Maintenance.<cache>.Partition<p>` (`Theine.Config.maintenance_name/2`).
+  Each partition's process works on its own view of the config
+  (`Theine.Config.partition/2`): its own `pending` counter, drain flag and
+  `sizes` fields, its own policy tables and expiry index, and a restart
+  rebuild that restores only the entries whose id carries its partition.
+  The functions below that take a partition `p` default to partition 0,
+  which is the whole cache when `partitions` is 1.
 
   `init/1` reads the config the Owner stored, resets the `pending` counter,
   the drain flag and the read buffer's heads, creates the `Theine.Policy`
@@ -50,7 +58,7 @@ defmodule Theine.Maintenance do
   the sweep stopped at `expire_batch` with due entries left, or an
   eviction, in the pass or after an applied `:put`, stopped at
   `evict_batch` removals, the next pass is scheduled at once through
-  `Theine.ReadBuffer.schedule_drain/1`.
+  `Theine.ReadBuffer.schedule_drain/2` with the process's partition.
 
   Drain-triggered passes are rate limited (specs/04 §The pass, §Decisions
   M2.8c): after a pass of duration `d`, a `:drain` that arrives within
@@ -74,7 +82,7 @@ defmodule Theine.Maintenance do
 
   require Theine.Clock
 
-  alias Theine.{Clock, Config, Expiry, Policy, ReadBuffer, Sketch}
+  alias Theine.{Clock, Config, Expiry, Partition, Policy, ReadBuffer, Sketch}
 
   # Index of the drain flag inside `config.flags` (specs/03).
   @drain_flag Theine.Owner.drain_flag()
@@ -172,54 +180,67 @@ defmodule Theine.Maintenance do
            deferred: reference() | nil
          }
 
-  @doc "Registered name of the maintenance process of `cache`."
+  @doc """
+  Registered name of the maintenance process of `cache`, partition 0's in a
+  partitioned cache (specs/12 §Supervision).
+  """
   @spec name(Config.cache()) :: atom()
   def name(cache) when is_atom(cache), do: Module.concat(__MODULE__, cache)
 
+  @doc """
+  Registered name of partition `p`'s maintenance process of `cache`;
+  `name(cache, 0)` is `name/1`.
+  """
+  @spec name(Config.cache(), non_neg_integer()) :: atom()
+  def name(cache, p) when is_atom(cache), do: Config.maintenance_name(cache, p)
+
   @doc false
-  @spec start_link(Config.cache()) :: GenServer.on_start()
-  def start_link(cache) when is_atom(cache) do
-    GenServer.start_link(__MODULE__, cache, name: name(cache))
+  @spec start_link(Config.cache() | {Config.cache(), non_neg_integer()}) :: GenServer.on_start()
+  def start_link(cache) when is_atom(cache), do: start_link({cache, 0})
+
+  def start_link({cache, p}) when is_atom(cache) and is_integer(p) do
+    GenServer.start_link(__MODULE__, {cache, p}, name: name(cache, p))
   end
 
   @doc """
-  Forgets everything the process knows about the cache's entries. Called by
-  `Theine.clear/1` after the entries table has been emptied; returns once
-  the policy state is empty too.
+  Forgets everything the process of partition `p` (default 0) knows about
+  the cache's entries. Called by `Theine.clear/1` after the entries table
+  has been emptied; returns once the policy state is empty too.
 
       Theine.Maintenance.reset(:sessions)
       #=> :ok
   """
-  @spec reset(Config.cache()) :: :ok
-  def reset(cache) when is_atom(cache), do: GenServer.call(name(cache), :reset)
+  @spec reset(Config.cache(), non_neg_integer()) :: :ok
+  def reset(cache, p \\ 0) when is_atom(cache), do: GenServer.call(name(cache, p), :reset)
 
   @doc """
-  Runs one full maintenance pass synchronously and returns `:ok` when it is
-  complete. For tests and benches (specs/04 §Responsibilities). Write events
-  the caller sent before calling are applied before the pass, in mailbox
-  order.
+  Runs one full maintenance pass of partition `p` (default 0) synchronously
+  and returns `:ok` when it is complete. For tests and benches (specs/04
+  §Responsibilities). Write events the caller sent to that partition before
+  calling are applied before the pass, in mailbox order.
 
       Theine.Maintenance.run(:sessions)
       #=> :ok
   """
-  @spec run(Config.cache()) :: :ok
-  def run(cache) when is_atom(cache), do: GenServer.call(name(cache), :run)
+  @spec run(Config.cache(), non_neg_integer()) :: :ok
+  def run(cache, p \\ 0) when is_atom(cache), do: GenServer.call(name(cache, p), :run)
 
   @doc """
-  Stops the process consuming anything until `resume/1`: write events,
-  `:drain` messages and calls all queue in its mailbox, and writers above
-  `write_hwm` block (specs/03 §Delivery with backpressure). Returns `:ok`
-  once the process is paused. Tests only: raises `ArgumentError` unless the
-  cache was started with `test_hooks: true`.
+  Stops the process of partition `p` (default 0) consuming anything until
+  `resume/2`: write events, `:drain` messages and calls all queue in its
+  mailbox, and writers above `write_hwm` block (specs/03 §Delivery with
+  backpressure). Returns `:ok` once the process is paused. Tests only:
+  raises `ArgumentError` unless the cache was started with `test_hooks:
+  true`.
 
       Theine.Maintenance.pause(:sessions)
       #=> :ok
   """
-  @spec pause(Config.cache()) :: :ok
-  def pause(cache) when is_atom(cache), do: hook!(cache, :pause)
+  @spec pause(Config.cache(), non_neg_integer()) :: :ok
+  def pause(cache, p \\ 0) when is_atom(cache), do: hook!(cache, p, :pause)
 
   @doc """
-  Lets a process paused by `pause/1` consume its mailbox again and returns
+  Lets a process paused by `pause/2` consume its mailbox again and returns
   `:ok` once it has. A no-op on a process that is not paused. Tests only:
   raises `ArgumentError` unless the cache was started with `test_hooks:
   true`.
@@ -227,11 +248,11 @@ defmodule Theine.Maintenance do
       Theine.Maintenance.resume(:sessions)
       #=> :ok
   """
-  @spec resume(Config.cache()) :: :ok
-  def resume(cache) when is_atom(cache), do: hook!(cache, :resume)
+  @spec resume(Config.cache(), non_neg_integer()) :: :ok
+  def resume(cache, p \\ 0) when is_atom(cache), do: hook!(cache, p, :resume)
 
-  defp hook!(cache, hook) do
-    case GenServer.call(name(cache), hook, :infinity) do
+  defp hook!(cache, p, hook) do
+    case GenServer.call(name(cache, p), hook, :infinity) do
       :ok ->
         :ok
 
@@ -261,30 +282,48 @@ defmodule Theine.Maintenance do
       #=>   read_buffer: nil, sketch: nil}
   """
   @spec info(Config.cache()) :: info()
-  def info(cache) when is_atom(cache), do: GenServer.call(name(cache), :info)
+  def info(cache) when is_atom(cache), do: info(cache, 0)
 
-  @doc "The policy row of `key` as the maintenance process sees it (tests)."
+  @doc """
+  `info/1` of partition `p`'s process: its passes, its `pending` counter,
+  its policy's sizes and expiry index (specs/12 §Calls that span
+  partitions).
+  """
+  @spec info(Config.cache(), non_neg_integer()) :: info()
+  def info(cache, p) when is_atom(cache), do: GenServer.call(name(cache, p), :info)
+
+  @doc """
+  The policy row of `key` as the maintenance process of the key's
+  partition sees it (tests).
+  """
   @spec policy_row(Config.cache(), term()) :: {:ok, Policy.row()} | :error
-  def policy_row(cache, key) when is_atom(cache), do: GenServer.call(name(cache), {:row, key})
+  def policy_row(cache, key) when is_atom(cache) do
+    p = Partition.of_key(key, Config.get(cache).partitions)
+    GenServer.call(name(cache, p), {:row, key})
+  end
 
   @doc "Entries per `:ets.select/3` chunk of the restart rebuild."
   @spec rebuild_chunk() :: 10_000
   def rebuild_chunk, do: @rebuild_chunk
 
   @impl true
-  @spec init(Config.cache()) :: {:ok, state(), {:continue, :rebuild}}
-  def init(cache) do
-    config = Config.get(cache)
+  @spec init({Config.cache(), non_neg_integer()}) :: {:ok, state(), {:continue, :rebuild}}
+  def init({cache, p}) do
+    # The partition's view: `config.partition` is `p` from here on, and
+    # every per-partition field (`pending`, the drain flag, `sizes`) is
+    # indexed by it (specs/12 §Restart).
+    config = cache |> Config.get() |> Config.partition(p)
 
     # specs/04 §Restart semantics step 2: events the previous process never
     # consumed are gone with it, readers' triggers start over, and reads
     # recorded before now are not worth draining into a cold policy. The
-    # sketch is cleared by `Policy.new/1`.
-    :atomics.put(config.pending, 1, 0)
-    :atomics.put(config.flags, @drain_flag, 0)
+    # sketch is cleared by `Policy.new/1`. Only this partition's counter
+    # and flag: the other partitions do not notice.
+    :atomics.put(config.pending, p + 1, 0)
+    :atomics.put(config.flags, @drain_flag + p, 0)
     if config.read_buffer, do: :ok = ReadBuffer.reset_heads(config)
 
-    seed_rand(cache)
+    seed_rand(cache, p)
     schedule_interval(config)
     module = config.policy_module
     state = %__MODULE__{cache: cache, config: config, module: module, policy: module.new(config)}
@@ -306,7 +345,8 @@ defmodule Theine.Maintenance do
   def handle_continue(:rebuild, %__MODULE__{config: config} = state) do
     true = :ets.safe_fixtable(config.table, true)
     started = System.monotonic_time()
-    rebuild(state, :ets.select(config.table, @rebuild_spec, @rebuild_chunk), {started, 0, 0})
+    spec = rebuild_spec(config)
+    rebuild(state, :ets.select(config.table, spec, @rebuild_chunk), {started, 0, 0})
   end
 
   def handle_continue({:rebuild, continuation, progress}, state) do
@@ -335,15 +375,25 @@ defmodule Theine.Maintenance do
 
     # Step 4: over capacity, the next pass must evict. The flag was cleared
     # in init/1, so this queues one `:drain` unless a reader already did.
-    if over_capacity?(config), do: ReadBuffer.schedule_drain(config)
+    if over_capacity?(config), do: ReadBuffer.schedule_drain(config, config.partition)
 
     {:noreply, state}
   end
 
+  # One partition rebuilds the entries whose id carries it (specs/12
+  # §Restart): still one scan of the whole table, filtered by the id's low
+  # bits. A cache of one partition takes every entry, with no guard.
+  defp rebuild_spec(%Config{partitions: 1}), do: @rebuild_spec
+
+  defp rebuild_spec(%Config{partitions: n, partition: p}) do
+    [{head, [], body}] = @rebuild_spec
+    [{head, [{:==, {:band, :"$2", n - 1}, p}], body}]
+  end
+
   defp over_capacity?(%Config{max_size: :infinity}), do: false
 
-  defp over_capacity?(%Config{max_size: max_size, sizes: sizes}),
-    do: Policy.weighted_size(sizes) > max_size
+  defp over_capacity?(%Config{max_size: max_size, sizes: sizes, partition: p}),
+    do: Policy.weighted_size(sizes, p) > max_size
 
   @doc """
   The `:rand` seed of the maintenance process of `cache`, derived from the
@@ -360,8 +410,27 @@ defmodule Theine.Maintenance do
     {hash, hash, hash}
   end
 
-  defp seed_rand(cache) do
-    _ = :rand.seed(:exsss, rand_seed(cache))
+  @doc """
+  The `:rand` seed of partition `p`'s maintenance process, from the cache
+  name and `p` (specs/12 §Acceptance, Hit rate). Partition 0's is
+  `rand_seed/1`, so a cache of one partition is seeded as before.
+
+      iex> Theine.Maintenance.rand_seed(:sessions, 0) == Theine.Maintenance.rand_seed(:sessions)
+      true
+      iex> Theine.Maintenance.rand_seed(:sessions, 1) == Theine.Maintenance.rand_seed(:sessions, 2)
+      false
+  """
+  @spec rand_seed(Config.cache(), non_neg_integer()) ::
+          {non_neg_integer(), non_neg_integer(), non_neg_integer()}
+  def rand_seed(cache, 0) when is_atom(cache), do: rand_seed(cache)
+
+  def rand_seed(cache, p) when is_atom(cache) and is_integer(p) do
+    hash = :erlang.phash2({cache, p})
+    {hash, hash, hash}
+  end
+
+  defp seed_rand(cache, p) do
+    _ = :rand.seed(:exsss, rand_seed(cache, p))
     :ok
   end
 
@@ -400,10 +469,10 @@ defmodule Theine.Maintenance do
       cache: state.cache,
       passes: state.passes,
       last_pass_duration: state.last_pass_duration,
-      pending: :atomics.get(config.pending, 1),
+      pending: :atomics.get(config.pending, config.partition + 1),
       call_writes: state.call_writes,
-      size: Policy.size(config.sizes),
-      weighted_size: Policy.weighted_size(config.sizes),
+      size: Policy.size(config.sizes, config.partition),
+      weighted_size: Policy.weighted_size(config.sizes, config.partition),
       expiring: Expiry.size(policy.expiry),
       segments: if(bounded?, do: Policy.weights(policy), else: nil),
       climber: Policy.climber(policy),
@@ -514,7 +583,7 @@ defmodule Theine.Maintenance do
   @spec apply_event(state(), Theine.WriteEvents.event(), 0 | 1) :: state()
   defp apply_event(%__MODULE__{module: module} = state, {:put, key, id, w, exp}, call) do
     {status, evicted, policy} = module.evict(module.on_write(state.policy, key, id, w, exp))
-    if status == :more, do: ReadBuffer.schedule_drain(state.config)
+    if status == :more, do: ReadBuffer.schedule_drain(state.config, state.config.partition)
     consumed(state, policy, evicted, call)
   end
 
@@ -525,8 +594,8 @@ defmodule Theine.Maintenance do
   # One struct update per consumed event, whatever it counts: a one-key
   # update costs several times a multi-key one on OTP 28 (specs/05
   # §Decisions M7.2).
-  defp consumed(%__MODULE__{} = state, policy, evicted, call) do
-    :atomics.sub(state.config.pending, 1, 1)
+  defp consumed(%__MODULE__{config: config} = state, policy, evicted, call) do
+    :atomics.sub(config.pending, config.partition + 1, 1)
 
     %{
       state
@@ -561,7 +630,7 @@ defmodule Theine.Maintenance do
     #    crosses the threshold from here on schedules the next pass. Not
     #    while a deferred `:drain` is pending: that one is the next pass, and
     #    the set flag is what keeps readers from sending another.
-    if is_nil(state.deferred), do: :atomics.put(config.flags, @drain_flag, 0)
+    if is_nil(state.deferred), do: :atomics.put(config.flags, @drain_flag + config.partition, 0)
 
     # 3. Drain the read buffer into the policy.
     {policy, reads, full?} = drain(config, module, state.policy)
@@ -587,7 +656,7 @@ defmodule Theine.Maintenance do
     # now. The flag was cleared in step 2, so this sends exactly one
     # `:drain` unless a reader already did, in which case that one serves.
     if full? or expire_status == :more or status == :more,
-      do: ReadBuffer.schedule_drain(config)
+      do: ReadBuffer.schedule_drain(config, config.partition)
 
     # 8. Record and emit. `writes` and `evicted` are counts since the
     #    previous pass, on arrival and in this pass alike.

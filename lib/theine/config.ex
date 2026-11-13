@@ -16,9 +16,13 @@ defmodule Theine.Config do
   `send/2`, which needs a local atom name (specs/08 §Decisions). The names
   of the `partitions` maintenance processes are held as a tuple in
   `maintenances`, partition 0 under the name in `maintenance` (specs/12
-  §Supervision); `partitions` is 1 until it becomes an option. The
-  loader's `inflight`, `waiters` and `refreshing` tables are named the
-  same way.
+  §Supervision). The loader's `inflight`, `waiters` and `refreshing`
+  tables are named the same way.
+
+  `partition` is 0 in the stored config. A maintenance process works on
+  `partition/2`'s view of it, which names its own partition, so that
+  `Theine.Policy` publishes to that partition's fields of `sizes`
+  (specs/12 §Calls that span partitions).
   """
 
   @type cache :: atom()
@@ -66,6 +70,7 @@ defmodule Theine.Config do
           test_hooks: boolean(),
           policy_module: module(),
           partitions: pos_integer(),
+          partition: non_neg_integer(),
           table: cache(),
           maintenance: atom(),
           maintenances: tuple(),
@@ -116,6 +121,7 @@ defmodule Theine.Config do
             test_hooks: false,
             policy_module: Theine.Policy,
             partitions: 1,
+            partition: 0,
             table: nil,
             maintenance: nil,
             maintenances: nil,
@@ -151,6 +157,7 @@ defmodule Theine.Config do
     :evict_batch,
     :maintenance_interval,
     :drain_backoff,
+    :partitions,
     :stats,
     :eviction_listener,
     :test_hooks,
@@ -208,15 +215,14 @@ defmodule Theine.Config do
     name = validate!(:name, fetch!(opts, :name))
     max_size = fetch!(opts, :max_size)
 
-    # `partitions` is not a `start_link` option yet (IMPLEMENTATION_PLAN.md
-    # M8.2): every cache has one partition, whose maintenance process keeps
-    # today's name.
+    # Partition 0's maintenance process keeps the name an unpartitioned
+    # cache has always used; the tuple of all `partitions` names is filled
+    # in once the option is validated.
     base = %__MODULE__{
       name: name,
       max_size: max_size,
       table: name,
       maintenance: maintenance_name(name, 0),
-      maintenances: maintenance_names(name, 1),
       task_supervisor: Module.concat(Theine.TaskSupervisor, name),
       # The single-flight tables of Theine.Loader (specs/07 §Single-flight),
       # named so that a restarted Owner recreates them under the same atom.
@@ -236,7 +242,39 @@ defmodule Theine.Config do
       %{config | max_size: validate!(:max_size, max_size)}
     end)
     |> check_policy_module!()
+    |> check_partitions!()
   end
+
+  # Bounded partitions need the read buffer split by partition and capacity
+  # shares (specs/12 §The read buffer is split by partition, §Each partition
+  # is a whole policy), which are not built yet: until then only an
+  # unbounded cache, which has neither, may run more than one partition.
+  defp check_partitions!(%__MODULE__{partitions: 1} = config),
+    do: %{config | maintenances: maintenance_names(config.name, 1)}
+
+  defp check_partitions!(%__MODULE__{partitions: n, max_size: :infinity} = config),
+    do: %{config | maintenances: maintenance_names(config.name, n)}
+
+  defp check_partitions!(%__MODULE__{partitions: n, max_size: max_size}) do
+    raise ArgumentError,
+          "option :partitions (#{n}) needs max_size: :infinity, got max_size: #{max_size}: " <>
+            "a bounded cache runs one partition until bounded partitions are built " <>
+            "(specs/12, IMPLEMENTATION_PLAN.md M8.4)"
+  end
+
+  @doc """
+  The view of `config` that partition `p`'s maintenance process works on:
+  the same config with `partition` set to `p` (specs/12 §Each partition is
+  a whole policy). The stored config is partition 0's view.
+
+      iex> config = Theine.Config.new!(name: :c, max_size: :infinity, partitions: 4)
+      iex> Theine.Config.partition(config, 2).partition
+      2
+  """
+  @spec partition(t(), non_neg_integer()) :: t()
+  def partition(%__MODULE__{partitions: n} = config, p)
+      when is_integer(p) and p >= 0 and p < n,
+      do: %{config | partition: p}
 
   @doc """
   The registered name of partition `p`'s maintenance process. Partition 0
@@ -388,6 +426,11 @@ defmodule Theine.Config do
   # The drain-pass rate limit (specs/04 §The pass): 0 turns it off.
   defp validate!(:drain_backoff, n) when is_integer(n) and n >= 0, do: n
 
+  # A power of two, so an id's partition is a mask (specs/12 §What is asked).
+  defp validate!(:partitions, n)
+       when is_integer(n) and n in 1..64 and Bitwise.band(n, n - 1) == 0,
+       do: n
+
   defp validate!(key, value) do
     raise ArgumentError,
           "invalid value for option #{inspect(key)}: #{inspect(value)} (#{expected(key)})"
@@ -411,5 +454,6 @@ defmodule Theine.Config do
     do: "expected a power of two"
 
   defp expected(:drain_backoff), do: "expected a non-negative integer"
+  defp expected(:partitions), do: "expected a power of two from 1 to 64"
   defp expected(_), do: "expected a positive integer"
 end

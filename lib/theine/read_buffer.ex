@@ -131,6 +131,28 @@ defmodule Theine.ReadBuffer do
   end
 
   @doc """
+  `schedule_drain/1` for partition `p` of a partitioned cache (specs/12
+  §Supervision): partition `p`'s drain flag, at index `p + 1` of `flags`,
+  and its maintenance process, `elem(maintenances, p)`. At `p = 0` this is
+  `schedule_drain/1`'s flag and process. Never raises. Returns `:ok`.
+  """
+  @spec schedule_drain(Config.t(), non_neg_integer()) :: :ok
+  def schedule_drain(%{flags: flags, maintenances: names}, p) do
+    case :atomics.compare_exchange(flags, @drain_flag + p, 0, 1) do
+      :ok ->
+        try do
+          send(elem(names, p), :drain)
+          :ok
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _set ->
+        :ok
+    end
+  end
+
+  @doc """
   Drains every stripe, calling `fun.(id)` for each live id, and returns the
   number of ids drained and whether a stripe was full (specs/03 §`drain/2`).
   `drain/3` is the folding form the maintenance process uses.

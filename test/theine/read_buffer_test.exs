@@ -216,6 +216,29 @@ defmodule Theine.ReadBufferTest do
       assert ReadBuffer.schedule_drain(config) == :ok
     end
 
+    test "schedule_drain/2 sets partition p's flag and asks partition p's process only" do
+      name = register_as_maintenance()
+
+      config = %{
+        config(slots: 8, threshold: 4)
+        | flags: :atomics.new(4, signed: false),
+          maintenances: {unique_maintenance(), unique_maintenance(), name, unique_maintenance()}
+      }
+
+      assert ReadBuffer.schedule_drain(config, 2) == :ok
+      assert_received :drain
+      assert for(i <- 1..4, do: :atomics.get(config.flags, i)) == [0, 0, 1, 0]
+
+      # Set: nothing more is sent until the process clears it.
+      assert ReadBuffer.schedule_drain(config, 2) == :ok
+      refute_received :drain
+
+      # Partition 1's name is not registered: no raise, its own flag set.
+      assert ReadBuffer.schedule_drain(config, 1) == :ok
+      refute_received :drain
+      assert for(i <- 1..4, do: :atomics.get(config.flags, i)) == [0, 1, 1, 0]
+    end
+
     test "the stripe is the scheduler id minus one, modulo stripes" do
       stripes = 2
       per_reader = 3

@@ -13,6 +13,8 @@ policy and performs all amortized work. It is Caffeine's
 - Expose `reset/1` (for `clear/1`), `run/1` (force a pass, for tests and
   benches), `pause/1` and `resume/1` (tests only, behind a compile-time flag
   or an opt), and `info/1` (queue depths, last pass duration, counts).
+  Each takes an optional partition `p` (default 0, specs/12), which names
+  the process of that partition.
 
 ## The pass
 
@@ -140,6 +142,15 @@ reports the scan's `duration`, `entries` and `chunks`. Some of the queued
 events are the `:put`s of entries the scan restored. The entry may have
 been evicted before its `:put` is applied, and such a `:put` must not
 re-create its row (specs/05 §Events `on_write`, §Decisions M2.12).
+
+With `partitions: n > 1` (specs/12) every partition's process runs these
+steps on its own share and the others do not notice: step 2 zeroes only
+its own `pending` counter (index `p + 1`) and drain flag (`flags` index
+`p + 1`), and step 3's scan is still one chunked scan of the whole table,
+but its match spec keeps only the rows whose id carries the partition,
+`{'==', {'band', Id, n - 1}, p}`. A cache of one partition uses the match
+spec with no guard. Partition `p > 0` seeds `:rand` from the cache name
+and `p`; partition 0 keeps the cache name's seed.
 
 ## Acceptance
 
@@ -444,3 +455,15 @@ re-create its row (specs/05 §Events `on_write`, §Decisions M2.12).
   `expirations` counter does include. `Theine.Test.Policy` forwards
   `expire/3` as `:expire`, and the order test's pass now reads `:on_access`
   …, `:expire`, `:evict`, `:climb`.
+- 2026-11-13 (M8.2): one process per partition (specs/12). A process is
+  started as `{cache, p}` and works on `Config.partition(config, p)`, the
+  stored config with `partition: p`, so every per-partition index is
+  derived from one field: `pending` and the drain flag at `p + 1`, and the
+  policy's `sizes` fields from `2p + 1` (specs/05 §Decisions M8.2). The
+  process schedules its own follow-up passes with
+  `ReadBuffer.schedule_drain/2`, which takes the partition; at `p = 0`
+  that is the flag and process of `schedule_drain/1`, which the hit path
+  keeps calling unchanged. `reset`, `run`, `pause`, `resume` and `info`
+  take a partition and default to 0; `policy_row/2` asks the key's own
+  partition. The pass and rebuild telemetry metadata are unchanged until
+  M8.3 adds `partition`.

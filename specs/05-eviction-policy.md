@@ -268,6 +268,8 @@ misses as counted here).
   assigned so the row shape is the same in both modes. `size` and
   `weighted_size` are published to a two-field `sizes` atomics as each event
   is applied, which is what `Theine.size/1` and `weighted_size/1` read.
+  With `partitions: n` (specs/12) the atomics has `2n` fields, and see
+  §Decisions M8.2.
 - 2026-10-28 (M2.4): the bounded struct carries `order`, the sketch, the
   region limits (`window_max`, `protected_max`), the three segment weights
   and `sketch_size`, the number of `Sketch.increment/2` calls since the
@@ -608,3 +610,13 @@ the window moves, and records the answer in §Decisions. Unbounded
   so the real gain is lower than measured. The `order` table is a tree, so
   deleting a row later costs as much as deleting it now, plus the work of
   finding it again (IMPLEMENTATION_PLAN.md §Benchmark log M7.4).
+- 2026-11-13 (M8.2): partition `p`'s policy publishes its `size` at index
+  `2p + 1` of the `sizes` atomics and its `weighted_size` at `2p + 2`
+  (specs/12 §Calls that span partitions). `new/1` takes the index from
+  `config.partition`, which is 0 in the stored config and `p` in partition
+  `p`'s view of it (specs/04 §Decisions M8.2), and keeps it in the struct
+  as `size_at`. `Policy.size/2` and `weighted_size/2` read a partition's
+  fields; `size/1` and `weighted_size/1` read partition 0's, which is the
+  whole cache at `partitions: 1`. Nothing else in the policy changed: at
+  `n = 1` the indices are the constants 1 and 2 they were, read from the
+  struct.

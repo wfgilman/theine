@@ -33,6 +33,7 @@ children = [
 | `evict_batch` | pos_integer | 1024 | 04, 05 |
 | `maintenance_interval` | ms | 1000 | 04 |
 | `drain_backoff` | non_neg_integer | 3 | 04 (a drain-triggered pass waits this multiple of the last pass's duration; 0 disables) |
+| `partitions` | power of two, 1..64 | 1 | 12 (maintenance processes; more than 1 needs `max_size: :infinity` until M8.4) |
 | `stats` | boolean | true | this file |
 | `eviction_listener` | boolean | false | this file (§Telemetry `[:theine, :eviction]`) |
 | `test_hooks` | boolean | false | 04 (`pause/1`, `resume/1`; tests only) |
@@ -90,6 +91,13 @@ Theine.Supervisor (rest_for_one, one per cache, registered as {Theine.Supervisor
 ├── Task.Supervisor     registered as {Theine.TaskSupervisor, name}; async loads, refreshes
 └── Theine.Maintenance  registered as {Theine.Maintenance, name}; rebuilds on restart (04)
 ```
+
+With `partitions: n > 1` the last child is instead `Theine.Partitions`
+(`one_for_one`, registered as `{Theine.Partitions, name}`), which
+supervises the `n` maintenance processes: partition 0 under the name above,
+partition `p` as `{Theine.Maintenance, name}.Partition<p>`, child id
+`{Theine.Maintenance, p}` (specs/12 §Supervision). A crash in one
+partition restarts only that partition.
 
 `rest_for_one` so that an Owner crash (which loses the tables) restarts
 everything after it, while a Maintenance crash restarts only Maintenance.
@@ -276,3 +284,15 @@ specs/09.
   is made, so the tracing multisets of specs/01 are unchanged. The config
   struct already had 36 keys and was a hashed map before the new field,
   so the field does not change the hit's one-key lookup.
+- 2026-11-13 (M8.2): `partitions` is a `start_link` option, placed after
+  `drain_backoff` with the other maintenance options. A value other than a
+  power of two from 1 to 64 raises `ArgumentError`, and so does `n > 1`
+  with a finite `max_size`, naming M8.4: bounded partitions need the read
+  buffer split by partition and capacity shares, which M8.4 builds
+  (specs/12 §Build order 2). With `n > 1` the tree's last child is
+  `Theine.Partitions` (above), and the Owner allocates `n` drain flags and
+  `2n` `sizes` fields beside M8.1's `n` id and `pending` counters. The
+  config gains `partition`, always 0 in the stored term; a maintenance
+  process sets it in its own copy (specs/04 §Decisions M8.2). Until M8.3,
+  `size/1`, `weighted_size/1`, `clear/1` and `run_maintenance/1` of a
+  partitioned cache act on partition 0 only.

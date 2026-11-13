@@ -3,7 +3,7 @@ defmodule Theine.MaintenanceTest do
 
   import Theine.Test.Helpers
 
-  alias Theine.{Config, Maintenance, Policy, ReadBuffer, Sketch}
+  alias Theine.{Config, Maintenance, Partition, Policy, ReadBuffer, Sketch}
 
   @drain_flag Theine.Owner.drain_flag()
 
@@ -1229,6 +1229,192 @@ defmodule Theine.MaintenanceTest do
       # The pass's own step 5 did the evicting here, and its measurement
       # counts them.
       assert passes_received(cache) |> Enum.map(fn {m, _} -> m.evicted end) |> Enum.sum() == 50
+    end
+  end
+
+  describe "partitions (specs/12 §Restart, §Each partition is a whole policy)" do
+    @partitions 4
+
+    defp start_partitioned(cache, extra \\ []) do
+      start_supervised!(
+        {Theine,
+         [name: cache, max_size: :infinity, partitions: @partitions, test_hooks: true] ++
+           @quiet ++ extra}
+      )
+
+      Config.get(cache)
+    end
+
+    # The keys of the entries table whose id carries partition `p`, with
+    # their entries.
+    defp table_of(cache, p) do
+      for {key, _, id, _, _, _} = entry <- :ets.tab2list(cache),
+          Partition.of_id(id, @partitions) == p,
+          into: %{},
+          do: {key, entry}
+    end
+
+    # The row of `key` in partition `p`'s policy, whatever the key's own
+    # partition: `policy_row/2` would route to the key's.
+    defp row_in(cache, p, key), do: GenServer.call(Maintenance.name(cache, p), {:row, key})
+
+    defp idle!(cache) do
+      config = Config.get(cache)
+
+      assert_eventually(fn ->
+        Enum.all?(1..@partitions, &(:atomics.get(config.pending, &1) == 0))
+      end)
+
+      for p <- 0..(@partitions - 1), do: Maintenance.info(cache, p)
+    end
+
+    test "a restarted partition rebuilds exactly its own keys" do
+      cache = unique_cache()
+      # No write-count passes, so a pass count moves only by a restart.
+      config = start_partitioned(cache, write_batch: 10_000)
+
+      for i <- 1..2_000, do: Theine.put(cache, i, i, weight: 2)
+      [info0, _, _, info3] = idle!(cache)
+      # After the four starts' own rebuilds, which `idle!/1` waited for.
+      attach_rebuild_handler(cache)
+      others = %{0 => info0, 3 => info3}
+      pids = for p <- [0, 2, 3], into: %{}, do: {p, Process.whereis(Maintenance.name(cache, p))}
+
+      # Partitions 1 and 2 paused: the next writes' events to them queue,
+      # and partition 1's die with it. Partitions 0 and 3 apply theirs.
+      :ok = Maintenance.pause(cache, 1)
+      :ok = Maintenance.pause(cache, 2)
+      for i <- 2_001..2_400, do: Theine.put(cache, i, i, weight: 2)
+      queued2 = 2_001..2_400 |> Enum.count(&(Partition.of_key(&1, @partitions) == 2))
+      assert :atomics.get(config.pending, 3) == queued2
+
+      old = Process.whereis(Maintenance.name(cache, 1))
+      Process.exit(old, :kill)
+      assert_eventually(fn -> Process.whereis(Maintenance.name(cache, 1)) not in [nil, old] end)
+
+      own = table_of(cache, 1)
+      assert map_size(own) > 0
+
+      assert %{passes: 0, pending: 0, size: size, weighted_size: weighted} =
+               Maintenance.info(cache, 1)
+
+      assert size == map_size(own)
+      assert weighted == 2 * size
+      assert_received {:rebuild, %{entries: entries}, %{cache: ^cache}}
+      assert entries == size
+      refute_received {:rebuild, _, %{cache: ^cache}}
+
+      # Every own key under the table's id, cold, and no key of another
+      # partition.
+      for {key, entry} <- own do
+        id = elem(entry, 2)
+        assert {:ok, {^key, ^id, nil, _, 2, :infinity, _}} = row_in(cache, 1, key)
+      end
+
+      for p <- [0, 2, 3], {key, _} <- Enum.take(table_of(cache, p), 50) do
+        assert row_in(cache, 1, key) == :error
+      end
+
+      # The others did not notice: same pids, same pass counts, partition
+      # 2's queued events still counted, and once resumed it applies them.
+      for p <- [0, 2, 3], do: assert(Process.whereis(Maintenance.name(cache, p)) == pids[p])
+      assert :atomics.get(config.pending, 3) == queued2
+      :ok = Maintenance.resume(cache, 2)
+
+      for p <- [0, 3] do
+        assert %{passes: passes, size: size} = Maintenance.info(cache, p)
+        assert passes == others[p].passes
+        assert size == map_size(table_of(cache, p))
+      end
+
+      assert %{pending: 0, size: size2} = Maintenance.info(cache, 2)
+      assert size2 == map_size(table_of(cache, 2))
+    end
+
+    test "each partition sweeps its own expired keys" do
+      cache = unique_cache()
+      start_supervised!({Theine.Test.Clock, cache: cache, at: 0}, id: {:clock, cache})
+      start_partitioned(cache)
+
+      for i <- 1..400, do: Theine.put(cache, i, i, ttl: 10)
+      for i <- 401..800, do: Theine.put(cache, i, i)
+      idle!(cache)
+
+      due =
+        for p <- 0..(@partitions - 1),
+            into: %{},
+            do: {p, Map.keys(table_of(cache, p)) |> Enum.filter(&(&1 <= 400))}
+
+      for p <- 0..(@partitions - 1) do
+        assert due[p] != []
+        assert Maintenance.info(cache, p).expiring == length(due[p])
+      end
+
+      Theine.Test.Clock.advance(cache, 10)
+
+      # One partition's pass removes its own due keys and nobody else's.
+      :ok = Maintenance.run(cache, 1)
+      assert Maintenance.info(cache, 1).expiring == 0
+      assert Theine.stats(cache).expirations == length(due[1])
+      for key <- due[1], do: refute(:ets.member(cache, key))
+
+      for p <- [0, 2, 3] do
+        assert Maintenance.info(cache, p).expiring == length(due[p])
+        for key <- due[p], do: assert(:ets.member(cache, key))
+      end
+
+      for p <- [0, 2, 3], do: :ok = Maintenance.run(cache, p)
+      assert Theine.stats(cache).expirations == 400
+      assert :ets.info(cache, :size) == 400
+
+      for p <- 0..(@partitions - 1) do
+        assert %{expiring: 0, size: size} = Maintenance.info(cache, p)
+        assert size == map_size(table_of(cache, p))
+      end
+    end
+
+    test "4 writers' put, get, delete and expire over 100_000 keys lose no event" do
+      cache = unique_cache()
+      start_partitioned(cache)
+      test = self()
+      writers = 4
+      keys = 100_000
+
+      for w <- 1..writers do
+        spawn_link(fn ->
+          for key <- w..keys//writers do
+            :ok = Theine.put(cache, key, {:v, key})
+            assert Theine.get(cache, key) == {:ok, {:v, key}}
+
+            cond do
+              rem(key, 3) == 0 -> :ok = Theine.delete(cache, key)
+              rem(key, 5) == 0 -> true = Theine.expire(cache, key, 600_000)
+              true -> :ok
+            end
+          end
+
+          send(test, {:writer_done, w})
+        end)
+      end
+
+      for w <- 1..writers, do: assert_receive({:writer_done, ^w}, 30_000)
+      infos = idle!(cache)
+
+      assert :ets.info(cache, :size) == keys - div(keys, 3)
+
+      # Each partition's policy holds exactly the table's keys whose ids
+      # carry it, under the table's id and expiry.
+      for {info, p} <- Enum.with_index(infos) do
+        own = table_of(cache, p)
+        assert info.size == map_size(own)
+        assert info.expiring == Enum.count(own, fn {_, entry} -> elem(entry, 5) != :infinity end)
+
+        for {key, {key, _value, id, weight, _written_at, expires_at}} <- own do
+          assert {:ok, {^key, ^id, nil, _, ^weight, ^expires_at, _}} = row_in(cache, p, key)
+        end
+      end
+
+      assert infos |> Enum.map(& &1.size) |> Enum.sum() == keys - div(keys, 3)
     end
   end
 

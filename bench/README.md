@@ -447,9 +447,10 @@ mix bench maintenance --max-size 10000 --duration 1   # quick smoke run, not a g
 
 Not Benchee. The drivers are in `Theine.Bench.Load` (`bench/lib`) and know
 nothing about theine. A subject is a map of callbacks (`start`, `put`, `get`,
-`size`, `call_writes`, `stop`; see the moduledoc), and the drivers can be
+`size`, `call_writes`, `sync`, `stop`; see the moduledoc), and the drivers can be
 checked against a plain ETS table. Each subject is started fresh with
-`max_size` and `write_hwm` 1 024 (the specs/08 default) for each of two runs:
+`max_size` and `write_hwm` 1 024 (the specs/08 default) for each of two
+gated runs:
 
 - **write run**: `schedulers_online` writers put distinct keys for
   `--duration` seconds (default 30). One process samples the entries-table
@@ -461,16 +462,34 @@ checked against a plain ETS table. Each subject is started fresh with
   writes keep evicting. Every `[:theine, :maintenance, :pass]` event during
   the run is collected.
 
+Then the per-event write cost, reported with no threshold (specs/09
+§Decisions M7.1). Each scenario runs 3 times, each time on a fresh cache
+with `max_size` 100 000 (whatever `--max-size` says) and `write_hwm`
+1 024. Keys `1..100_000` are put and drained with the subject's `sync`, then
+one writer puts for 5 s (or `--duration`, when shorter):
+
+- **overwrite**: uniformly random keys of `1..100_000` (seeded), so every
+  event updates an existing entry.
+- **new**: keys `100_001`, `100_002`, ...: every event adds an entry and
+  evicts one.
+
+The clock stops when `sync` returns after the writer stops, so it covers
+every event sent. One writer outruns the maintenance process and blocks on
+backpressure, so `us_per_event` (elapsed µs over puts) is what one write
+event costs the maintenance process. Both figures are the mean of the runs.
+
 `--max-size` defaults to 1 000 000. The one subject is `theine`: a real
 cache started with `max_size`, `write_hwm` and otherwise the specs/08
 defaults, whose `size` is the entries table's count and whose
 `call_writes` is `Theine.Maintenance.info/1`'s field of that name (the
 backpressure calls the maintenance process consumed; specs/03 §Decisions
-M2.11), read before and after the mixed run.
+M2.11), read before and after the mixed run. Its `sync` is
+`Theine.run_maintenance/1`: the call queues behind every event already sent.
 
 Extra `system` fields: `max_size`, `duration_s`, `sample_ms`, `settle_ms`,
 `write_hwm`, `pass_budget_ms`, `read_fraction`, `ttl_ms`, `zipf_s`,
-`key_space`, `subjects` (names), `missing_erl_flags` (list).
+`key_space`, `event_max_size`, `event_duration_s`, `event_runs`, `subjects`
+(names), `missing_erl_flags` (list).
 
 Each `results` row is one subject:
 
@@ -488,6 +507,18 @@ Each `results` row is one subject:
 | `backpressure.reads`, `backpressure.writes` | integer | operations in the mixed run |
 | `backpressure.call_writes` | integer or null | writes that took the call path (specs/03), null when the subject cannot tell |
 | `backpressure.fraction` | number or null | `call_writes / writes` |
+| `write_cost` | array | one object per per-event scenario, below |
+
+Each `write_cost` entry:
+
+| field | type | meaning |
+|---|---|---|
+| `scenario` | string | `"overwrite"` or `"new"` |
+| `max_size` | integer | cache bound, 100 000 |
+| `writes` | integer | puts per run, mean of the runs, rounded |
+| `puts_per_s` | number | puts over elapsed seconds, mean of the runs |
+| `us_per_event` | number or null | elapsed µs over puts, mean of the runs; null if a run made no puts |
+| `runs` | array | each run's `writes`, `elapsed_us`, `puts_per_s`, `us_per_event` |
 
 Thresholds (specs/09):
 
@@ -498,7 +529,7 @@ Thresholds (specs/09):
 - budget `pass p99 (us)`: `<= 5000`; budget `pass max (us)`: `<= 20000`.
   A run with no pass events fails `maintenance pass events observed`
   (actual `0`, limit `>= 1`) rather than passing vacuously.
-- Backpressure is reported only.
+- Backpressure and the per-event write cost are reported only.
 
 ## Traces (`mix bench.traces`)
 

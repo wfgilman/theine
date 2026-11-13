@@ -132,8 +132,15 @@ test/                         mirrors lib/; test/support for shared helpers
   overwrites `hitrate-<sha>.json`. Compare hits before starting the second. Two runs must agree to the hit: compare the
   `hits` fields in the JSON, not the percentages (the harness raises if a
   pass it did not request ran).
-- `mix bench maintenance` takes about 2 min at the default 1 M entries
-  (two 30 s runs plus 1 M puts); `--max-size 10000 --duration 1` smokes it
+- The per-event write cost rows of `mix bench maintenance` (M7.1) agree to
+  3% within one invocation but moved 27% between invocations, after the
+  gated runs heat the laptop. To compare two trees, run
+  `bench/results/placement-m71.exs` (gitignored; `Load.event_run/3` alone,
+  4.26–4.54 µs per overwrite on M7.1's tree) before and after the change.
+  If a pass-budget miss comes with mixed-run reads well under 12 M, the
+  machine was slow.
+- `mix bench maintenance` takes about 2.5 min at the default 1 M entries
+  (two 30 s runs plus 1 M puts, then six 5 s per-event runs); `--max-size 10000 --duration 1` smokes it
   in seconds and shows the same overshoot structure. To attribute an
   overshoot, `bench/results/overshoot-m211.exs` (gitignored) samples the
   table size, the policy's `sizes` atomics and `pending` together: table =

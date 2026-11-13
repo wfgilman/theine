@@ -165,6 +165,12 @@ with `schedulers_online` writer processes and reports:
   Threshold: p99 ≤ `pass_budget` (5 ms); max ≤ 4 × `pass_budget`.
 - **Write backpressure**: fraction of writes that took the call path.
   Reported, no threshold; it should be near zero in the mixed run.
+- **Per-event write cost**: what one write event costs the maintenance
+  process. A full cache with `max_size` 100_000 (filled and drained before
+  the clock starts) takes one writer for 5 s, in two scenarios: (a)
+  overwrites of uniformly random existing keys, (b) distinct new keys, each
+  evicting one entry. Puts/s and µs per event, the mean of 3 runs on a fresh
+  cache each. Reported, no threshold.
 
 ## Running in the loop
 
@@ -515,3 +521,21 @@ exits non-zero when a threshold fails so the loop sees it as a failed gate.
   this row on any other shape, still fails the gate. `bench/get.exs` is
   unchanged: its exit status still reports the miss, and the gate reads the
   verdicts.
+- 2026-11-12 (M7.1): `mix bench maintenance` gains the per-event write
+  cost as a reported scenario with no threshold. M7 tunes the maintenance
+  process's write path for headroom: the write targets are met, so there
+  is nothing to gate, but each M7 task must show a lower per-event cost
+  than the task before it, and the overshoot and mixed runs at 1 M entries
+  and `schedulers_online` writers are too noisy for that (±15% writes run
+  to run). One writer against a full cache of 100_000 isolates the
+  maintenance process: a writer that gets ahead blocks on backpressure, so
+  the puts it completes are the events the process consumed. The clock runs
+  from the writer's start to a `run_maintenance/1` call after it stops,
+  which queues behind every event the writer sent, so µs per event is the
+  elapsed time over the puts. Overwrites (uniformly random keys of the
+  filled range, seeded) and new keys (each evicting one entry) are the two
+  costs of the 2026-11-12 profile in IMPLEMENTATION_PLAN.md M7. Each is
+  the mean of 3 runs on a fresh cache. A `--duration` below 5 s shortens
+  these runs to `--duration`, so the smoke run stays short; the cache size
+  does not follow `--max-size`, since the cost per event depends on the
+  size of the policy tables.

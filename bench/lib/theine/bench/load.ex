@@ -11,12 +11,14 @@ defmodule Theine.Bench.Load do
         get: (state, key -> any()),
         size: (state -> non_neg_integer()), # :ets.info(entries, :size)
         call_writes: (state -> non_neg_integer() | nil),
+        sync: (state -> any()),
         stop: (state -> any())
       }
 
   `call_writes` returns how many writes so far took the call path
   (specs/03 §Delivery with backpressure), or `nil` when the subject cannot
-  tell.
+  tell. `sync` returns once every write made so far has been applied
+  (for a subject with no background work, a no-op).
   """
 
   alias Theine.Bench.Zipf
@@ -165,6 +167,73 @@ defmodule Theine.Bench.Load do
       end
     end
   end
+
+  @doc """
+  The per-event write cost run: keys `1..fill` are put and `subject.sync`
+  drains them, then one writer puts for `duration_ms`, with `keys` either
+  `:overwrite` (uniformly random keys of `1..fill`, seeded with `seed`) or
+  `:new` (`fill + 1`, `fill + 2`, ...: distinct keys, each evicting one
+  entry from a cache bounded at `fill`). After the writer stops,
+  `subject.sync` waits until every event has been consumed.
+
+  The clock runs from the writer's start to the end of that sync, so the
+  time covers every event the writer sent. With one writer the maintenance
+  process is the bottleneck (a writer that gets ahead blocks on
+  backpressure), so `us_per_event` is what one write event costs it.
+  """
+  @spec event_run(map(), term(), keyword()) :: %{
+          writes: non_neg_integer(),
+          elapsed_us: float(),
+          puts_per_s: float(),
+          us_per_event: float() | nil
+        }
+  def event_run(subject, state, opts) do
+    fill = Keyword.fetch!(opts, :fill)
+
+    Enum.each(1..fill//1, &subject.put.(state, &1, &1, nil))
+    subject.sync.(state)
+
+    keys =
+      case Keyword.fetch!(opts, :keys) do
+        :overwrite -> {:overwrite, fill, :rand.seed_s(:exsss, Keyword.fetch!(opts, :seed))}
+        :new -> {:new, fill + 1}
+      end
+
+    stop = new_stop()
+    started = System.monotonic_time()
+    pid = spawn_link(fn -> event_loop(subject, state, stop, keys, 0) end)
+    Process.sleep(Keyword.fetch!(opts, :duration_ms))
+    stop(stop)
+    [writes] = collect([pid], :writes)
+    subject.sync.(state)
+
+    elapsed_us =
+      System.convert_time_unit(System.monotonic_time() - started, :native, :nanosecond) / 1000
+
+    %{
+      writes: writes,
+      elapsed_us: elapsed_us,
+      puts_per_s: writes / (elapsed_us / 1_000_000),
+      us_per_event: if(writes > 0, do: elapsed_us / writes)
+    }
+  end
+
+  defp event_loop(subject, state, stop, keys, writes) do
+    if stopped?(stop) do
+      reply(stop, :writes, writes)
+    else
+      {key, keys} = next_key(keys)
+      subject.put.(state, key, key, nil)
+      event_loop(subject, state, stop, keys, writes + 1)
+    end
+  end
+
+  defp next_key({:overwrite, fill, rand}) do
+    {key, rand} = :rand.uniform_s(fill, rand)
+    {key, {:overwrite, fill, rand}}
+  end
+
+  defp next_key({:new, key}), do: {key, {:new, key + 1}}
 
   defp delta(nil, _before), do: nil
   defp delta(_after, nil), do: nil

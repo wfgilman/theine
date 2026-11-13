@@ -5,8 +5,9 @@
 #   mix bench maintenance --max-size 10000 --duration 1    # quick smoke run
 #
 # Not Benchee: each subject runs the overshoot write run, then the mixed run,
-# through Theine.Bench.Load. Evaluates to the list of failed threshold
-# descriptions (Mix.Tasks.Bench).
+# then the per-event write cost runs (reported only), through
+# Theine.Bench.Load. Evaluates to the list of failed threshold descriptions
+# (Mix.Tasks.Bench).
 
 defmodule Theine.Bench.Maintenance do
   alias Theine.Bench.{Load, Report}
@@ -24,6 +25,13 @@ defmodule Theine.Bench.Maintenance do
   @zipf_s 1.0
   @key_space_factor 2
   @seed 11
+  # The per-event write cost (specs/09 §Decisions M7.1): a full cache of
+  # this size, one writer for at most this long, each scenario run this
+  # many times on a fresh cache. Reported, no threshold.
+  @event_max_size 100_000
+  @event_duration_s 5.0
+  @event_runs 3
+  @event_scenarios [:overwrite, :new]
 
   @none "no theine subject yet"
 
@@ -32,11 +40,20 @@ defmodule Theine.Bench.Maintenance do
       OptionParser.parse!(argv, strict: [max_size: :integer, duration: :float])
 
     max_size = Keyword.get(opts, :max_size, @max_size)
-    duration_ms = round(Keyword.get(opts, :duration, @duration_s) * 1000)
+    duration_s = Keyword.get(opts, :duration, @duration_s)
+    duration_ms = round(duration_s * 1000)
+    # A smoke run's short --duration shortens the per-event runs too.
+    event_ms = round(min(duration_s, @event_duration_s) * 1000)
     schedulers = System.schedulers_online()
     missing_flags = Report.check_erl_flags()
 
-    rows = Enum.map(subjects(), &run_subject(&1, max_size, duration_ms, schedulers))
+    rows =
+      Enum.map(subjects(), fn subject ->
+        subject
+        |> run_subject(max_size, duration_ms, schedulers)
+        |> Map.put(:write_cost, write_cost(subject, event_ms))
+      end)
+
     thresholds = Enum.flat_map(rows, &thresholds(&1, schedulers))
 
     path =
@@ -53,6 +70,9 @@ defmodule Theine.Bench.Maintenance do
             ttl_ms: @ttl_ms,
             zipf_s: @zipf_s,
             key_space: @key_space_factor * max_size,
+            event_max_size: @event_max_size,
+            event_duration_s: event_ms / 1000,
+            event_runs: @event_runs,
             subjects: Enum.map(subjects(), & &1.name),
             missing_erl_flags: missing_flags
           }),
@@ -89,6 +109,9 @@ defmodule Theine.Bench.Maintenance do
         get: fn name, key -> Theine.get(name, key) end,
         size: fn name -> :ets.info(name, :size) end,
         call_writes: fn name -> Theine.Maintenance.info(name).call_writes end,
+        # A call queues behind every event already sent, and the pass it
+        # runs leaves nothing pending.
+        sync: fn name -> :ok = Theine.run_maintenance(name) end,
         stop: fn name -> Supervisor.stop(Theine.Supervisor.name(name)) end
       }
     ]
@@ -152,6 +175,44 @@ defmodule Theine.Bench.Maintenance do
         fraction: if(mixed.call_writes && mixed.writes > 0, do: mixed.call_writes / mixed.writes)
       }
     }
+  end
+
+  # One row per scenario: the mean puts/s and µs per event over
+  # @event_runs runs, each on a fresh cache bounded at @event_max_size.
+  defp write_cost(subject, event_ms) do
+    start_opts = [max_size: @event_max_size, write_hwm: @write_hwm]
+
+    for scenario <- @event_scenarios do
+      IO.puts(
+        :stderr,
+        "maintenance: #{subject.name} per-event #{scenario} run, #{@event_runs} x #{event_ms} ms"
+      )
+
+      runs =
+        for i <- 1..@event_runs do
+          with_subject(subject, start_opts, fn state ->
+            Load.event_run(subject, state,
+              fill: @event_max_size,
+              keys: scenario,
+              duration_ms: event_ms,
+              seed: @seed + i
+            )
+          end)
+        end
+
+      %{
+        scenario: Atom.to_string(scenario),
+        max_size: @event_max_size,
+        runs: runs,
+        writes: runs |> Enum.map(& &1.writes) |> mean() |> round(),
+        puts_per_s: mean(Enum.map(runs, & &1.puts_per_s)),
+        us_per_event: mean(Enum.map(runs, & &1.us_per_event))
+      }
+    end
+  end
+
+  defp mean(values) do
+    if Enum.any?(values, &is_nil/1), do: nil, else: Enum.sum(values) / length(values)
   end
 
   defp with_subject(subject, start_opts, fun) do
@@ -227,10 +288,25 @@ defmodule Theine.Bench.Maintenance do
 
     #{section(rows, ["subject", "reads", "writes", "call-path writes", "fraction"], fn r -> [r.subject, r.backpressure.reads, r.backpressure.writes, r.backpressure.call_writes, r.backpressure.fraction] end)}
 
+    ### Per-event write cost (reported, no threshold; one writer, mean of #{@event_runs} runs)
+
+    #{write_cost_section(rows)}
+
     #{Report.thresholds_markdown(thresholds, "none evaluated (#{@none})")}
 
     Result: #{path}
     """
+  end
+
+  defp write_cost_section([]), do: @none
+
+  defp write_cost_section(rows) do
+    Report.table(
+      ["subject", "scenario", "max_size", "writes", "puts/s", "us per event"],
+      for r <- rows, c <- r.write_cost do
+        [r.subject, c.scenario, c.max_size, c.writes, c.puts_per_s, c.us_per_event]
+      end
+    )
   end
 
   defp section([], _header, _cells), do: @none

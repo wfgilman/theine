@@ -3,7 +3,8 @@ defmodule Theine do
   A bounded in-memory cache for the BEAM, modelled on Java's Caffeine.
 
   Entries live in ETS; access buffers and the frequency sketch live in
-  `:atomics`; one maintenance process per cache owns the W-TinyLFU policy.
+  `:atomics`; one maintenance process per cache owns the W-TinyLFU policy,
+  or one per partition with the `partitions` option of `start_link/1`.
   The public API is specified in `specs/08-api-and-lifecycle.md`.
 
   ## Starting a cache
@@ -118,7 +119,8 @@ defmodule Theine do
 
   The `weigher` is called on every write without a `weight:` option and
   must return a positive integer; an entry heavier than `max_size` is never
-  stored (see `put/4`).
+  stored (see `put/4`), nor with `partitions` one heavier than its
+  partition's share (see Partitions below).
 
   `eviction_listener: true` emits a `[:theine, :eviction]` telemetry event
   for every entry the cache removes on its own, with `%{weight: weight}` as
@@ -163,7 +165,8 @@ defmodule Theine do
   - `write_hwm`: the write events that may wait for the maintenance
     process before a writer blocks until it catches up. This is also the
     most a bounded cache can transiently hold above `max_size`, plus one
-    in-flight write per writer.
+    in-flight write per writer; with `partitions: n` each partition has
+    its own `write_hwm`, so the excess is up to `n * write_hwm`.
   - `write_batch`: the maintenance process runs a pass after this many
     write events, and flushes at most this many queued events in one.
   - `expire_batch`: the expired entries one pass removes at most.
@@ -174,17 +177,77 @@ defmodule Theine do
     the previous pass's duration after it, which caps the maintenance
     process's share of a scheduler under heavy reads; 0 runs such passes
     back to back.
-  - `partitions`: the number of maintenance processes. Every write is
-    applied by one maintenance process, which caps the writes a cache can
-    sustain; with `partitions: n` each key belongs to one of `n`
-    processes, each with its own policy, expiry and `write_hwm`, so the
-    entries table may hold up to `n * write_hwm` unapplied writes. In a
-    bounded cache each partition evicts within its share of `max_size`,
-    `div(max_size, n)` or one more, which must be at least 10_000, and an
-    entry heavier than its partition's share is never stored.
+  - `partitions`: the number of maintenance processes; see Partitions
+    below.
   - `stats`: `false` stops `get/2` from counting hits and misses (see
     `stats/1`); load, eviction, expiration and refresh counts are kept
     either way.
+
+  ### Partitions
+
+  `partitions: n` (a power of two up to 64) runs `n` maintenance processes
+  instead of one. Use it when a cache is short of write throughput, and
+  leave the default of 1 otherwise.
+
+  One maintenance process applies every write event of a cache, and a
+  writer that outruns it waits for it, so that process's rate is the
+  cache's sustained write ceiling however many processes write. On a
+  two-core laptop that is about 100_000 new keys a second when each one
+  evicts an entry, and about 200_000 to 250_000 overwrites. With
+  `partitions: n` each key belongs to one partition, chosen from the
+  key's hash when it is written, and each partition is a whole policy over
+  its own keys: its own W-TinyLFU segments, frequency sketch, adaptive
+  window, expiry sweep and `write_hwm`. Writes spread over many keys then
+  go to `n` processes, and the ceiling rises with `n` up to the cores the
+  writers leave free; four partitions sustained 2.1 to 2.2 times one
+  partition's writes on that laptop. Writes to one hot key all go to its
+  partition, which partitioning does not help.
+
+  The rest is still one cache: one name, one entries table, one `size/1`
+  and one `stats/1`, single-flight loading across every key, and a hit
+  finds its partition in the entry it read, without hashing the key. A
+  crash in one partition's process restarts only that partition, which
+  rebuilds its own keys from the table.
+
+  What partitions cost:
+
+  - **A minimum share.** In a bounded cache each partition evicts within
+    its share of `max_size`: `div(max_size, n)`, plus one for the first
+    `rem(max_size, n)` partitions, so the shares add up to `max_size`.
+    `start_link/1` raises `ArgumentError` when `div(max_size, n)` is below
+    10_000, because a smaller share leaves each policy too few entries for
+    its admission window and hill climber. At shares of 12_500 entries
+    and up the measured hit rates stayed within half a point of one
+    partition's. An unbounded cache has no minimum share.
+  - **A lower entry-weight limit.** An entry heavier than its key's
+    partition's share is never stored (see `put/4`), so the heaviest
+    entry a cache can hold falls from `max_size` to about
+    `max_size / n`. The hash spreads keys evenly, not weight, so uneven
+    weights can also leave one partition evicting while another has room.
+  - **More slack above `max_size`.** Each partition lets `write_hwm` write
+    events wait before its writers block, so under sustained writes a
+    bounded cache may hold up to `max_size + n * write_hwm` entries' weight
+    plus one in-flight write per writer, against `max_size + write_hwm`
+    with one partition. It returns to `max_size` once the writes are
+    applied.
+  - **More drain passes under few readers.** Each partition rate limits
+    its own read-driven passes (`drain_backoff`), so under one reader `n`
+    partitions run up to `n` times the passes of one. On a machine with
+    few cores those passes take time from the readers: one reader of a
+    100_000-entry cache measured a p50 1.13 to 1.26 times the default
+    cache's at `partitions: 4`. With a reader on every scheduler the two
+    were within a few percent.
+  - **Memory and processes.** `n` maintenance processes and their
+    supervisor, `n` sets of policy tables and `n` groups of read-buffer
+    rings. The sketches together are about the size of one.
+
+      iex> {:ok, _} = Theine.start_link(name: :partitions_doc, max_size: 40_000, partitions: 4)
+      iex> Theine.put(:partitions_doc, :a, 1)
+      :ok
+      iex> Theine.run_maintenance(:partitions_doc)
+      :ok
+      iex> Theine.size(:partitions_doc)
+      1
   """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) when is_list(opts) do

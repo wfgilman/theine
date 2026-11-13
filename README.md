@@ -2,7 +2,8 @@
 
 A Caffeine-style in-memory cache for the BEAM, in pure Elixir. W-TinyLFU
 admission with Caffeine's adaptive window, lossy striped read buffers,
-amortized maintenance in one process, expiration, and single-flight loading
+amortized maintenance in one process (or in `n` with `partitions: n`, for
+write-heavy caches), expiration, and single-flight loading
 from an L2. ETS holds the entries and `:atomics` the access buffers and the
 frequency sketch. No NIFs, ports or C; the one runtime dependency is
 `telemetry`.
@@ -128,7 +129,33 @@ maintenance process can apply. Measured here, one cache sustained
 245_000–469_000 overwrites/s from one writer, 190_000–242_000/s in total
 from four writers, and about 96_000/s of new keys that each evict an
 entry. That is 0.03–0.21× the rate of an ETS insert. If you need more
-write throughput than that, shard across several caches.
+write throughput than that, start the cache with `partitions: n`: `n`
+maintenance processes, each applying the writes of the keys that hash to
+it under its own share of `max_size` (`Theine.start_link/1` documents the
+costs: a share of at least 10_000 entries, an entry-weight limit of about
+`max_size / n`, and up to `n * write_hwm` of slack above `max_size`). With
+one writer per scheduler, measured by `mix bench maintenance` on the same
+machine (M8.5a; overwrite rewrites existing keys, new evicts one entry
+per write):
+
+| partitions | scenario | puts/s | × partitions 1 |
+|---|---|---|---|
+| 1 | overwrite | 194_562 | 1.00 |
+| 1 | new | 102_961 | 1.00 |
+| 2 | overwrite | 322_535 | 1.66 |
+| 2 | new | 150_870 | 1.47 |
+| 4 | overwrite | 434_864 | 2.24 |
+| 4 | new | 217_056 | 2.11 |
+
+The gain is bounded by the cores the writers leave free; on a machine
+with four physical cores `partitions: 4` must reach 2× (a human step of
+the final gate, still pending). Writes to one hot key all go to one
+partition, so partitions raise the ceiling for writes spread over many
+keys only. A partitioned hit costs what the default hit costs, but each
+partition runs its own drain passes, so under one reader on this
+two-core machine `partitions: 4` read at 1.13–1.26× the default cache's
+p50 on 100_000 keys, and at most 1.04× on 1_000_000 keys or with four
+readers.
 
 **`mix bench hitrate`**: hit rate (%) on the ARC traces and two synthetic
 ones. `theine_static` is the same cache with `adaptive: false`. Caffeine's
@@ -150,10 +177,18 @@ a human step of the final gate, still pending.
 | zipf | 10_000 | 56.61 | 64.03 | pending | 64.46 | pending |
 | zipf | 100_000 | 76.41 | 79.71 | pending | 79.74 | pending |
 
+With `partitions: 4` (`theine_p4`, run on the rows where each partition's
+share is at least 10_000 entries: DS1, S3, P3 and zipf 100_000) the hit
+rate was within 0.4 points of `theine` on every row, from −0.24 on P3 to
++0.36 on zipf 100_000 (M8.5b).
+
 **`mix bench maintenance`**: a cache bounded at 1_000_000 entries under one
 writer per scheduler. In a 30 s run of distinct-key writes the table never
 held more than 1_001_028 entries, the `max_size + write_hwm + schedulers`
-bound, and it was back at 1_000_000 a second after the writers stopped. In
+bound, and it was back at 1_000_000 a second after the writers stopped.
+With `partitions: 4` the same run never held more than 1_003_999 entries,
+under its `max_size + 4 * write_hwm + schedulers` bound of 1_004_100, and
+settled at 1_000_000 too (M8.5a). In
 the mixed run (75% Zipf reads, 25% writes, half of them with a 100 ms TTL)
 a maintenance pass took 2.1 ms at p50, 4.0 ms at p99 and 11.7 ms at most,
 against a 5 ms budget for the p99.

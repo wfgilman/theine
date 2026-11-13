@@ -1,8 +1,8 @@
-# 12 — Partitioned maintenance (design, settled for v2)
+# 12 — Partitioned maintenance (built)
 
-Status: settled for v2 on 2026-11-12 (§Settled questions), planned as
-IMPLEMENTATION_PLAN.md §M8 and being built. Built so far: ids and routing
-(M8.1, `Theine.Partition`), and `n` maintenance processes under
+Status: settled for v2 on 2026-11-12 (§Settled questions) and built in
+IMPLEMENTATION_PLAN.md §M8, finished 2026-11-13 (M8.6). Built: ids and
+routing (M8.1, `Theine.Partition`), and `n` maintenance processes under
 `Theine.Partitions` with per-partition `pending`, backpressure, drain flag,
 `sizes` fields and restart (M8.2), the calls that span partitions (M8.3),
 and bounded partitions: the read buffer split by partition, the
@@ -10,8 +10,14 @@ partitioned `hit` shape, capacity shares, a sketch per share and the
 minimum share (M8.4). `partitions` is a `start_link` option. `mix bench
 get` has `theine_p4` and `mix bench maintenance` has the partitioned
 overshoot run and the throughput rows (M8.5a). `mix bench hitrate` has
-`theine_p4` on the rows whose share qualifies (M8.5b). The docs (M8.6)
-remain.
+`theine_p4` on the rows whose share qualifies (M8.5b). The `start_link/1`
+doc, the README and specs/00 describe the option (M8.6). Two items stay
+open, and both need a person. The reference machine's throughput gate
+(settled question 4) has not been run. The hot-path row of §Acceptance
+misses at `parallel: 1` on the development machine (IMPLEMENTATION_PLAN.md
+open question 5).
+The sections below keep the note's design wording ("would", "a build"),
+and §Costs gives the measured figures where the build took them.
 It is the follow-on to milestone M7: M7 lowers the cost of a write event
 inside one maintenance process, and this note lets one cache run several
 of them. It says how a cache splits its policy across `partitions`
@@ -244,25 +250,36 @@ The other partitions do not notice.
 
 | | `n = 1` | `n > 1` |
 |---|---|---|
-| `get/2` hit | unchanged | one `band`, one multiply, one add (estimate under 3 ns, not measured) |
+| `get/2` hit | unchanged | one `band`, one multiply, one add (353.7 ns against the default hit's 355.0 with maintenance paused, M8.5a; the drain passes are another matter, below) |
 | `put/4`, `put_new/4`, a commit | unchanged | `phash2/2` and a shift, about 20 ns (measured 2026-11-12), and the id arithmetic |
 | `delete/2`, `expire/3`, expired read | unchanged | one `band` on the id |
 | processes | 1 maintenance | `n` maintenance and one supervisor |
 | memory | unchanged | `n` × the rings and policy-table overhead; sketches about the same in total |
 | sustained writes | one process's ceiling | up to `n` × that, limited by cores (below) |
 
-**Throughput is a guess until measured.** Writers and maintenance
+**Throughput is bounded by cores.** Writers and maintenance
 processes share the schedulers. On the 4-scheduler development machine,
 four writers and four partitions compete for four cores, so 2–3× one
 partition is a more honest expectation than 4×. Writes concentrated on a
 few hot keys also concentrate on their partitions: partitioning raises the
-ceiling for writes spread over many keys, not for one hot key.
+ceiling for writes spread over many keys, not for one hot key. Measured in
+M8.5a with one writer per scheduler on that machine, `partitions: 4`
+sustained 2.24× `partitions: 1`'s overwrites and 2.11× its evicting new
+keys, and `partitions: 2` 1.66× and 1.47×.
+
+**Drain passes multiply under few readers.** Each partition rate limits
+its own read-driven passes (specs/04 §Decisions M2.8c), so under one reader
+`n` partitions run about `n` times the passes of one, and on a machine with
+few cores they take time from that reader. M8.5a measured `theine_p4`'s
+p50 at 1.13–1.26× `theine`'s at 100_000 keys and one reader, and at most
+1.04× elsewhere (IMPLEMENTATION_PLAN.md open question 5).
 
 **Hit rate may drop a little.** Admission compares a candidate only with a
 victim in its own partition, and each hill climber samples a `1/n` share
 of the accesses. Over a share of many thousand entries that should be
-statistically close to one global policy. Small shares are where it breaks
-down. At `max_size: 1_000` with `n = 8`, each partition has 125 entries and
+statistically close to one global policy (M8.5b measured `theine_p4`
+within −0.24 to +0.36 points of `theine` on every qualifying row). Small
+shares are where it breaks down. At `max_size: 1_000` with `n = 8`, each partition has 125 entries and
 a window of one or two, and the climber's samples are noisy. That is why
 there is a minimum share (settled question 1). Uneven weights can also leave
 one partition evicting while another has room: the hash spreads keys
@@ -461,3 +478,18 @@ except where noted.
   (P3, 12_500 entries a partition: −0.24). Two `--traces P3` runs agree to
   the hit, so the partitioned replay is deterministic. The margin is read
   as two-sided, "within 1 point" either way.
+- 2026-11-13 (M8.6): the note is marked built. The `start_link/1` doc has
+  a Partitions section. It says when to use the option (a cache short of
+  write throughput, over many keys). It also gives the minimum share, the
+  entry-weight limit of about `max_size / n` (also on `put/4` and the
+  `weigher`), the `n * write_hwm` slack (also on `write_hwm`), and the
+  extra drain passes under few readers. The README's sustained-write
+  paragraph points to `partitions` instead of hand sharding and carries
+  M8.5a's throughput rows. It also gives `theine_p4`'s hit-rate deltas and
+  partitioned overshoot. specs/00 moves the feature from §Non-goals into
+  §What theine is and goal 3, and gives A5's slack for `n > 1`. §Costs now
+  gives the measured hit, throughput and hit-rate figures in place of
+  estimates. It also states the drain-pass cost that open question 5
+  raised, because users of the option should know it whichever way that
+  question is settled. §Design and §What a build would change keep their
+  design wording, since every item in them is built.

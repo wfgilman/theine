@@ -12,6 +12,10 @@ native code, that reproduces the architecture of Java's Caffeine:
   to the store, and never contends on a shared cache line;
 - a single maintenance process that drains the buffers and applies policy,
   expiration and eviction in amortized O(1) batches, off the request path;
+  with `partitions: n` (specs/12), `n` of them over the one entries table,
+  each running the whole policy over the keys that hash to it and its
+  share of `max_size`, so a cache's sustained write ceiling is not one
+  process's;
 - a loading layer with single-flight coalescing, asynchronous loads, and
   refresh-after-write (stale-while-revalidate) for values sourced from a
   slower L2 such as Redis, Postgres or a remote service.
@@ -34,8 +38,8 @@ Elixir caches, not as "beats ETS":
 2. Reads never write to ETS. The entry store sees writes only from `put`,
    `delete`, expiry cleanup and eviction.
 3. The policy (frequency sketch, access order, expiry index) is owned by one
-   process and lives in `:atomics` and private ETS, so it costs no GC in the
-   caller and no locks.
+   process (one per partition with `partitions: n`) and lives in `:atomics`
+   and private ETS, so it costs no GC in the caller and no locks.
 
 ## Acceptance criteria (the project is done when all hold)
 
@@ -65,7 +69,10 @@ list is the contract.
 - **A5 Bounded.** Under a sustained 100% write workload at any scheduler
   count, the entry count never exceeds `max_size` plus the write-buffer slack
   defined in specs/03, and returns to at most `max_size` within one
-  maintenance interval of the writes stopping.
+  maintenance interval of the writes stopping. With `partitions: n > 1`
+  each partition has its own `write_hwm`, so the slack is `n * write_hwm`
+  plus one in-flight write per writer (specs/12 §A5 with partitions,
+  §Settled questions 2).
 - **A6 No native code.** `mix.exs` has no NIF, port or `make` dependency, and
   the release contains no `.so`.
 
@@ -82,8 +89,6 @@ list is the contract.
 - Distribution, replication, persistence, or an L2 adapter library. The
   loader is a function; what it calls is the user's business.
 - Weak/soft references, cache-wide locks, transactions.
-- Partitioned maintenance (several policy processes per cache, to raise the
-  sustained write ceiling of specs/03). Settled for v2 in specs/12.
 
 ## Mapping to Caffeine (for anyone who knows it)
 
@@ -143,6 +148,11 @@ list is the contract.
   Caffeine simulator cross-check instructions, docs, `mix hex.build` clean.
 - **M6 Optional.** Eviction listener, `fetch_all`, expire-after-access
   design note. Only after M5 is green.
+- **M7 Write-path tuning.** The cost of one write event inside the
+  maintenance process, measured per event by `mix bench maintenance`.
+- **M8 Partitioned maintenance.** specs/12: the `partitions` option, `n`
+  maintenance processes over one entries table. Done when `partitions: 1`
+  is unchanged and specs/12 §Acceptance holds.
 
 ## Decisions
 
@@ -245,3 +255,11 @@ list is the contract.
   no hash. Its six open questions were settled the same day (specs/12
   §Settled questions), among them the A5 slack for `n > 1`:
   `max_size + n * write_hwm + writers`. No code changed.
+- 2026-11-13 (M8.6): partitioned maintenance is built (IMPLEMENTATION_PLAN.md
+  §M8, specs/12), so it leaves §Non-goals. It is part of §What theine is and
+  goal 3, and A5 states its slack for `n > 1`, as specs/12 §Settled
+  questions 2 settled it. Goal 1 is unchanged: a partitioned hit adds a
+  `band`, a multiply and an add, and no call, hash or `:atomics` op
+  (specs/10's tracing multisets). The milestone list gains M7 and M8,
+  which were planned after this file's list was written. The default
+  stays `partitions: 1`.

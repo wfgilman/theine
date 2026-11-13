@@ -82,6 +82,8 @@ list is the contract.
 - Distribution, replication, persistence, or an L2 adapter library. The
   loader is a function; what it calls is the user's business.
 - Weak/soft references, cache-wide locks, transactions.
+- Partitioned maintenance (several policy processes per cache, to raise the
+  sustained write ceiling of specs/03). Drafted for v2 in specs/12.
 
 ## Mapping to Caffeine (for anyone who knows it)
 
@@ -235,3 +237,10 @@ list is the contract.
   `:atomics` word per entry, stamped by every hit with `exchange`. That is
   one more op on the hit of a cache with the option, which needs a human
   decision on goal 1 (specs/11 open question 1). It stays a v1 non-goal.
+- 2026-11-12: partitioned maintenance added to §Non-goals as a v2 draft,
+  specs/12. The M7 profile found no single dominant cost in a write event,
+  so tuning one maintenance process cannot multiply a cache's write
+  ceiling. The note splits the policy across `partitions` processes over
+  one entries table and carries the partition in the id, so a hit needs
+  no hash. It leaves six questions for a human, among them the A5 slack
+  for `n > 1`. No code changed.

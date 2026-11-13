@@ -137,7 +137,7 @@ Raising the write ceiling by a large factor needs the policy split across severa
 Order: M7.1, M7.2, M7.3, M7.4. Each later task is measured against the M7.1 baseline and the task before it.
 
 - [x] M7.1 Per-event write cost in `mix bench maintenance` **(maintenance)** (specs/09 §`mix bench maintenance`; specs/04): a reported scenario, with no threshold, that measures what one write event costs the maintenance process. A full bounded cache (`max_size: 100_000`, filled and drained before timing), one writer for 5 s, two runs: (a) overwrites of uniformly random existing keys, (b) distinct new keys, each evicting one entry. Report puts/s and µs per event for each, as the mean of 3 runs, in the bench's summary and its JSON result. Document the scenario in `bench/README.md` and specs/09 as reported only, with a dated entry under specs/09 §Decisions. — outcome: `mix bench maintenance` prints both rows and still exits 0 at 4/4; the numbers are recorded under §Benchmark log as M7's baseline (expected near 4.2 µs and 10.5 µs on the development machine).
-- [ ] M7.2 Fewer one-field struct updates on the event path **(maintenance)** **(policy)** (specs/05 §Events; specs/04 §The pass): on the `on_write`, `on_remove`, `on_access` and `evict` paths, fold one-field `%{state | k: v}` updates into the multi-field update next to them, and return the state unchanged where nothing changes (`add_segment/3` with delta 0). In `Theine.Maintenance`, fold the `evicted` update into `consumed/2`'s update. In `replace/6`, merge the two `:ets.update_element/3` calls on the key's policy row (the segment and seq written by `reorder/6`, and the id, weight and `expires_at` written by `replace/6`) into one. Add a dated entry under specs/05 §Decisions recording the one-key update cost above, so later code on the event path keeps to multi-field updates. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; M7.1's overwrite and eviction µs per event both lower than the baseline, recorded under §Benchmark log.
+- [x] M7.2 Fewer one-field struct updates on the event path **(maintenance)** **(policy)** (specs/05 §Events; specs/04 §The pass): on the `on_write`, `on_remove`, `on_access` and `evict` paths, fold one-field `%{state | k: v}` updates into the multi-field update next to them, and return the state unchanged where nothing changes (`add_segment/3` with delta 0). In `Theine.Maintenance`, fold the `evicted` update into `consumed/2`'s update. In `replace/6`, merge the two `:ets.update_element/3` calls on the key's policy row (the segment and seq written by `reorder/6`, and the id, weight and `expires_at` written by `replace/6`) into one. Add a dated entry under specs/05 §Decisions recording the one-key update cost above, so later code on the event path keeps to multi-field updates. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; M7.1's overwrite and eviction µs per event both lower than the baseline, recorded under §Benchmark log.
 - [ ] M7.3 Hash each key for the sketch once **(maintenance)** **(policy)** (specs/02 §Hashing, §Operations; specs/05 §State): keep the key's sketch hash in its policy row, so that `increment` and `frequency` on a key the policy holds skip `:erlang.phash2/2`, the spread and the rehash. `Theine.Sketch` gains variants that take the stored hash, and the hash function is unchanged, so every counter is bit-identical (the sketch's property tests and `positions/2` still hold). The row shape changes, so every `@row_*` position, row pattern, `restore/5` and the test helpers that read rows move with it, and specs/05 §State is updated. The drained reads benefit too: every drained hit increments the sketch through `reorder_and_sample/5`. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4 with the mixed-run pass p99 no higher than before; M7.1's eviction µs per event lower than M7.2's, recorded under §Benchmark log.
 - [ ] M7.4 Lazy deletion in the LRU `order` table, kept only if it pays **(maintenance)** **(policy)** (specs/05 §State, §`evict()`): a move inserts the key's new `{base + seq, key}` row and leaves the old one, and the policy row's seq is the authority. Every walk of `order` (`lru_entry`, the candidate cursor and `previous/2`, `demote`, `fitting_lru`, the climber's transfers, the `lru/2` and `mru/2` helpers) drops a row whose seq no longer matches the key's row and moves on. Stale rows must stay bounded: compact in bounded steps inside the pass, inside `pass_budget`, for example when `order` holds more than twice the live rows. A property test drives random event sequences and checks that the live order is the same as with eager deletion. — outcome: `mix bench hitrate` identical to the hit; `mix bench maintenance` 4/4; M7.1's overwrite µs per event at least 0.3 µs lower than M7.3's. If the gain falls short or the hit counts move, revert the code, record the measurement under §Benchmark log and in a dated specs/05 §Decisions entry, and check the task off as not taken.
 
@@ -220,6 +220,44 @@ resolution, and are settled by editing the spec in the build commit that
 needs the answer (PROMPT_build.md step 5).
 
 ## Benchmark log
+
+### M7.2 — `mix bench hitrate` (full, in two runs), `mix bench maintenance` and two compiled probes, tree of the M7.2 commit (2026-11-12; hitrate 19/19 and 6/6 with every row identical to the hit, maintenance 4/4)
+
+**Hits.** The non-DS1 run's adaptive `theine` rows were compared with a same-session baseline: `bench/results/hits-m72.exs` (gitignored) compiles a revision's `Theine.Policy` (`HITS_BASE`, default HEAD, here b8a824a) as `Theine.BasePolicy` and replays the traces through it with `policy_module`, under the bench's cache names and options and `Theine.Bench.Cache.access/2`. Its rows match the final gate's percentages. `theine_static` keeps the cache names of M2.11e's run, so it is compared with that run's `theine` rows (`hitrate-91115ee.json`), and DS1 with the final gate's `hitrate-7e8712e.json` (`bench/results/compare-hits.exs`):
+
+| trace | size | theine base | theine M7.2 | theine_static M2.11e | theine_static M7.2 |
+| --- | --- | --- | --- | --- | --- |
+| OLTP | 1000 | 363523 | 363523 | 324531 | 324531 |
+| OLTP | 2000 | 415352 | 415352 | 382947 | 382947 |
+| OLTP | 5000 | 504230 | 504230 | 479056 | 479056 |
+| S3 | 100000 | 1924533 | 1924533 | 1967411 | 1967411 |
+| S3 | 400000 | 6988897 | 6988897 | 6944119 | 6944119 |
+| P3 | 50000 | 1006714 | 1006714 | 1034294 | 1034294 |
+| loop | 1000 | 88007 | 88007 | 88942 | 88942 |
+| zipf | 10000 | 6403286 | 6403286 | 6446324 | 6446324 |
+| zipf | 100000 | 7971043 | 7971043 | 7973675 | 7973675 |
+| DS1 | 1000000 | 6178165 | 6178165 | 6378479 | 6378479 |
+| DS1 | 4000000 | 20052457 | 20052457 | 20066089 | 20066089 |
+| DS1 | 8000000 | 30789048 | 30789048 | 30789224 | 30789224 |
+
+(DS1's base columns are the final gate's.) The lru rows are unchanged too. The percentages are those of §Final gate.
+
+**Per-event cost, policy only.** `bench/results/policy-m72.exs` (gitignored) times `on_write/5` then `evict/1` in one process with no messaging, on a policy of 100_000 keys, 300_000 events per round. Each round runs the previous `Theine.Policy` (`POLICY_BASE`, default HEAD) and this one in turn. Six rounds, `+sbt db +sbwt very_long`:
+
+| scenario | base mean µs | M7.2 mean µs | base range | M7.2 range |
+| --- | --- | --- | --- | --- |
+| overwrite | 3.266 | 3.109 | 3.239–3.291 | 3.078–3.135 |
+| new key, evicting one | 6.199 | 6.127 | 6.181–6.213 | 6.087–6.148 |
+
+M7.2 was faster in every round of both scenarios. Its spread is about 1%, where M7.1's wall-clock `event_run` is bimodal (3.8–4.1 or 5.3–5.8 µs per overwrite from one round to the next, `bench/results/events-m72.exs`), so the probe is the comparison for M7.3 and M7.4. The overwrite saves 0.16 µs, near the profile's 0.24 µs from three alternating runs, and the eviction path 0.07 µs. The new key's remaining struct updates are the insert's, `evict/1`'s opening of a batch and its settling, all multi-key.
+
+**`mix bench maintenance`**, `ERL_FLAGS="+sbt db +sbwt very_long"`, 4/4:
+
+| max sample (limit 1001028) | writes (write run) | passes | pass p50 us | pass p99 us | pass max us | reads (mixed) | overwrite us/event | new us/event |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1001028 | 3014001 | 9256 | 1948.80 | 3908.16 | 5847.76 | 12423439 | 4.12 | 7.84 |
+
+Both per-event rows are below M7's baseline (overwrite 4.25–5.41 µs, new 8.24–8.95 µs, §M7.1), and the mixed run's 12.4 M reads show a machine at full speed (discovered issue 10).
 
 ### M7.1 — `mix bench maintenance` with the per-event write cost, three invocations, and a standalone placement probe, tree of the M7.1 commit (2026-11-12; 2/4, 2/4, 4/4; `lib/` unchanged)
 

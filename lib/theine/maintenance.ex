@@ -438,7 +438,7 @@ defmodule Theine.Maintenance do
   # consumed, so the reply is the consumption, and it goes out before a pass
   # the event may trigger.
   def handle_call({:event, event}, from, state) do
-    state = apply_call_event(state, event)
+    state = apply_event(state, event, 1)
     GenServer.reply(from, :ok)
     {:noreply, batch(state)}
   end
@@ -468,10 +468,10 @@ defmodule Theine.Maintenance do
   # Write events are applied on arrival (specs/04 §The pass, first paragraph).
   @impl true
   def handle_info({:put, _, _, _, _} = event, state),
-    do: {:noreply, state |> apply_event(event) |> batch()}
+    do: {:noreply, state |> apply_event(event, 0) |> batch()}
 
   def handle_info({:removed, _, _} = event, state),
-    do: {:noreply, state |> apply_event(event) |> batch()}
+    do: {:noreply, state |> apply_event(event, 0) |> batch()}
 
   # A reader's or a follow-up's `:drain` (specs/03 §`schedule_drain/1`).
   # While one is deferred, another is dropped: the flag has stayed set, so
@@ -508,27 +508,33 @@ defmodule Theine.Maintenance do
   # which is the A5 bound. An entry heavier than `evict_batch` removals
   # leaves the cache over capacity with `:more`; the pass this schedules
   # finishes the eviction, as after a capped step 5.
-  @spec apply_event(state(), Theine.WriteEvents.event()) :: state()
-  defp apply_event(%__MODULE__{module: module, config: config} = state, {:put, key, id, w, exp}) do
+  #
+  # `call` is 1 for an event that arrived as a backpressure call (specs/03
+  # §Delivery with backpressure), counted for `info/1`, else 0.
+  @spec apply_event(state(), Theine.WriteEvents.event(), 0 | 1) :: state()
+  defp apply_event(%__MODULE__{module: module} = state, {:put, key, id, w, exp}, call) do
     {status, evicted, policy} = module.evict(module.on_write(state.policy, key, id, w, exp))
-    if status == :more, do: ReadBuffer.schedule_drain(config)
-    consumed(%{state | evicted: state.evicted + evicted}, policy)
+    if status == :more, do: ReadBuffer.schedule_drain(state.config)
+    consumed(state, policy, evicted, call)
   end
 
-  defp apply_event(state, {:removed, key, id}) do
-    consumed(state, state.module.on_remove(state.policy, key, id))
+  defp apply_event(state, {:removed, key, id}, call) do
+    consumed(state, state.module.on_remove(state.policy, key, id), 0, call)
   end
 
-  defp consumed(state, policy) do
+  # One struct update per consumed event, whatever it counts: a one-key
+  # update costs several times a multi-key one on OTP 28 (specs/05
+  # §Decisions M7.2).
+  defp consumed(%__MODULE__{} = state, policy, evicted, call) do
     :atomics.sub(state.config.pending, 1, 1)
-    %{state | policy: policy, writes: state.writes + 1}
-  end
 
-  # An event that arrived as a backpressure call (specs/03 §Delivery with
-  # backpressure): applied like any other, and counted for `info/1`.
-  defp apply_call_event(state, event) do
-    state = apply_event(state, event)
-    %{state | call_writes: state.call_writes + 1}
+    %{
+      state
+      | policy: policy,
+        writes: state.writes + 1,
+        evicted: state.evicted + evicted,
+        call_writes: state.call_writes + call
+    }
   end
 
   # The write-count trigger: a pass once `write_batch` events have been
@@ -626,13 +632,13 @@ defmodule Theine.Maintenance do
   defp flush(state, limit) do
     receive do
       {:put, _, _, _, _} = event ->
-        flush(apply_event(state, event), limit - 1)
+        flush(apply_event(state, event, 0), limit - 1)
 
       {:removed, _, _} = event ->
-        flush(apply_event(state, event), limit - 1)
+        flush(apply_event(state, event, 0), limit - 1)
 
       {:"$gen_call", from, {:event, event}} ->
-        state = apply_call_event(state, event)
+        state = apply_event(state, event, 1)
         GenServer.reply(from, :ok)
         flush(state, limit - 1)
     after

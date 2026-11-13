@@ -361,12 +361,10 @@ defmodule Theine.Policy do
     end
   end
 
-  defp replace(state, key, id, weight, expires_at, row) do
-    {^key, old_id, segment, old_seq, old_weight, old_expires_at} = row
-
-    # The access first: it claims the seq, and a refused seq (the
-    # sentinel) must leave every table untouched.
-    state = touch(state, key, segment, old_seq)
+  # Without a bound there is no order to keep and no segment weight, so the
+  # state is unchanged.
+  defp replace(%__MODULE__{order: nil} = state, key, id, weight, expires_at, row) do
+    {^key, old_id, nil, _seq, old_weight, old_expires_at} = row
     true = :ets.delete(state.ids, old_id)
     true = :ets.insert(state.ids, {id, key})
 
@@ -379,11 +377,59 @@ defmodule Theine.Policy do
 
     :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
     add(state, 0, weight - old_weight)
+    state
+  end
+
+  # Bounded: an access to the policy, but neither a hit nor a miss to the
+  # climber. The key moves to the MRU of its own segment, so the row's
+  # segment stays, and its seq, id, weight and expires_at are written in
+  # one `update_element`; the seq, the sketch count and the segment weight
+  # in one struct update (specs/05 §Decisions M7.2).
+  defp replace(
+         %__MODULE__{order: order, policy: policy} = state,
+         key,
+         id,
+         weight,
+         expires_at,
+         row
+       ) do
+    {^key, old_id, segment, old_seq, old_weight, old_expires_at} = row
+
+    # The seq first: a refused seq (the sentinel) must leave every table
+    # untouched.
+    seq = next_seq(state)
+    true = :ets.delete(order, base(segment) + old_seq)
+    true = :ets.insert(order, {base(segment) + seq, key})
+    true = :ets.delete(state.ids, old_id)
+    true = :ets.insert(state.ids, {id, key})
+
+    true =
+      :ets.update_element(policy, key, [
+        {@row_id, id},
+        {@row_seq, seq},
+        {@row_weight, weight},
+        {@row_expires_at, expires_at}
+      ])
+
+    :ok = Expiry.move(state.expiry, key, id, old_expires_at, expires_at)
+    add(state, 0, weight - old_weight)
+    :ok = Sketch.increment(state.sketch, key)
 
     state
-    |> add_segment(segment, weight - old_weight)
+    |> accessed(seq, segment, weight - old_weight)
     |> fit(key, segment, weight, old_weight)
   end
+
+  # `replace/6`'s struct update: the seq it claimed, its sketch count and
+  # the weight change of the key's segment, three keys at once.
+  defp accessed(%__MODULE__{sketch_size: size, window_weight: w} = state, seq, :window, delta),
+    do: %{state | next_seq: seq + 1, sketch_size: size + 1, window_weight: w + delta}
+
+  defp accessed(%__MODULE__{sketch_size: size, probation_weight: w} = state, seq, :probation, d),
+    do: %{state | next_seq: seq + 1, sketch_size: size + 1, probation_weight: w + d}
+
+  defp accessed(%__MODULE__{sketch_size: size, protected_weight: w} = state, seq, :protected, d),
+    do: %{state | next_seq: seq + 1, sketch_size: size + 1, protected_weight: w + d}
 
   defp table_expires_at(table, key, id, expires_at) do
     case :ets.lookup(table, key) do
@@ -399,11 +445,7 @@ defmodule Theine.Policy do
   defp fit(state, key, :protected, weight, old_weight) when weight > old_weight do
     if weight > state.protected_max do
       [{^key, _id, :protected, seq, ^weight, _expires_at}] = :ets.lookup(state.policy, key)
-
-      state
-      |> move(key, :protected, seq, :probation)
-      |> add_segment(:protected, -weight)
-      |> add_segment(:probation, weight)
+      move(state, key, :protected, seq, :probation, weight)
     else
       demote(state)
     end
@@ -440,32 +482,46 @@ defmodule Theine.Policy do
     }
   end
 
-  # An access: move `key` to the MRU of `segment` and count it in the
-  # sketch. Nothing to do without a bound. An overwrite is an access to the
-  # policy but neither a hit nor a miss to the climber.
-  defp touch(%__MODULE__{order: nil} = state, _key, nil, _old_seq), do: state
-
-  defp touch(%__MODULE__{} = state, key, segment, old_seq),
-    do: reorder_and_sample(state, key, segment, old_seq, 0)
-
-  # A move to the MRU of the key's own segment and its sketch count, with
-  # one struct update: a struct update costs about as much as an ETS
-  # update_element here, and this is the drain's common case (specs/05
-  # §Decisions M2.11b). `hit` is 1 for a drained read, the climber's hit.
-  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq, hit) do
+  # A drained read's move to the MRU of the key's own segment and its
+  # sketch count, with one struct update: a struct update costs about as
+  # much as an ETS update_element here, and this is the drain's common case
+  # (specs/05 §Decisions M2.11b). It counts as the climber's hit.
+  defp reorder_and_sample(%__MODULE__{sketch_size: size} = state, key, segment, old_seq) do
     seq = next_seq(state)
     reorder(state, key, segment, old_seq, segment, seq)
     :ok = Sketch.increment(state.sketch, key)
-    %{state | next_seq: seq + 1, sketch_size: size + 1, sample_hits: state.sample_hits + hit}
+    %{state | next_seq: seq + 1, sketch_size: size + 1, sample_hits: state.sample_hits + 1}
   end
 
-  # Moves `key` from `{from, old_seq}` to the MRU end of `to` with a fresh
-  # seq.
-  defp move(%__MODULE__{} = state, key, from, old_seq, to) do
+  # Moves `key`, of weight `weight`, from `{from, old_seq}` to the MRU end
+  # of `to` with a fresh seq, and the weight with it: one struct update for
+  # the seq and both segment weights (specs/05 §Decisions M7.2).
+  defp move(%__MODULE__{} = state, key, from, old_seq, to, weight) do
     seq = next_seq(state)
     reorder(state, key, from, old_seq, to, seq)
-    %{state | next_seq: seq + 1}
+    shift(state, seq, from, to, weight)
   end
+
+  # The four moves between segments that `move/6` makes: a demotion or a
+  # heavy protected key to probation, a window overflow or `transfer_out`
+  # to probation, and `transfer_in` from either main segment to the window.
+  defp shift(
+         %__MODULE__{protected_weight: m, probation_weight: p} = s,
+         seq,
+         :protected,
+         :probation,
+         w
+       ),
+       do: %{s | next_seq: seq + 1, protected_weight: m - w, probation_weight: p + w}
+
+  defp shift(%__MODULE__{window_weight: v, probation_weight: p} = s, seq, :window, :probation, w),
+    do: %{s | next_seq: seq + 1, window_weight: v - w, probation_weight: p + w}
+
+  defp shift(%__MODULE__{probation_weight: p, window_weight: v} = s, seq, :probation, :window, w),
+    do: %{s | next_seq: seq + 1, probation_weight: p - w, window_weight: v + w}
+
+  defp shift(%__MODULE__{protected_weight: m, window_weight: v} = s, seq, :protected, :window, w),
+    do: %{s | next_seq: seq + 1, protected_weight: m - w, window_weight: v + w}
 
   # The table side of a move: one delete and one insert on `order`, one
   # update on `policy`.
@@ -575,7 +631,7 @@ defmodule Theine.Policy do
   # Window → window MRU, protected → protected MRU, and a probation entry
   # too heavy for protected → probation MRU.
   defp access(state, key, segment, seq, _weight),
-    do: reorder_and_sample(state, key, segment, seq, 1)
+    do: reorder_and_sample(state, key, segment, seq)
 
   # Demotes protected LRU entries to probation MRU until the protected
   # segment fits. Every step removes a positive weight, and the segment is
@@ -586,15 +642,7 @@ defmodule Theine.Policy do
   defp demote(%__MODULE__{order: order, policy: policy} = state) do
     {seq, key} = lru_entry(order, :protected)
     weight = :ets.lookup_element(policy, key, @row_weight)
-    new_seq = next_seq(state)
-    reorder(state, key, :protected, seq, :probation, new_seq)
-
-    demote(%{
-      state
-      | next_seq: new_seq + 1,
-        protected_weight: state.protected_weight - weight,
-        probation_weight: state.probation_weight + weight
-    })
+    demote(move(state, key, :protected, seq, :probation, weight))
   end
 
   defp next_seq(%__MODULE__{next_seq: seq}) when seq < @max_seq, do: seq
@@ -671,9 +719,7 @@ defmodule Theine.Policy do
     weight = :ets.lookup_element(policy, key, @row_weight)
 
     state
-    |> move(key, :window, seq, :probation)
-    |> add_segment(:window, -weight)
-    |> add_segment(:probation, weight)
+    |> move(key, :window, seq, :probation, weight)
     |> overflow(n + 1)
   end
 
@@ -695,10 +741,15 @@ defmodule Theine.Policy do
   defp total(%__MODULE__{window_weight: w, probation_weight: p, protected_weight: m}),
     do: w + p + m
 
+  # One decision. The candidate count, the cursor and the floor it leaves
+  # go into `remove/5`'s struct update with the removed key's segment
+  # weight (specs/05 §Decisions M7.2).
   defp decide(%__MODULE__{order: order, candidates: candidates} = state) do
+    %__MODULE__{cursor: cursor, candidate_floor: floor} = state
+
     case lru_entry(order, :probation) do
       {_victim_seq, victim} when candidates == 0 ->
-        remove(state, victim)
+        remove(state, victim, 0, cursor, floor)
 
       {victim_seq, victim} ->
         case candidate(state) do
@@ -706,32 +757,34 @@ defmodule Theine.Policy do
             # The cursor walked past the batch's overflows: every remaining
             # probation entry has been tested, so the leftover count is
             # settled.
-            remove(settled(state), victim)
+            remove(state, victim, 0, nil, nil)
 
           {^victim_seq, ^victim} ->
-            remove(%{state | candidates: candidates - 1, cursor: 0}, victim)
+            remove(state, victim, candidates - 1, 0, floor)
 
           {seq, candidate} ->
             # The next cursor position is fixed before anything is deleted.
-            state = %{state | candidates: candidates - 1, cursor: previous(order, seq)}
+            cursor = previous(order, seq)
 
             if admit?(state, candidate, victim),
-              do: remove(state, victim),
-              else: remove(state, candidate)
+              do: remove(state, victim, candidates - 1, cursor, floor),
+              else: remove(state, candidate, candidates - 1, cursor, floor)
         end
 
       nil ->
         case lru_entry(order, :protected) do
           {_seq, key} ->
-            remove(state, key)
+            remove(state, key, candidates, cursor, floor)
 
           nil ->
             {_seq, key} = lru_entry(order, :window)
-            remove(state, key)
+            remove(state, key, candidates, cursor, floor)
         end
     end
   end
 
+  # Already settled is the common case, once per applied `:put`: no update.
+  defp settled(%__MODULE__{candidates: 0, cursor: nil, candidate_floor: nil} = state), do: state
   defp settled(state), do: %{state | candidates: 0, cursor: nil, candidate_floor: nil}
 
   # The entry under the cursor: the probation entry at the cursor's seq
@@ -779,9 +832,12 @@ defmodule Theine.Policy do
 
   # Removes `key` (specs/04 §Removing an entry): the entries table keeps a
   # version under another id, or none, when a put or delete raced the
-  # policy, and that version's event settles the rows this drops.
-  defp remove(%__MODULE__{policy: policy, table: table, counters: counters} = state, key) do
-    [{^key, id, _segment, _seq, _weight, _expires_at} = row] = :ets.lookup(policy, key)
+  # policy, and that version's event settles the rows this drops. The
+  # candidate count, cursor and floor `decide/1` chose are written with the
+  # segment weight, in one struct update.
+  defp remove(%__MODULE__{} = state, key, candidates, cursor, floor) do
+    %__MODULE__{policy: policy, table: table, counters: counters} = state
+    [{^key, id, segment, _seq, weight, _expires_at} = row] = :ets.lookup(policy, key)
 
     evicted =
       case :ets.lookup(table, key) do
@@ -795,8 +851,50 @@ defmodule Theine.Policy do
           0
       end
 
-    {drop(state, row), evicted}
+    :ok = drop_rows(state, row)
+    {retire(state, segment, weight, candidates, cursor, floor), evicted}
   end
+
+  defp retire(%__MODULE__{window_weight: v} = state, :window, weight, candidates, cursor, floor),
+    do: %{
+      state
+      | window_weight: v - weight,
+        candidates: candidates,
+        cursor: cursor,
+        candidate_floor: floor
+    }
+
+  defp retire(
+         %__MODULE__{probation_weight: p} = state,
+         :probation,
+         weight,
+         candidates,
+         cursor,
+         floor
+       ),
+       do: %{
+         state
+         | probation_weight: p - weight,
+           candidates: candidates,
+           cursor: cursor,
+           candidate_floor: floor
+       }
+
+  defp retire(
+         %__MODULE__{protected_weight: m} = state,
+         :protected,
+         weight,
+         candidates,
+         cursor,
+         floor
+       ),
+       do: %{
+         state
+         | protected_weight: m - weight,
+           candidates: candidates,
+           cursor: cursor,
+           candidate_floor: floor
+       }
 
   defp notify(nil, _entry, _cause), do: :ok
   defp notify(cache, entry, cause), do: Entry.evicted(cache, entry, cause)
@@ -920,9 +1018,7 @@ defmodule Theine.Policy do
     case main_lru(state, quota) do
       {segment, seq, key, weight} ->
         state
-        |> move(key, segment, seq, :window)
-        |> add_segment(segment, -weight)
-        |> add_segment(:window, weight)
+        |> move(key, segment, seq, :window, weight)
         |> transfer_in(quota - weight, n - 1)
 
       nil ->
@@ -953,9 +1049,7 @@ defmodule Theine.Policy do
     case fitting_lru(state, :window, quota) do
       {:window, seq, key, weight} ->
         state
-        |> move(key, :window, seq, :probation)
-        |> add_segment(:window, -weight)
-        |> add_segment(:probation, weight)
+        |> move(key, :window, seq, :probation, weight)
         |> transfer_out(quota - weight, n - 1)
 
       nil ->
@@ -1021,13 +1115,18 @@ defmodule Theine.Policy do
     end
   end
 
-  defp drop(state, {key, id, segment, seq, weight, expires_at}) do
+  defp drop(state, {_key, _id, segment, _seq, weight, _expires_at} = row) do
+    :ok = drop_rows(state, row)
+    add_segment(state, segment, -weight)
+  end
+
+  # The table side of a drop: every row of the key and the published sizes.
+  defp drop_rows(state, {key, id, segment, seq, weight, expires_at}) do
     true = :ets.delete(state.policy, key)
     true = :ets.delete(state.ids, id)
     if state.order, do: true = :ets.delete(state.order, base(segment) + seq)
     :ok = Expiry.delete(state.expiry, key, expires_at)
     add(state, -1, -weight)
-    add_segment(state, segment, -weight)
   end
 
   @doc """
@@ -1241,7 +1340,11 @@ defmodule Theine.Policy do
     :ok
   end
 
+  # A delta of 0 returns the state as it is: a one-key struct update costs
+  # 150–230 ns on OTP 28 (specs/05 §Decisions M7.2), and a same-weight
+  # rewrite is the common case.
   defp add_segment(state, nil, _delta), do: state
+  defp add_segment(state, _segment, 0), do: state
 
   defp add_segment(%{window_weight: w} = state, :window, delta),
     do: %{state | window_weight: w + delta}

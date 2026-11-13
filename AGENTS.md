@@ -134,9 +134,13 @@ test/                         mirrors lib/; test/support for shared helpers
   pass it did not request ran).
 - The per-event write cost rows of `mix bench maintenance` (M7.1) agree to
   3% within one invocation but moved 27% between invocations, after the
-  gated runs heat the laptop. To compare two trees, run
-  `bench/results/placement-m71.exs` (gitignored; `Load.event_run/3` alone,
-  4.26–4.54 µs per overwrite on M7.1's tree) before and after the change.
+  gated runs heat the laptop. To compare a `Theine.Policy` change, run
+  `bench/results/policy-m72.exs` (gitignored): it times `on_write/5` +
+  `evict/1` in one process against a revision's Policy (`POLICY_BASE`,
+  default HEAD) in alternating rounds, spread about 1%. The wall-clock
+  `event_run` is bimodal round to round (M7.2). For exact baseline hits
+  without a second full bench, `bench/results/hits-m72.exs` replays the
+  traces through a revision's Policy under the bench's cache names.
   If a pass-budget miss comes with mixed-run reads well under 12 M, the
   machine was slow.
 - `mix bench maintenance` takes about 2.5 min at the default 1 M entries

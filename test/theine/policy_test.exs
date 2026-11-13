@@ -201,6 +201,31 @@ defmodule Theine.PolicyTest do
       assert Policy.weighted_size(policy.sizes) == 6
     end
 
+    # specs/05 §Decisions M7.2: where an event changes no field of the
+    # struct, the very term comes back, with no struct update at all.
+    # `:erts_debug.same/2` tells one term from an equal copy.
+    test "a same-weight rewrite and an evict with nothing to do return the same term", %{
+      table: table
+    } do
+      # Heavier than window_max (1 at 100): evict/1 overflows it to probation.
+      policy = put(bounded(100), table, :a, 1, 3)
+      {:done, 0, policy} = Policy.evict(policy)
+      assert Policy.weights(policy) == %{window: 0, probation: 3, protected: 0}
+
+      rewritten = Policy.on_write(policy, :a, 1, 3, :infinity)
+      assert :erts_debug.same(rewritten, policy)
+      assert {:done, 0, evicted} = Policy.evict(rewritten)
+      assert :erts_debug.same(evicted, policy)
+
+      # A weight change is one struct update, and lands in the segment.
+      heavier = Policy.on_write(policy, :a, 1, 4, :infinity)
+      refute :erts_debug.same(heavier, policy)
+      assert Policy.weights(heavier) == %{window: 0, probation: 4, protected: 0}
+
+      unbounded = Policy.on_write(Policy.new(config(:infinity)), :a, 1, 3, :infinity)
+      assert :erts_debug.same(Policy.on_write(unbounded, :a, 2, 5, :infinity), unbounded)
+    end
+
     test "a heavier rewrite of a protected key demotes the protected LRU until it fits", %{
       table: table
     } do

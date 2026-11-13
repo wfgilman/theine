@@ -493,3 +493,35 @@ the window moves, and records the answer in §Decisions. Unbounded
   removal. Dropping the row then would leave a live entry with no policy
   row, so it is never evicted or swept. The check costs one
   `lookup_element` per removal event in the pass.
+- 2026-11-12 (M7.2): code on the event path keeps to multi-key struct
+  updates. On OTP 28 (erts 16.4) a one-key update `%{state | k: v}` costs
+  150–230 ns and a two-key update 30–50 ns; this reproduces in plain Erlang
+  with no theine code (IMPLEMENTATION_PLAN.md §M7, the profile). So every
+  step of `on_write`, `on_remove`, `on_access` and `evict`, and the
+  maintenance process's per-event bookkeeping, writes all the fields it
+  changes in one update, and a step that changes nothing returns the struct
+  it was given. As applied in M7.2: `move/6` takes the moved key's weight
+  and writes `next_seq` and both segment weights at once, for the window
+  overflow, a demotion, a protected key grown past `protected_max` and the
+  climber's transfers. An overwrite with a new id (`replace/6`) writes the
+  row's seq, id, weight and `expires_at` in one `update_element` (the key
+  stays in its segment, so the segment is not rewritten) and `next_seq`,
+  `sketch_size` and its segment's weight in one struct update. `decide/1`
+  hands the candidate count, cursor and floor to the removal, which writes
+  them with the removed key's segment weight. `add_segment/3` with a delta
+  of 0 and `settled/1` on a struct already settled return it unchanged, so
+  a same-weight overwrite followed by an `evict/1` with nothing to do makes
+  no struct update in the policy. `Theine.Maintenance` writes a consumed
+  event's `policy`, `writes`, `evicted` and `call_writes` in one update.
+  Two one-key updates are left because nothing else changes beside them:
+  a drop's segment weight in `on_remove` and the sweep, and `next_seq`
+  after an unbounded insert. The order of the table operations inside an
+  overwrite changed (the `order` move now comes before the ids rows, and
+  the sketch increment after the expiry index); the tables are private to
+  the process, so nothing can observe the order, and the decisions are
+  unchanged. Timed in one process with no messaging (on_write then evict,
+  100_000 keys, probe `bench/results/policy-m72.exs`, gitignored, six
+  alternating rounds against the previous `Theine.Policy`), an overwrite
+  went from 3.266 to 3.109 µs and a new key with its eviction from 6.199 to
+  6.127 µs, faster in every round. Every row of `mix bench hitrate` kept
+  its hits (IMPLEMENTATION_PLAN.md §Benchmark log M7.2).
